@@ -1,0 +1,25 @@
+[package]
+name = "pov-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+argon2.workspace = true
+base64ct.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+process-wrap.workspace = true
+rustix.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-rusqlite.workspace = true
+tokio-util.workspace = true
+unicode-normalization.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+pov-platform = { path = "../pov-platform" }

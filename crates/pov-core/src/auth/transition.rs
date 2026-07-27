@@ -1,0 +1,1807 @@
+use std::{error::Error, fmt, str};
+
+#[cfg(test)]
+use base64ct::{Base64Unpadded, Encoding};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+use zeroize::Zeroizing;
+
+use super::{
+    SecretBytes, ValidatedVerifier,
+    keyring::{ACTIVE_ONLY_LENGTH, AuthTimestampMicros, KeyId, Keyring, KeyringVersion},
+};
+
+pub(crate) const AUTH_MAINTENANCE_LOCK_NAME: &str = "auth-maintenance.lock";
+pub(crate) const ACTIVE_KEYRING_NAME: &str = "auth-keyring.v1";
+pub(crate) const TRANSITION_METADATA_NAME: &str = "metadata";
+pub(crate) const STAGED_KEYRING_NAME: &str = "staged-keyring";
+pub(crate) const PREPARED_SENTINEL_NAME: &str = "prepared";
+
+const TRANSITION_PREFIX: &str = ".auth-transition-";
+const CLEANUP_PREFIX: &str = ".auth-cleanup-";
+const INSTALL_PREFIX: &str = ".auth-keyring-install-";
+const INSTALL_SUFFIX: &str = ".tmp";
+const CANONICAL_UUID_TEXT_LENGTH: usize = 36;
+
+const METADATA_MAGIC: &[u8; 8] = b"POVAUTHM";
+const METADATA_FORMAT_VERSION: u16 = 1;
+const INITIALIZE_METADATA_TAG: u8 = 1;
+const METADATA_CHECKSUM_BYTES: usize = 32;
+const METADATA_FIXED_HEADER_BYTES: usize = 166;
+pub(super) const MAX_INITIALIZATION_METADATA_BYTES: usize = 512;
+const KID_BYTES: usize = 43;
+const STAGED_HASH_BYTES: usize = 32;
+const MAX_LOGIN_ID_BYTES: usize = 32;
+const MAX_LEGACY_POLICY_PROVENANCE_BYTES: usize = 64;
+
+pub(crate) const NO_BLOCKLIST_CHECK_SENTINEL: &str = "no-blocklist-check-v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransitionKind {
+    Initialize,
+    Planned,
+    Retire,
+    Compromise,
+    Loss,
+}
+
+impl TransitionKind {
+    const ALL: [Self; 5] = [
+        Self::Initialize,
+        Self::Planned,
+        Self::Retire,
+        Self::Compromise,
+        Self::Loss,
+    ];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Initialize => "initialize",
+            Self::Planned => "planned",
+            Self::Retire => "retire",
+            Self::Compromise => "compromise",
+            Self::Loss => "loss",
+        }
+    }
+
+    pub(crate) fn parse_persisted(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == value)
+    }
+}
+
+macro_rules! auth_v4_id {
+    ($name:ident) => {
+        #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub(crate) struct $name(Uuid);
+
+        impl $name {
+            pub(crate) fn new() -> Self {
+                Self(Uuid::new_v4())
+            }
+
+            pub(crate) const fn from_uuid(value: Uuid) -> Option<Self> {
+                if matches!(value.get_version(), Some(uuid::Version::Random))
+                    && matches!(value.get_variant(), uuid::Variant::RFC4122)
+                {
+                    Some(Self(value))
+                } else {
+                    None
+                }
+            }
+
+            fn from_bytes(bytes: &[u8]) -> Result<Self, TransitionContractError> {
+                let uuid = Uuid::from_slice(bytes)
+                    .map_err(|_| TransitionContractError::InvalidIdentifier)?;
+                Self::from_uuid(uuid).ok_or(TransitionContractError::InvalidIdentifier)
+            }
+
+            pub(crate) const fn as_uuid(self) -> Uuid {
+                self.0
+            }
+
+            fn as_bytes(&self) -> &[u8; 16] {
+                self.0.as_bytes()
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter
+                    .debug_tuple(stringify!($name))
+                    .field(&"[REDACTED]")
+                    .finish()
+            }
+        }
+    };
+}
+
+auth_v4_id!(TransitionId);
+auth_v4_id!(AuditId);
+auth_v4_id!(AuthOwnerId);
+
+impl TransitionId {
+    fn parse_canonical(raw: &[u8]) -> Result<Self, TransitionContractError> {
+        if raw.len() != CANONICAL_UUID_TEXT_LENGTH || !raw.is_ascii() {
+            return Err(TransitionContractError::InvalidIdentifier);
+        }
+        let text = str::from_utf8(raw).map_err(|_| TransitionContractError::InvalidIdentifier)?;
+        let uuid = Uuid::parse_str(text).map_err(|_| TransitionContractError::InvalidIdentifier)?;
+        let transition_id =
+            Self::from_uuid(uuid).ok_or(TransitionContractError::InvalidIdentifier)?;
+        if transition_id.canonical_text().as_bytes() != raw {
+            return Err(TransitionContractError::InvalidIdentifier);
+        }
+        Ok(transition_id)
+    }
+
+    fn canonical_text(self) -> String {
+        self.0.hyphenated().to_string()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TopLevelArtifactName {
+    MaintenanceLock,
+    ActiveKeyring,
+    Transition {
+        kind: TransitionKind,
+        id: TransitionId,
+    },
+    Cleanup {
+        kind: TransitionKind,
+        id: TransitionId,
+    },
+    InstallTemp {
+        id: TransitionId,
+    },
+}
+
+impl TopLevelArtifactName {
+    pub(crate) fn parse(raw: &[u8]) -> Result<Self, TransitionContractError> {
+        match raw {
+            name if name == AUTH_MAINTENANCE_LOCK_NAME.as_bytes() => {
+                return Ok(Self::MaintenanceLock);
+            }
+            name if name == ACTIVE_KEYRING_NAME.as_bytes() => return Ok(Self::ActiveKeyring),
+            _ => {}
+        }
+
+        if let Some(parsed) = parse_kind_and_id(raw, TRANSITION_PREFIX)? {
+            return Ok(Self::Transition {
+                kind: parsed.0,
+                id: parsed.1,
+            });
+        }
+        if let Some(parsed) = parse_kind_and_id(raw, CLEANUP_PREFIX)? {
+            return Ok(Self::Cleanup {
+                kind: parsed.0,
+                id: parsed.1,
+            });
+        }
+        if let Some(id_bytes) = raw
+            .strip_prefix(INSTALL_PREFIX.as_bytes())
+            .and_then(|remainder| remainder.strip_suffix(INSTALL_SUFFIX.as_bytes()))
+        {
+            return Ok(Self::InstallTemp {
+                id: TransitionId::parse_canonical(id_bytes)?,
+            });
+        }
+
+        Err(TransitionContractError::InvalidArtifactName)
+    }
+
+    pub(crate) fn format(self) -> String {
+        match self {
+            Self::MaintenanceLock => AUTH_MAINTENANCE_LOCK_NAME.to_owned(),
+            Self::ActiveKeyring => ACTIVE_KEYRING_NAME.to_owned(),
+            Self::Transition { kind, id } => {
+                format!(
+                    "{TRANSITION_PREFIX}{}-{}",
+                    kind.as_str(),
+                    id.canonical_text()
+                )
+            }
+            Self::Cleanup { kind, id } => {
+                format!("{CLEANUP_PREFIX}{}-{}", kind.as_str(), id.canonical_text())
+            }
+            Self::InstallTemp { id } => {
+                format!("{INSTALL_PREFIX}{}{INSTALL_SUFFIX}", id.canonical_text())
+            }
+        }
+    }
+}
+
+fn parse_kind_and_id(
+    raw: &[u8],
+    namespace_prefix: &str,
+) -> Result<Option<(TransitionKind, TransitionId)>, TransitionContractError> {
+    let Some(remainder) = raw.strip_prefix(namespace_prefix.as_bytes()) else {
+        return Ok(None);
+    };
+    for kind in TransitionKind::ALL {
+        let mut kind_prefix = kind.as_str().as_bytes().to_vec();
+        kind_prefix.push(b'-');
+        if let Some(id_bytes) = remainder.strip_prefix(kind_prefix.as_slice()) {
+            return TransitionId::parse_canonical(id_bytes)
+                .map(|id| Some((kind, id)))
+                .map_err(|_| TransitionContractError::InvalidArtifactName);
+        }
+    }
+    Err(TransitionContractError::InvalidArtifactName)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReservationEntryName {
+    Metadata,
+    StagedKeyring,
+    Prepared,
+}
+
+impl ReservationEntryName {
+    pub(crate) fn parse(raw: &[u8]) -> Result<Self, TransitionContractError> {
+        match raw {
+            name if name == TRANSITION_METADATA_NAME.as_bytes() => Ok(Self::Metadata),
+            name if name == STAGED_KEYRING_NAME.as_bytes() => Ok(Self::StagedKeyring),
+            name if name == PREPARED_SENTINEL_NAME.as_bytes() => Ok(Self::Prepared),
+            _ => Err(TransitionContractError::InvalidArtifactName),
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Metadata => TRANSITION_METADATA_NAME,
+            Self::StagedKeyring => STAGED_KEYRING_NAME,
+            Self::Prepared => PREPARED_SENTINEL_NAME,
+        }
+    }
+}
+
+#[derive(Eq, PartialEq)]
+pub(crate) struct LoginId(String);
+
+impl LoginId {
+    pub(crate) fn parse(raw: &[u8]) -> Result<Self, TransitionContractError> {
+        if !(3..=MAX_LOGIN_ID_BYTES).contains(&raw.len())
+            || !raw[0].is_ascii_lowercase()
+            || !raw[1..].iter().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(byte)
+            })
+        {
+            return Err(TransitionContractError::InvalidLoginId);
+        }
+        let value = str::from_utf8(raw)
+            .map_err(|_| TransitionContractError::InvalidLoginId)?
+            .to_owned();
+        Ok(Self(value))
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl fmt::Debug for LoginId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LoginId([REDACTED])")
+    }
+}
+
+#[derive(Eq, PartialEq)]
+pub(crate) struct LegacyPolicyProvenance(String);
+
+impl LegacyPolicyProvenance {
+    pub(crate) fn parse(raw: &[u8]) -> Result<Self, TransitionContractError> {
+        if raw.is_empty()
+            || raw.len() > MAX_LEGACY_POLICY_PROVENANCE_BYTES
+            || !raw[0].is_ascii_lowercase()
+            || !raw[raw.len() - 1].is_ascii_lowercase() && !raw[raw.len() - 1].is_ascii_digit()
+            || !raw
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        {
+            return Err(TransitionContractError::InvalidLegacyPolicyProvenance);
+        }
+        let value = str::from_utf8(raw)
+            .map_err(|_| TransitionContractError::InvalidLegacyPolicyProvenance)?
+            .to_owned();
+        Ok(Self(value))
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl fmt::Debug for LegacyPolicyProvenance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LegacyPolicyProvenance([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct SourceTimestampMicros(u64);
+
+impl SourceTimestampMicros {
+    pub(crate) fn new(value: u64) -> Result<Self, TransitionContractError> {
+        if value > i64::MAX as u64 {
+            return Err(TransitionContractError::InvalidMetadata);
+        }
+        Ok(Self(value))
+    }
+
+    const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct PersistedLifecycleKeyId(KeyId);
+
+impl PersistedLifecycleKeyId {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        KeyId::from_stored_bytes(value.as_bytes()).ok().map(Self)
+    }
+
+    pub(crate) fn matches_key(self, value: KeyId) -> bool {
+        self.0 == value
+    }
+}
+
+impl fmt::Debug for PersistedLifecycleKeyId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PersistedLifecycleKeyId([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct PersistedLifecycleTransitionId(TransitionId);
+
+impl PersistedLifecycleTransitionId {
+    pub(crate) fn parse(value: &[u8]) -> Option<Self> {
+        TransitionId::from_bytes(value).ok().map(Self)
+    }
+}
+
+impl fmt::Debug for PersistedLifecycleTransitionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PersistedLifecycleTransitionId([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct PersistedLifecycleKeyringVersion(KeyringVersion);
+
+impl PersistedLifecycleKeyringVersion {
+    pub(crate) fn parse(value: i64) -> Option<Self> {
+        u64::try_from(value)
+            .ok()
+            .and_then(|value| KeyringVersion::new(value).ok())
+            .map(Self)
+    }
+
+    pub(crate) fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    pub(crate) fn matches_version(self, value: KeyringVersion) -> bool {
+        self.0 == value
+    }
+}
+
+impl fmt::Debug for PersistedLifecycleKeyringVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PersistedLifecycleKeyringVersion([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct PersistedLifecycleTimestamp(SourceTimestampMicros);
+
+impl PersistedLifecycleTimestamp {
+    pub(crate) fn parse(value: i64) -> Option<Self> {
+        u64::try_from(value)
+            .ok()
+            .filter(|value| *value > 0)
+            .and_then(|value| SourceTimestampMicros::new(value).ok())
+            .map(Self)
+    }
+
+    pub(crate) fn matches_i64(self, value: i64) -> bool {
+        u64::try_from(value).ok() == Some(self.0.get())
+    }
+
+    pub(crate) fn is_at_or_after(self, value: AuthTimestampMicros) -> bool {
+        self.0.get() >= value.get()
+    }
+}
+
+impl fmt::Debug for PersistedLifecycleTimestamp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PersistedLifecycleTimestamp([REDACTED])")
+    }
+}
+
+pub(crate) struct InitializationMetadataInput {
+    pub(crate) transition_id: TransitionId,
+    pub(crate) owner_id: AuthOwnerId,
+    pub(crate) audit_id: AuditId,
+    pub(crate) source_at_micros: SourceTimestampMicros,
+    pub(crate) login_id: LoginId,
+    pub(crate) password_verifier: ValidatedVerifier,
+    pub(crate) recovery_verifier: ValidatedVerifier,
+}
+
+impl fmt::Debug for InitializationMetadataInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("InitializationMetadataInput([REDACTED])")
+    }
+}
+
+pub(crate) struct InitializationMetadataV1 {
+    transition_id: TransitionId,
+    owner_id: AuthOwnerId,
+    audit_id: AuditId,
+    result_kid: KeyId,
+    result_keyring_version: KeyringVersion,
+    key_activated_at_micros: AuthTimestampMicros,
+    source_at_micros: SourceTimestampMicros,
+    staged_keyring_length: u32,
+    staged_keyring_hash: [u8; STAGED_HASH_BYTES],
+    login_id: LoginId,
+    password_verifier: ValidatedVerifier,
+    recovery_verifier: ValidatedVerifier,
+    legacy_policy_provenance: LegacyPolicyProvenance,
+}
+
+pub(crate) struct InitializationPreparationV1 {
+    metadata: InitializationMetadataV1,
+    staged_keyring: SecretBytes,
+}
+
+impl InitializationPreparationV1 {
+    pub(crate) fn from_keyring(
+        input: InitializationMetadataInput,
+        keyring: &Keyring,
+    ) -> Result<Self, TransitionContractError> {
+        if input.source_at_micros.get() == 0 {
+            return Err(TransitionContractError::InvalidMetadata);
+        }
+        let metadata = InitializationMetadataV1::from_keyring(input, keyring)?;
+        let staged_keyring = keyring.encode();
+        metadata
+            .validate_staged_keyring(SecretBytes::new(staged_keyring.expose_secret().to_vec()))?;
+        Ok(Self {
+            metadata,
+            staged_keyring,
+        })
+    }
+
+    pub(super) fn transition_artifact(&self) -> TopLevelArtifactName {
+        TopLevelArtifactName::Transition {
+            kind: TransitionKind::Initialize,
+            id: self.metadata.transition_id,
+        }
+    }
+
+    pub(super) fn encoded_metadata(&self) -> Result<SecretBytes, TransitionContractError> {
+        self.metadata.encode()
+    }
+
+    pub(super) fn staged_keyring_bytes(&self) -> &[u8] {
+        self.staged_keyring.expose_secret()
+    }
+}
+
+impl fmt::Debug for InitializationPreparationV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("InitializationPreparationV1([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct InitializationSourceExpectation<'a> {
+    metadata: &'a InitializationMetadataV1,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct InitializationSourceSeed<'a> {
+    metadata: &'a InitializationMetadataV1,
+}
+
+impl<'a> InitializationSourceSeed<'a> {
+    pub(crate) const fn expectation(self) -> InitializationSourceExpectation<'a> {
+        InitializationSourceExpectation {
+            metadata: self.metadata,
+        }
+    }
+
+    pub(crate) fn transition_id(self) -> &'a [u8; 16] {
+        self.metadata.transition_id.as_bytes()
+    }
+
+    pub(crate) fn owner_id(self) -> &'a [u8; 16] {
+        self.metadata.owner_id.as_bytes()
+    }
+
+    pub(crate) fn audit_id(self) -> &'a [u8; 16] {
+        self.metadata.audit_id.as_bytes()
+    }
+
+    pub(crate) fn result_kid(self) -> &'a str {
+        self.metadata.result_kid.as_str()
+    }
+
+    pub(crate) fn result_keyring_version(self) -> i64 {
+        i64::try_from(self.metadata.result_keyring_version.get())
+            .expect("validated keyring versions fit SQLite integers")
+    }
+
+    pub(crate) fn source_at_micros(self) -> i64 {
+        i64::try_from(self.metadata.source_at_micros.get())
+            .expect("validated source timestamps fit SQLite integers")
+    }
+
+    pub(crate) fn login_id(self) -> &'a str {
+        str::from_utf8(self.metadata.login_id.as_bytes())
+            .expect("validated login identifiers are ASCII")
+    }
+
+    pub(crate) fn password_phc(self) -> &'a str {
+        self.metadata.password_verifier.expose_phc()
+    }
+
+    pub(crate) fn recovery_phc(self) -> &'a str {
+        self.metadata.recovery_verifier.expose_phc()
+    }
+
+    pub(crate) fn legacy_policy_provenance(self) -> &'a str {
+        str::from_utf8(self.metadata.legacy_policy_provenance.as_bytes())
+            .expect("validated legacy policy provenance is ASCII")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_metadata<R>(
+        transition_id: [u8; 16],
+        login_id: &[u8],
+        signing_seed: [u8; 32],
+        run: impl FnOnce(InitializationSourceSeed<'_>) -> R,
+    ) -> R {
+        const OWNER_ID: [u8; 16] = [
+            0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x84, 0x44, 0x44, 0x44, 0x44, 0x44,
+            0x44, 0x44,
+        ];
+        const AUDIT_ID: [u8; 16] = [
+            0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x45, 0x55, 0x85, 0x55, 0x55, 0x55, 0x55, 0x55,
+            0x55, 0x55,
+        ];
+        const SOURCE_AT_MICROS: u64 = 1_700_000_000_000_001;
+
+        let verifier = |fill| {
+            let salt = Base64Unpadded::encode_string(&[fill; 16]);
+            let output = Base64Unpadded::encode_string(&[fill; 32]);
+            ValidatedVerifier::parse(SecretBytes::new(
+                format!("$argon2id$v=19$m=65536,t=3,p=4${salt}${output}").into_bytes(),
+            ))
+            .expect("canonical synthetic verifier")
+        };
+        let keyring = Keyring::from_test_seeds(1, SOURCE_AT_MICROS - 1, signing_seed, None)
+            .expect("synthetic initialization keyring");
+        let metadata = InitializationMetadataV1::from_keyring(
+            InitializationMetadataInput {
+                transition_id: TransitionId::from_uuid(Uuid::from_bytes(transition_id))
+                    .expect("transition ID"),
+                owner_id: AuthOwnerId::from_uuid(Uuid::from_bytes(OWNER_ID)).expect("owner ID"),
+                audit_id: AuditId::from_uuid(Uuid::from_bytes(AUDIT_ID)).expect("audit ID"),
+                source_at_micros: SourceTimestampMicros::new(SOURCE_AT_MICROS)
+                    .expect("source timestamp"),
+                login_id: LoginId::parse(login_id).expect("login ID"),
+                password_verifier: verifier(0x61),
+                recovery_verifier: verifier(0x62),
+            },
+            &keyring,
+        )
+        .expect("initialization metadata");
+        run(InitializationSourceSeed {
+            metadata: &metadata,
+        })
+    }
+}
+
+impl fmt::Debug for InitializationSourceSeed<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("InitializationSourceSeed([REDACTED])")
+    }
+}
+
+impl<'a> InitializationSourceExpectation<'a> {
+    pub(crate) fn uses_no_blocklist_check_policy(self) -> bool {
+        self.metadata.legacy_policy_provenance.as_bytes() == NO_BLOCKLIST_CHECK_SENTINEL.as_bytes()
+    }
+
+    pub(crate) fn transition_id(self) -> &'a [u8; 16] {
+        self.metadata.transition_id.as_bytes()
+    }
+
+    pub(crate) fn result_kid(self) -> &'a str {
+        self.metadata.result_kid.as_str()
+    }
+
+    pub(crate) fn result_keyring_version(self) -> i64 {
+        i64::try_from(self.metadata.result_keyring_version.get())
+            .expect("validated keyring versions fit SQLite integers")
+    }
+
+    pub(crate) fn source_at_micros(self) -> i64 {
+        i64::try_from(self.metadata.source_at_micros.get())
+            .expect("validated source timestamps fit SQLite integers")
+    }
+
+    pub(crate) fn matches_lifecycle(
+        self,
+        transition_id: PersistedLifecycleTransitionId,
+        expected_kid: PersistedLifecycleKeyId,
+        keyring_version: PersistedLifecycleKeyringVersion,
+        updated_at_micros: PersistedLifecycleTimestamp,
+    ) -> bool {
+        transition_id.0 == self.metadata.transition_id
+            && expected_kid.0 == self.metadata.result_kid
+            && keyring_version.0 == self.metadata.result_keyring_version
+            && updated_at_micros.0 == self.metadata.source_at_micros
+    }
+
+    pub(crate) fn matches_active_lifecycle(
+        self,
+        expected_kid: PersistedLifecycleKeyId,
+        keyring_version: PersistedLifecycleKeyringVersion,
+        updated_at_micros: PersistedLifecycleTimestamp,
+    ) -> bool {
+        expected_kid.0 == self.metadata.result_kid
+            && keyring_version.0 == self.metadata.result_keyring_version
+            && updated_at_micros.0 == self.metadata.source_at_micros
+    }
+
+    pub(crate) fn matches_owner_id(self, raw: &[u8]) -> bool {
+        raw == self.metadata.owner_id.as_bytes()
+    }
+
+    pub(crate) fn matches_audit_id(self, raw: &[u8]) -> bool {
+        raw == self.metadata.audit_id.as_bytes()
+    }
+
+    pub(crate) fn matches_login_id(self, raw: &[u8]) -> bool {
+        raw == self.metadata.login_id.as_bytes()
+    }
+
+    pub(crate) fn matches_password_phc(self, raw: &[u8]) -> bool {
+        raw == self.metadata.password_verifier.expose_phc().as_bytes()
+    }
+
+    pub(crate) fn matches_recovery_phc(self, raw: &[u8]) -> bool {
+        raw == self.metadata.recovery_verifier.expose_phc().as_bytes()
+    }
+
+    pub(crate) fn matches_legacy_policy_provenance(self, raw: &[u8]) -> bool {
+        raw == self.metadata.legacy_policy_provenance.as_bytes()
+    }
+
+    pub(crate) fn is_canonical_owner_id(raw: &[u8]) -> bool {
+        AuthOwnerId::from_bytes(raw).is_ok()
+    }
+
+    pub(crate) fn is_canonical_audit_id(raw: &[u8]) -> bool {
+        AuditId::from_bytes(raw).is_ok()
+    }
+
+    pub(crate) fn is_canonical_login_id(raw: &[u8]) -> bool {
+        LoginId::parse(raw).is_ok()
+    }
+
+    pub(crate) fn is_canonical_verifier(raw: &[u8]) -> bool {
+        ValidatedVerifier::is_canonical_encoded(raw)
+    }
+
+    pub(crate) fn verifiers_have_independent_salts(left: &[u8], right: &[u8]) -> bool {
+        ValidatedVerifier::encoded_salts_are_independent(left, right)
+    }
+
+    pub(crate) fn is_canonical_legacy_policy_provenance(raw: &[u8]) -> bool {
+        LegacyPolicyProvenance::parse(raw).is_ok()
+    }
+}
+
+impl fmt::Debug for InitializationSourceExpectation<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("InitializationSourceExpectation([REDACTED])")
+    }
+}
+
+impl InitializationMetadataV1 {
+    pub(crate) fn from_keyring(
+        input: InitializationMetadataInput,
+        keyring: &Keyring,
+    ) -> Result<Self, TransitionContractError> {
+        if keyring.version().get() != 1 {
+            return Err(TransitionContractError::InvalidInitializationKeyring);
+        }
+        let key_activated_at_micros = keyring.active_activated_at();
+        if input.source_at_micros.get() < key_activated_at_micros.get() {
+            return Err(TransitionContractError::InvalidMetadata);
+        }
+        let staged_keyring = keyring.encode();
+        let staged_bytes = staged_keyring.expose_secret();
+        if staged_bytes.len() != ACTIVE_ONLY_LENGTH {
+            return Err(TransitionContractError::InvalidInitializationKeyring);
+        }
+        validate_independent_verifier_salts(&input.password_verifier, &input.recovery_verifier)?;
+        let staged_keyring_hash = Sha256::digest(staged_bytes).into();
+        let metadata = Self {
+            transition_id: input.transition_id,
+            owner_id: input.owner_id,
+            audit_id: input.audit_id,
+            result_kid: keyring.active_kid(),
+            result_keyring_version: keyring.version(),
+            key_activated_at_micros,
+            source_at_micros: input.source_at_micros,
+            staged_keyring_length: u32::try_from(staged_bytes.len())
+                .map_err(|_| TransitionContractError::InvalidInitializationKeyring)?,
+            staged_keyring_hash,
+            login_id: input.login_id,
+            password_verifier: input.password_verifier,
+            recovery_verifier: input.recovery_verifier,
+            legacy_policy_provenance: LegacyPolicyProvenance::parse(
+                NO_BLOCKLIST_CHECK_SENTINEL.as_bytes(),
+            )?,
+        };
+        metadata.validate_encoded_length()?;
+        Ok(metadata)
+    }
+
+    pub(crate) fn decode(encoded: SecretBytes) -> Result<Self, TransitionContractError> {
+        let bytes = encoded.expose_secret();
+        if bytes.len() > MAX_INITIALIZATION_METADATA_BYTES
+            || bytes.len() < METADATA_FIXED_HEADER_BYTES + 1 + METADATA_CHECKSUM_BYTES
+            || bytes.get(..METADATA_MAGIC.len()) != Some(METADATA_MAGIC.as_slice())
+        {
+            return Err(TransitionContractError::InvalidMetadata);
+        }
+        if read_u16(bytes, 8)? != METADATA_FORMAT_VERSION {
+            return Err(TransitionContractError::UnsupportedMetadataVersion);
+        }
+        if usize::try_from(read_u32(bytes, 10)?).ok() != Some(bytes.len()) {
+            return Err(TransitionContractError::InvalidMetadata);
+        }
+        if bytes[14] != INITIALIZE_METADATA_TAG {
+            return Err(TransitionContractError::UnsupportedMetadataKind);
+        }
+
+        let checksum_offset = bytes
+            .len()
+            .checked_sub(METADATA_CHECKSUM_BYTES)
+            .ok_or(TransitionContractError::InvalidMetadata)?;
+        if Sha256::digest(&bytes[..checksum_offset]).as_slice() != &bytes[checksum_offset..] {
+            return Err(TransitionContractError::InvalidMetadata);
+        }
+
+        let transition_id = TransitionId::from_bytes(read_slice(bytes, 15, 16)?)?;
+        let owner_id = AuthOwnerId::from_bytes(read_slice(bytes, 31, 16)?)?;
+        let audit_id = AuditId::from_bytes(read_slice(bytes, 47, 16)?)?;
+        let result_kid = KeyId::from_stored_bytes(read_slice(bytes, 63, KID_BYTES)?)
+            .map_err(|_| TransitionContractError::InvalidMetadata)?;
+        let result_keyring_version = KeyringVersion::new(read_u64(bytes, 106)?)
+            .map_err(|_| TransitionContractError::InvalidMetadata)?;
+        if result_keyring_version.get() != 1 {
+            return Err(TransitionContractError::InvalidInitializationKeyring);
+        }
+        let key_activated_at_micros = AuthTimestampMicros::new(read_u64(bytes, 114)?)
+            .map_err(|_| TransitionContractError::InvalidMetadata)?;
+        let source_at_micros = SourceTimestampMicros::new(read_u64(bytes, 122)?)?;
+        if source_at_micros.get() < key_activated_at_micros.get() {
+            return Err(TransitionContractError::InvalidMetadata);
+        }
+        let staged_keyring_length = read_u32(bytes, 130)?;
+        if staged_keyring_length as usize != ACTIVE_ONLY_LENGTH {
+            return Err(TransitionContractError::InvalidInitializationKeyring);
+        }
+        let mut staged_keyring_hash = [0_u8; STAGED_HASH_BYTES];
+        staged_keyring_hash.copy_from_slice(read_slice(bytes, 134, STAGED_HASH_BYTES)?);
+
+        let mut offset = METADATA_FIXED_HEADER_BYTES;
+        let login_length = usize::from(read_byte(bytes, &mut offset, checksum_offset)?);
+        let login_id = LoginId::parse(read_field(
+            bytes,
+            &mut offset,
+            login_length,
+            checksum_offset,
+        )?)?;
+        let password_length = usize::from(read_u16_at_cursor(bytes, &mut offset, checksum_offset)?);
+        let password_verifier = ValidatedVerifier::parse(SecretBytes::new(
+            read_field(bytes, &mut offset, password_length, checksum_offset)?.to_vec(),
+        ))
+        .map_err(|_| TransitionContractError::InvalidMetadata)?;
+        let recovery_length = usize::from(read_u16_at_cursor(bytes, &mut offset, checksum_offset)?);
+        let recovery_verifier = ValidatedVerifier::parse(SecretBytes::new(
+            read_field(bytes, &mut offset, recovery_length, checksum_offset)?.to_vec(),
+        ))
+        .map_err(|_| TransitionContractError::InvalidMetadata)?;
+        let provenance_length = usize::from(read_byte(bytes, &mut offset, checksum_offset)?);
+        let legacy_policy_provenance = LegacyPolicyProvenance::parse(read_field(
+            bytes,
+            &mut offset,
+            provenance_length,
+            checksum_offset,
+        )?)?;
+        if offset != checksum_offset {
+            return Err(TransitionContractError::InvalidMetadata);
+        }
+        validate_independent_verifier_salts(&password_verifier, &recovery_verifier)?;
+
+        let metadata = Self {
+            transition_id,
+            owner_id,
+            audit_id,
+            result_kid,
+            result_keyring_version,
+            key_activated_at_micros,
+            source_at_micros,
+            staged_keyring_length,
+            staged_keyring_hash,
+            login_id,
+            password_verifier,
+            recovery_verifier,
+            legacy_policy_provenance,
+        };
+        let canonical = metadata.encode()?;
+        if canonical.expose_secret() != bytes {
+            return Err(TransitionContractError::InvalidMetadata);
+        }
+        Ok(metadata)
+    }
+
+    pub(crate) fn encode(&self) -> Result<SecretBytes, TransitionContractError> {
+        let total_length = self.encoded_length()?;
+        let mut bytes = Zeroizing::new(Vec::with_capacity(total_length));
+        bytes.extend_from_slice(METADATA_MAGIC);
+        bytes.extend_from_slice(&METADATA_FORMAT_VERSION.to_be_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(total_length)
+                .map_err(|_| TransitionContractError::InvalidMetadata)?
+                .to_be_bytes(),
+        );
+        bytes.push(INITIALIZE_METADATA_TAG);
+        bytes.extend_from_slice(self.transition_id.as_bytes());
+        bytes.extend_from_slice(self.owner_id.as_bytes());
+        bytes.extend_from_slice(self.audit_id.as_bytes());
+        bytes.extend_from_slice(self.result_kid.as_bytes());
+        bytes.extend_from_slice(&self.result_keyring_version.get().to_be_bytes());
+        bytes.extend_from_slice(&self.key_activated_at_micros.get().to_be_bytes());
+        bytes.extend_from_slice(&self.source_at_micros.get().to_be_bytes());
+        bytes.extend_from_slice(&self.staged_keyring_length.to_be_bytes());
+        bytes.extend_from_slice(&self.staged_keyring_hash);
+        push_u8_length_field(&mut bytes, self.login_id.as_bytes())?;
+        push_u16_length_field(&mut bytes, self.password_verifier.expose_phc().as_bytes())?;
+        push_u16_length_field(&mut bytes, self.recovery_verifier.expose_phc().as_bytes())?;
+        push_u8_length_field(&mut bytes, self.legacy_policy_provenance.as_bytes())?;
+        let checksum = Sha256::digest(bytes.as_slice());
+        bytes.extend_from_slice(&checksum);
+        if bytes.len() != total_length {
+            return Err(TransitionContractError::InvalidMetadata);
+        }
+        Ok(SecretBytes::from_zeroizing(bytes))
+    }
+
+    pub(crate) fn validate_staged_keyring(
+        &self,
+        staged_keyring: SecretBytes,
+    ) -> Result<Keyring, TransitionContractError> {
+        if !self.matches_staged_keyring(staged_keyring.expose_secret()) {
+            return Err(TransitionContractError::InvalidInitializationKeyring);
+        }
+        let keyring = Keyring::decode(staged_keyring)
+            .map_err(|_| TransitionContractError::InvalidInitializationKeyring)?;
+        if keyring.version() != self.result_keyring_version
+            || keyring.active_kid() != self.result_kid
+            || keyring.active_activated_at() != self.key_activated_at_micros
+            || keyring.encode().expose_secret().len() != ACTIVE_ONLY_LENGTH
+        {
+            return Err(TransitionContractError::InvalidInitializationKeyring);
+        }
+        Ok(keyring)
+    }
+
+    pub(crate) const fn source_expectation(&self) -> InitializationSourceExpectation<'_> {
+        InitializationSourceExpectation { metadata: self }
+    }
+
+    pub(crate) fn sentinel_source_seed(&self) -> Option<InitializationSourceSeed<'_>> {
+        let expectation = self.source_expectation();
+        (self.source_at_micros.get() > 0 && expectation.uses_no_blocklist_check_policy())
+            .then_some(InitializationSourceSeed { metadata: self })
+    }
+
+    fn matches_staged_keyring(&self, staged_keyring: &[u8]) -> bool {
+        staged_keyring.len() == self.staged_keyring_length as usize
+            && Sha256::digest(staged_keyring).as_slice() == self.staged_keyring_hash
+    }
+
+    pub(crate) fn matches_transition_artifact(&self, artifact: TopLevelArtifactName) -> bool {
+        matches!(
+            artifact,
+            TopLevelArtifactName::Transition {
+                kind: TransitionKind::Initialize,
+                id
+            } if id == self.transition_id
+        )
+    }
+
+    pub(super) fn matches_reservation_artifact(&self, artifact: TopLevelArtifactName) -> bool {
+        matches!(
+            artifact,
+            TopLevelArtifactName::Transition {
+                kind: TransitionKind::Initialize,
+                id
+            } | TopLevelArtifactName::Cleanup {
+                kind: TransitionKind::Initialize,
+                id
+            } if id == self.transition_id
+        )
+    }
+
+    fn encoded_length(&self) -> Result<usize, TransitionContractError> {
+        METADATA_FIXED_HEADER_BYTES
+            .checked_add(1)
+            .and_then(|length| length.checked_add(self.login_id.as_bytes().len()))
+            .and_then(|length| length.checked_add(2))
+            .and_then(|length| length.checked_add(self.password_verifier.expose_phc().len()))
+            .and_then(|length| length.checked_add(2))
+            .and_then(|length| length.checked_add(self.recovery_verifier.expose_phc().len()))
+            .and_then(|length| length.checked_add(1))
+            .and_then(|length| length.checked_add(self.legacy_policy_provenance.as_bytes().len()))
+            .and_then(|length| length.checked_add(METADATA_CHECKSUM_BYTES))
+            .filter(|length| *length <= MAX_INITIALIZATION_METADATA_BYTES)
+            .ok_or(TransitionContractError::InvalidMetadata)
+    }
+
+    fn validate_encoded_length(&self) -> Result<(), TransitionContractError> {
+        self.encoded_length().map(|_| ())
+    }
+}
+
+impl fmt::Debug for InitializationMetadataV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("InitializationMetadataV1([REDACTED])")
+    }
+}
+
+fn validate_independent_verifier_salts(
+    password: &ValidatedVerifier,
+    recovery: &ValidatedVerifier,
+) -> Result<(), TransitionContractError> {
+    let password_salt = password
+        .expose_phc()
+        .rsplit_once('$')
+        .and_then(|(prefix, _)| prefix.rsplit_once('$'))
+        .map(|(_, salt)| salt)
+        .ok_or(TransitionContractError::InvalidMetadata)?;
+    let recovery_salt = recovery
+        .expose_phc()
+        .rsplit_once('$')
+        .and_then(|(prefix, _)| prefix.rsplit_once('$'))
+        .map(|(_, salt)| salt)
+        .ok_or(TransitionContractError::InvalidMetadata)?;
+    if password_salt == recovery_salt {
+        return Err(TransitionContractError::InvalidMetadata);
+    }
+    Ok(())
+}
+
+fn push_u8_length_field(output: &mut Vec<u8>, value: &[u8]) -> Result<(), TransitionContractError> {
+    output.push(u8::try_from(value.len()).map_err(|_| TransitionContractError::InvalidMetadata)?);
+    output.extend_from_slice(value);
+    Ok(())
+}
+
+fn push_u16_length_field(
+    output: &mut Vec<u8>,
+    value: &[u8],
+) -> Result<(), TransitionContractError> {
+    output.extend_from_slice(
+        &u16::try_from(value.len())
+            .map_err(|_| TransitionContractError::InvalidMetadata)?
+            .to_be_bytes(),
+    );
+    output.extend_from_slice(value);
+    Ok(())
+}
+
+fn read_slice(
+    bytes: &[u8],
+    offset: usize,
+    length: usize,
+) -> Result<&[u8], TransitionContractError> {
+    bytes
+        .get(
+            offset
+                ..offset
+                    .checked_add(length)
+                    .ok_or(TransitionContractError::InvalidMetadata)?,
+        )
+        .ok_or(TransitionContractError::InvalidMetadata)
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, TransitionContractError> {
+    let raw: [u8; 2] = read_slice(bytes, offset, 2)?
+        .try_into()
+        .map_err(|_| TransitionContractError::InvalidMetadata)?;
+    Ok(u16::from_be_bytes(raw))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, TransitionContractError> {
+    let raw: [u8; 4] = read_slice(bytes, offset, 4)?
+        .try_into()
+        .map_err(|_| TransitionContractError::InvalidMetadata)?;
+    Ok(u32::from_be_bytes(raw))
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, TransitionContractError> {
+    let raw: [u8; 8] = read_slice(bytes, offset, 8)?
+        .try_into()
+        .map_err(|_| TransitionContractError::InvalidMetadata)?;
+    Ok(u64::from_be_bytes(raw))
+}
+
+fn read_byte(
+    bytes: &[u8],
+    offset: &mut usize,
+    limit: usize,
+) -> Result<u8, TransitionContractError> {
+    if *offset >= limit {
+        return Err(TransitionContractError::InvalidMetadata);
+    }
+    let byte = bytes[*offset];
+    *offset += 1;
+    Ok(byte)
+}
+
+fn read_u16_at_cursor(
+    bytes: &[u8],
+    offset: &mut usize,
+    limit: usize,
+) -> Result<u16, TransitionContractError> {
+    if offset
+        .checked_add(2)
+        .filter(|next| *next <= limit)
+        .is_none()
+    {
+        return Err(TransitionContractError::InvalidMetadata);
+    }
+    let value = read_u16(bytes, *offset)?;
+    *offset += 2;
+    Ok(value)
+}
+
+fn read_field<'a>(
+    bytes: &'a [u8],
+    offset: &mut usize,
+    length: usize,
+    limit: usize,
+) -> Result<&'a [u8], TransitionContractError> {
+    let next = offset
+        .checked_add(length)
+        .filter(|next| *next <= limit)
+        .ok_or(TransitionContractError::InvalidMetadata)?;
+    let value = &bytes[*offset..next];
+    *offset = next;
+    Ok(value)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransitionContractError {
+    InvalidArtifactName,
+    InvalidIdentifier,
+    InvalidLoginId,
+    InvalidLegacyPolicyProvenance,
+    InvalidInitializationKeyring,
+    InvalidMetadata,
+    UnsupportedMetadataVersion,
+    UnsupportedMetadataKind,
+}
+
+impl fmt::Display for TransitionContractError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidArtifactName => "authentication artifact name is invalid",
+            Self::InvalidIdentifier => "authentication transition identifier is invalid",
+            Self::InvalidLoginId => "authentication login identifier is invalid",
+            Self::InvalidLegacyPolicyProvenance => {
+                "authentication legacy policy provenance is invalid"
+            }
+            Self::InvalidInitializationKeyring => {
+                "authentication initialization keyring is invalid"
+            }
+            Self::InvalidMetadata => "authentication transition metadata is invalid",
+            Self::UnsupportedMetadataVersion => {
+                "authentication transition metadata version is unsupported"
+            }
+            Self::UnsupportedMetadataKind => {
+                "authentication transition metadata kind is unsupported"
+            }
+        })
+    }
+}
+
+impl Error for TransitionContractError {}
+
+#[cfg(test)]
+mod tests {
+    use base64ct::{Base64Unpadded, Encoding};
+    use sha2::{Digest, Sha256};
+    use uuid::Uuid;
+
+    use super::{
+        ACTIVE_KEYRING_NAME, AUTH_MAINTENANCE_LOCK_NAME, AuditId, AuthOwnerId,
+        INITIALIZE_METADATA_TAG, InitializationMetadataInput, InitializationMetadataV1,
+        LegacyPolicyProvenance, LoginId, MAX_INITIALIZATION_METADATA_BYTES,
+        METADATA_CHECKSUM_BYTES, METADATA_FIXED_HEADER_BYTES, METADATA_FORMAT_VERSION,
+        METADATA_MAGIC, NO_BLOCKLIST_CHECK_SENTINEL, PREPARED_SENTINEL_NAME, ReservationEntryName,
+        STAGED_KEYRING_NAME, SourceTimestampMicros, TRANSITION_METADATA_NAME, TopLevelArtifactName,
+        TransitionContractError, TransitionId, TransitionKind,
+    };
+    use crate::auth::{
+        SecretBytes, ValidatedVerifier,
+        keyring::{ACTIVE_ONLY_LENGTH, AuthTimestampMicros, Keyring, KeyringVersion},
+    };
+
+    const TRANSITION_UUID: &str = "a1111111-b222-4c33-8d44-e55555555555";
+    const OTHER_UUID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const ACTIVE_AT: u64 = 1_700_000_000_000_000;
+    const RFC8032_SEED_ONE: [u8; 32] = [
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
+        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+        0x7f, 0x60,
+    ];
+
+    fn fixed_id(raw: &str) -> Uuid {
+        Uuid::parse_str(raw).expect("fixed UUID")
+    }
+
+    fn transition_id() -> TransitionId {
+        TransitionId::from_uuid(fixed_id(TRANSITION_UUID)).expect("fixed transition ID")
+    }
+
+    fn owner_id() -> AuthOwnerId {
+        AuthOwnerId::from_uuid(fixed_id("01234567-89ab-4cde-8fab-0123456789ab"))
+            .expect("fixed owner ID")
+    }
+
+    fn audit_id() -> AuditId {
+        AuditId::from_uuid(fixed_id("fedcba98-7654-4321-8abc-fedcba987654"))
+            .expect("fixed audit ID")
+    }
+
+    fn verifier(fill: u8) -> ValidatedVerifier {
+        let salt = Base64Unpadded::encode_string(&[fill; 16]);
+        let output = Base64Unpadded::encode_string(&[fill; 32]);
+        ValidatedVerifier::parse(SecretBytes::new(
+            format!("$argon2id$v=19$m=65536,t=3,p=4${salt}${output}").into_bytes(),
+        ))
+        .expect("canonical synthetic verifier")
+    }
+
+    fn keyring() -> Keyring {
+        Keyring::from_test_seeds(1, ACTIVE_AT, RFC8032_SEED_ONE, None)
+            .expect("fixed initialization keyring")
+    }
+
+    fn metadata() -> InitializationMetadataV1 {
+        InitializationMetadataV1::from_keyring(
+            InitializationMetadataInput {
+                transition_id: transition_id(),
+                owner_id: owner_id(),
+                audit_id: audit_id(),
+                source_at_micros: SourceTimestampMicros::new(ACTIVE_AT + 1)
+                    .expect("source timestamp"),
+                login_id: LoginId::parse(b"owner_01").expect("login ID"),
+                password_verifier: verifier(0x11),
+                recovery_verifier: verifier(0x22),
+            },
+            &keyring(),
+        )
+        .expect("initialization metadata")
+    }
+
+    #[test]
+    fn exact_top_level_and_inner_artifact_names_round_trip() {
+        let id = transition_id();
+        for generated in [
+            TransitionId::new().as_uuid(),
+            AuditId::new().as_uuid(),
+            AuthOwnerId::new().as_uuid(),
+        ] {
+            assert_eq!(generated.get_version(), Some(uuid::Version::Random));
+            assert_eq!(generated.get_variant(), uuid::Variant::RFC4122);
+        }
+        let mut names = vec![
+            TopLevelArtifactName::MaintenanceLock,
+            TopLevelArtifactName::ActiveKeyring,
+            TopLevelArtifactName::InstallTemp { id },
+        ];
+        for kind in TransitionKind::ALL {
+            names.push(TopLevelArtifactName::Transition { kind, id });
+            names.push(TopLevelArtifactName::Cleanup { kind, id });
+        }
+
+        for name in names {
+            let encoded = name.format();
+            assert_eq!(TopLevelArtifactName::parse(encoded.as_bytes()), Ok(name));
+        }
+        assert_eq!(
+            TopLevelArtifactName::MaintenanceLock.format(),
+            AUTH_MAINTENANCE_LOCK_NAME
+        );
+        assert_eq!(
+            TopLevelArtifactName::ActiveKeyring.format(),
+            ACTIVE_KEYRING_NAME
+        );
+        assert_eq!(
+            TopLevelArtifactName::Transition {
+                kind: TransitionKind::Initialize,
+                id
+            }
+            .format(),
+            format!(".auth-transition-initialize-{TRANSITION_UUID}")
+        );
+        assert_eq!(
+            TopLevelArtifactName::InstallTemp { id }.format(),
+            format!(".auth-keyring-install-{TRANSITION_UUID}.tmp")
+        );
+
+        for (raw, expected) in [
+            (
+                TRANSITION_METADATA_NAME.as_bytes(),
+                ReservationEntryName::Metadata,
+            ),
+            (
+                STAGED_KEYRING_NAME.as_bytes(),
+                ReservationEntryName::StagedKeyring,
+            ),
+            (
+                PREPARED_SENTINEL_NAME.as_bytes(),
+                ReservationEntryName::Prepared,
+            ),
+        ] {
+            assert_eq!(ReservationEntryName::parse(raw), Ok(expected));
+            assert_eq!(expected.as_str().as_bytes(), raw);
+        }
+    }
+
+    #[test]
+    fn artifact_names_reject_aliases_wrong_uuid_forms_and_raw_bytes() {
+        let uppercase = TRANSITION_UUID.to_ascii_uppercase();
+        let simple = TRANSITION_UUID.replace('-', "");
+        for invalid in [
+            ".auth-transition-initialize-",
+            ".auth-transition-INITIALIZE-11111111-2222-4333-8444-555555555555",
+            ".auth-transition-unknown-11111111-2222-4333-8444-555555555555",
+            ".auth-transition-initialize-11111111-2222-3333-8444-555555555555",
+            ".auth-transition-initialize-11111111-2222-4333-c444-555555555555",
+            ".auth-transition-initialize-{11111111-2222-4333-8444-555555555555}",
+            "urn:uuid:11111111-2222-4333-8444-555555555555",
+            ".auth-keyring.v1",
+            "auth-keyring.v2",
+            "metadata",
+            ".DS_Store",
+            "../auth-keyring.v1",
+        ] {
+            assert!(
+                TopLevelArtifactName::parse(invalid.as_bytes()).is_err(),
+                "{invalid}"
+            );
+        }
+        for invalid in [
+            format!(".auth-transition-initialize-{uppercase}"),
+            format!(".auth-transition-initialize-{simple}"),
+            format!(".auth-transition-initialize-{TRANSITION_UUID}-tail"),
+            format!(".auth-keyring-install-{uppercase}.tmp"),
+            format!(".auth-keyring-install-{simple}.tmp"),
+            format!(".auth-keyring-install-{TRANSITION_UUID}.TMP"),
+        ] {
+            assert!(
+                TopLevelArtifactName::parse(invalid.as_bytes()).is_err(),
+                "{invalid}"
+            );
+        }
+        for invalid in [
+            b".auth-transition-initialize-\xff".as_slice(),
+            b".auth-transition-initialize-11111111-2222-4333-8444-555555555555\0",
+            b".auth-keyring-install-11111111-2222-4333-8444-555555555555.tmp/child",
+        ] {
+            assert!(TopLevelArtifactName::parse(invalid).is_err());
+        }
+        for invalid in [b"Metadata".as_slice(), b"staged_keyring", b"prepared\0"] {
+            assert!(ReservationEntryName::parse(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn login_and_legacy_policy_provenance_are_exact_ascii_contracts() {
+        for valid in [
+            b"abc".as_slice(),
+            b"a-b",
+            b"a_b",
+            b"a0123456789012345678901234567890",
+        ] {
+            LoginId::parse(valid).expect("valid login ID");
+        }
+        for invalid in [
+            b"ab".as_slice(),
+            b"Aaa",
+            b"1aa",
+            b"a.a",
+            b" aa",
+            b"aaa ",
+            b"a\xffb",
+            b"a01234567890123456789012345678901",
+        ] {
+            assert_eq!(
+                LoginId::parse(invalid).unwrap_err(),
+                TransitionContractError::InvalidLoginId
+            );
+        }
+
+        for valid in [
+            b"v1".as_slice(),
+            NO_BLOCKLIST_CHECK_SENTINEL.as_bytes(),
+            b"legacy-policy-v1",
+        ] {
+            LegacyPolicyProvenance::parse(valid).expect("valid legacy policy provenance");
+        }
+        for invalid in [
+            b"".as_slice(),
+            b"V1",
+            b"1v",
+            b"-v1",
+            b"v1-",
+            b"v_1",
+            b"v1\xff",
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert_eq!(
+                LegacyPolicyProvenance::parse(invalid).unwrap_err(),
+                TransitionContractError::InvalidLegacyPolicyProvenance
+            );
+        }
+    }
+
+    #[test]
+    fn initialization_metadata_has_stable_golden_shape_and_actual_byte_hash() {
+        let metadata_v1 = metadata();
+        let encoded = metadata_v1.encode().expect("encode metadata");
+        let bytes = encoded.expose_secret();
+        assert!(bytes.len() <= MAX_INITIALIZATION_METADATA_BYTES);
+        assert_eq!(&bytes[..8], METADATA_MAGIC);
+        assert_eq!(
+            u16::from_be_bytes(bytes[8..10].try_into().unwrap()),
+            METADATA_FORMAT_VERSION
+        );
+        assert_eq!(
+            u32::from_be_bytes(bytes[10..14].try_into().unwrap()) as usize,
+            bytes.len()
+        );
+        assert_eq!(bytes[14], INITIALIZE_METADATA_TAG);
+        assert_eq!(
+            metadata_v1.legacy_policy_provenance.as_bytes(),
+            NO_BLOCKLIST_CHECK_SENTINEL.as_bytes()
+        );
+
+        let staged = keyring().encode();
+        let staged_bytes = staged.expose_secret().to_vec();
+        assert_eq!(staged_bytes.len(), ACTIVE_ONLY_LENGTH);
+        metadata_v1
+            .validate_staged_keyring(SecretBytes::new(staged_bytes.clone()))
+            .expect("validate staged keyring");
+        let mut changed = staged_bytes.clone();
+        changed[30] ^= 1;
+        assert_eq!(
+            metadata_v1
+                .validate_staged_keyring(SecretBytes::new(changed.clone()))
+                .unwrap_err(),
+            TransitionContractError::InvalidInitializationKeyring
+        );
+        let mut invalid_keyring = metadata();
+        invalid_keyring.staged_keyring_hash = Sha256::digest(&changed).into();
+        assert_eq!(
+            invalid_keyring
+                .validate_staged_keyring(SecretBytes::new(changed))
+                .unwrap_err(),
+            TransitionContractError::InvalidInitializationKeyring
+        );
+        assert_eq!(
+            metadata_v1
+                .validate_staged_keyring(SecretBytes::new(staged_bytes[..169].to_vec()))
+                .unwrap_err(),
+            TransitionContractError::InvalidInitializationKeyring
+        );
+
+        let alternate = Keyring::from_test_seeds(1, ACTIVE_AT, [0x42; 32], None)
+            .expect("alternate keyring")
+            .encode();
+        let mut cross_mismatch = metadata();
+        cross_mismatch.staged_keyring_hash = Sha256::digest(alternate.expose_secret()).into();
+        assert_eq!(
+            cross_mismatch
+                .validate_staged_keyring(alternate)
+                .unwrap_err(),
+            TransitionContractError::InvalidInitializationKeyring
+        );
+
+        let mut version_mismatch = metadata();
+        version_mismatch.result_keyring_version = KeyringVersion::new(2).unwrap();
+        assert_eq!(
+            version_mismatch
+                .validate_staged_keyring(SecretBytes::new(staged_bytes.clone()))
+                .unwrap_err(),
+            TransitionContractError::InvalidInitializationKeyring
+        );
+
+        let mut activation_mismatch = metadata();
+        activation_mismatch.key_activated_at_micros =
+            AuthTimestampMicros::new(ACTIVE_AT + 1).unwrap();
+        assert_eq!(
+            activation_mismatch
+                .validate_staged_keyring(SecretBytes::new(staged_bytes))
+                .unwrap_err(),
+            TransitionContractError::InvalidInitializationKeyring
+        );
+
+        let digest: [u8; 32] = Sha256::digest(bytes).into();
+        assert_eq!(
+            digest,
+            [
+                85, 164, 118, 154, 121, 18, 63, 26, 12, 20, 173, 130, 158, 145, 169, 2, 238, 112,
+                252, 183, 144, 208, 80, 237, 173, 57, 70, 239, 83, 10, 245, 49,
+            ]
+        );
+
+        let decoded = InitializationMetadataV1::decode(SecretBytes::new(bytes.to_vec()))
+            .expect("decode golden metadata");
+        assert_eq!(
+            decoded.encode().unwrap().expose_secret(),
+            encoded.expose_secret()
+        );
+        assert!(
+            decoded.matches_transition_artifact(TopLevelArtifactName::Transition {
+                kind: TransitionKind::Initialize,
+                id: transition_id(),
+            })
+        );
+        assert!(
+            !decoded.matches_transition_artifact(TopLevelArtifactName::Transition {
+                kind: TransitionKind::Initialize,
+                id: TransitionId::from_uuid(fixed_id(OTHER_UUID)).unwrap(),
+            })
+        );
+        assert!(
+            !decoded.matches_transition_artifact(TopLevelArtifactName::Transition {
+                kind: TransitionKind::Planned,
+                id: transition_id(),
+            })
+        );
+    }
+
+    #[test]
+    fn initialization_metadata_rejects_all_truncation_append_and_header_corruption() {
+        let encoded = metadata().encode().expect("encode metadata");
+        let original = encoded.expose_secret();
+        for length in 0..original.len() {
+            assert!(
+                InitializationMetadataV1::decode(SecretBytes::new(original[..length].to_vec()))
+                    .is_err(),
+                "truncation length {length}"
+            );
+        }
+
+        let mut appended = original.to_vec();
+        appended.push(0);
+        assert_eq!(
+            InitializationMetadataV1::decode(SecretBytes::new(appended)).unwrap_err(),
+            TransitionContractError::InvalidMetadata
+        );
+
+        let mut oversized = vec![0_u8; MAX_INITIALIZATION_METADATA_BYTES + 1];
+        oversized[..8].copy_from_slice(METADATA_MAGIC);
+        assert_eq!(
+            InitializationMetadataV1::decode(SecretBytes::new(oversized)).unwrap_err(),
+            TransitionContractError::InvalidMetadata
+        );
+
+        for (offset, replacement, expected) in [
+            (0, b'X', TransitionContractError::InvalidMetadata),
+            (9, 2, TransitionContractError::UnsupportedMetadataVersion),
+            (14, 2, TransitionContractError::UnsupportedMetadataKind),
+        ] {
+            let mut corrupted = original.to_vec();
+            corrupted[offset] = replacement;
+            assert_eq!(
+                InitializationMetadataV1::decode(SecretBytes::new(corrupted)).unwrap_err(),
+                expected
+            );
+        }
+        let mut wrong_length = original.to_vec();
+        wrong_length[10..14].copy_from_slice(&(original.len() as u32 - 1).to_be_bytes());
+        assert_eq!(
+            InitializationMetadataV1::decode(SecretBytes::new(wrong_length)).unwrap_err(),
+            TransitionContractError::InvalidMetadata
+        );
+        let mut checksum_corrupt = original.to_vec();
+        let checksum_offset = checksum_corrupt.len() - METADATA_CHECKSUM_BYTES;
+        checksum_corrupt[checksum_offset] ^= 1;
+        assert_eq!(
+            InitializationMetadataV1::decode(SecretBytes::new(checksum_corrupt)).unwrap_err(),
+            TransitionContractError::InvalidMetadata
+        );
+    }
+
+    #[test]
+    fn metadata_semantics_reject_invalid_ids_kid_version_timestamps_length_login_phc_and_salt_reuse()
+     {
+        let encoded = metadata().encode().expect("encode metadata");
+        let original = encoded.expose_secret();
+        for mutation in [
+            MetadataMutation::Bytes(15, Uuid::nil().as_bytes().to_vec()),
+            MetadataMutation::Bytes(31, Uuid::nil().as_bytes().to_vec()),
+            MetadataMutation::Bytes(47, Uuid::nil().as_bytes().to_vec()),
+            MetadataMutation::Byte(63, b'!'),
+            MetadataMutation::Bytes(106, 2_u64.to_be_bytes().to_vec()),
+            MetadataMutation::Bytes(114, (i64::MAX as u64 + 1).to_be_bytes().to_vec()),
+            MetadataMutation::Bytes(122, (ACTIVE_AT - 1).to_be_bytes().to_vec()),
+            MetadataMutation::Bytes(122, (i64::MAX as u64 + 1).to_be_bytes().to_vec()),
+            MetadataMutation::Bytes(130, 169_u32.to_be_bytes().to_vec()),
+            MetadataMutation::Byte(METADATA_FIXED_HEADER_BYTES, 2),
+        ] {
+            let corrupted = mutate_and_checksum(original, mutation);
+            assert!(InitializationMetadataV1::decode(SecretBytes::new(corrupted)).is_err());
+        }
+
+        let password_length_offset =
+            METADATA_FIXED_HEADER_BYTES + 1 + usize::from(original[METADATA_FIXED_HEADER_BYTES]);
+        let password_length = u16::from_be_bytes(
+            original[password_length_offset..password_length_offset + 2]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let password_offset = password_length_offset + 2;
+        let recovery_length_offset = password_offset + password_length;
+        let recovery_length = u16::from_be_bytes(
+            original[recovery_length_offset..recovery_length_offset + 2]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let recovery_offset = recovery_length_offset + 2;
+
+        let bad_password =
+            mutate_and_checksum(original, MetadataMutation::Byte(password_offset, b'!'));
+        assert_eq!(
+            InitializationMetadataV1::decode(SecretBytes::new(bad_password)).unwrap_err(),
+            TransitionContractError::InvalidMetadata
+        );
+
+        let mut same_salt = original.to_vec();
+        let password = &original[password_offset..password_offset + password_length];
+        let password_salt = phc_salt_range(password);
+        let recovery = &original[recovery_offset..recovery_offset + recovery_length];
+        let recovery_salt = phc_salt_range(recovery);
+        let recovery_salt_absolute =
+            recovery_offset + recovery_salt.start..recovery_offset + recovery_salt.end;
+        same_salt[recovery_salt_absolute].copy_from_slice(&password[password_salt]);
+        refresh_metadata_checksum(&mut same_salt);
+        assert_eq!(
+            InitializationMetadataV1::decode(SecretBytes::new(same_salt)).unwrap_err(),
+            TransitionContractError::InvalidMetadata
+        );
+
+        let same_verifier = InitializationMetadataV1::from_keyring(
+            InitializationMetadataInput {
+                transition_id: transition_id(),
+                owner_id: owner_id(),
+                audit_id: audit_id(),
+                source_at_micros: SourceTimestampMicros::new(ACTIVE_AT).unwrap(),
+                login_id: LoginId::parse(b"owner_01").unwrap(),
+                password_verifier: verifier(0x33),
+                recovery_verifier: verifier(0x33),
+            },
+            &keyring(),
+        );
+        assert!(same_verifier.is_err());
+
+        let verify_only = Keyring::from_test_seeds(
+            1,
+            ACTIVE_AT,
+            RFC8032_SEED_ONE,
+            Some((ACTIVE_AT - 1, [0x22; 32])),
+        )
+        .expect("verify-only keyring");
+        assert_eq!(
+            InitializationMetadataV1::from_keyring(
+                InitializationMetadataInput {
+                    transition_id: transition_id(),
+                    owner_id: owner_id(),
+                    audit_id: audit_id(),
+                    source_at_micros: SourceTimestampMicros::new(ACTIVE_AT).unwrap(),
+                    login_id: LoginId::parse(b"owner_01").unwrap(),
+                    password_verifier: verifier(0x11),
+                    recovery_verifier: verifier(0x22),
+                },
+                &verify_only,
+            )
+            .unwrap_err(),
+            TransitionContractError::InvalidInitializationKeyring
+        );
+    }
+
+    #[test]
+    fn source_timestamp_is_bounded_and_not_before_key_activation() {
+        assert!(SourceTimestampMicros::new(i64::MAX as u64).is_ok());
+        assert_eq!(
+            SourceTimestampMicros::new(i64::MAX as u64 + 1).unwrap_err(),
+            TransitionContractError::InvalidMetadata
+        );
+
+        let input = |source_at_micros| InitializationMetadataInput {
+            transition_id: transition_id(),
+            owner_id: owner_id(),
+            audit_id: audit_id(),
+            source_at_micros,
+            login_id: LoginId::parse(b"owner_01").unwrap(),
+            password_verifier: verifier(0x11),
+            recovery_verifier: verifier(0x22),
+        };
+        InitializationMetadataV1::from_keyring(
+            input(SourceTimestampMicros::new(ACTIVE_AT).unwrap()),
+            &keyring(),
+        )
+        .expect("equal activation and source timestamps are valid");
+        assert_eq!(
+            InitializationMetadataV1::from_keyring(
+                input(SourceTimestampMicros::new(ACTIVE_AT - 1).unwrap()),
+                &keyring(),
+            )
+            .unwrap_err(),
+            TransitionContractError::InvalidMetadata
+        );
+        InitializationMetadataV1::from_keyring(
+            input(SourceTimestampMicros::new(i64::MAX as u64).unwrap()),
+            &keyring(),
+        )
+        .expect("maximum SQLite timestamp is valid");
+    }
+
+    #[test]
+    fn decoder_preserves_canonical_legacy_policy_provenance_without_rewrite() {
+        const HISTORICAL_VERSION: &[u8] = b"pov-blocklist-v0-4deb3704dc42b9a0";
+
+        let encoded = metadata().encode().expect("encode metadata");
+        let mut historical = encoded.expose_secret().to_vec();
+        let mut offset = METADATA_FIXED_HEADER_BYTES;
+        offset += 1 + usize::from(historical[offset]);
+        let password_length = usize::from(u16::from_be_bytes(
+            historical[offset..offset + 2].try_into().unwrap(),
+        ));
+        offset += 2 + password_length;
+        let recovery_length = usize::from(u16::from_be_bytes(
+            historical[offset..offset + 2].try_into().unwrap(),
+        ));
+        offset += 2 + recovery_length;
+        let provenance_length = usize::from(historical[offset]);
+        let provenance_end = offset + 1 + provenance_length;
+        historical.splice(
+            offset..provenance_end,
+            std::iter::once(HISTORICAL_VERSION.len() as u8)
+                .chain(HISTORICAL_VERSION.iter().copied()),
+        );
+        let total_length = u32::try_from(historical.len()).unwrap();
+        historical[10..14].copy_from_slice(&total_length.to_be_bytes());
+        refresh_metadata_checksum(&mut historical);
+
+        let decoded =
+            InitializationMetadataV1::decode(SecretBytes::new(historical.clone())).unwrap();
+        assert_eq!(
+            decoded.legacy_policy_provenance.as_bytes(),
+            HISTORICAL_VERSION
+        );
+        assert!(
+            !decoded
+                .source_expectation()
+                .uses_no_blocklist_check_policy()
+        );
+        assert_eq!(decoded.encode().unwrap().expose_secret(), historical);
+    }
+
+    #[test]
+    fn sentinel_is_rollback_only_from_the_legacy_runtime_perspective() {
+        const LEGACY_RUNTIME_CURRENT_MARKER: &[u8] = b"pov-blocklist-v1-4deb3704dc42b9a0";
+
+        let metadata = metadata();
+        let expectation = metadata.source_expectation();
+        assert!(expectation.uses_no_blocklist_check_policy());
+        assert!(
+            expectation.matches_legacy_policy_provenance(NO_BLOCKLIST_CHECK_SENTINEL.as_bytes())
+        );
+        assert!(!expectation.matches_legacy_policy_provenance(LEGACY_RUNTIME_CURRENT_MARKER));
+        assert!(metadata.sentinel_source_seed().is_some());
+    }
+
+    #[test]
+    fn metadata_and_contract_debug_are_redacted() {
+        let metadata = metadata();
+        let input = InitializationMetadataInput {
+            transition_id: transition_id(),
+            owner_id: owner_id(),
+            audit_id: audit_id(),
+            source_at_micros: SourceTimestampMicros::new(ACTIVE_AT).unwrap(),
+            login_id: LoginId::parse(b"secret_owner").unwrap(),
+            password_verifier: verifier(0x11),
+            recovery_verifier: verifier(0x22),
+        };
+        let rendered = format!(
+            "{metadata:?} {:?} {input:?} {:?} {:?} {:?} {:?} {:?}",
+            metadata.source_expectation(),
+            transition_id(),
+            owner_id(),
+            audit_id(),
+            LoginId::parse(b"secret_owner").unwrap(),
+            LegacyPolicyProvenance::parse(b"secret-version-1").unwrap(),
+        );
+        for secret in [
+            "secret_owner",
+            "secret-version-1",
+            TRANSITION_UUID,
+            "$argon2id$",
+        ] {
+            assert!(!rendered.contains(secret), "{secret}");
+        }
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(
+            !TransitionContractError::InvalidMetadata
+                .to_string()
+                .contains("secret")
+        );
+    }
+
+    enum MetadataMutation {
+        Byte(usize, u8),
+        Bytes(usize, Vec<u8>),
+    }
+
+    fn mutate_and_checksum(original: &[u8], mutation: MetadataMutation) -> Vec<u8> {
+        let mut bytes = original.to_vec();
+        match mutation {
+            MetadataMutation::Byte(offset, value) => bytes[offset] = value,
+            MetadataMutation::Bytes(offset, value) => {
+                bytes[offset..offset + value.len()].copy_from_slice(&value);
+            }
+        }
+        refresh_metadata_checksum(&mut bytes);
+        bytes
+    }
+
+    fn refresh_metadata_checksum(bytes: &mut [u8]) {
+        let checksum_offset = bytes.len() - METADATA_CHECKSUM_BYTES;
+        let checksum = Sha256::digest(&bytes[..checksum_offset]);
+        bytes[checksum_offset..].copy_from_slice(&checksum);
+    }
+
+    fn phc_salt_range(phc: &[u8]) -> std::ops::Range<usize> {
+        let mut dollar_offsets = phc
+            .iter()
+            .enumerate()
+            .filter_map(|(index, byte)| (*byte == b'$').then_some(index));
+        let _leading = dollar_offsets.next().unwrap();
+        let _algorithm = dollar_offsets.next().unwrap();
+        let _version = dollar_offsets.next().unwrap();
+        let parameters = dollar_offsets.next().unwrap();
+        let salt_end = dollar_offsets.next().unwrap();
+        parameters + 1..salt_end
+    }
+}

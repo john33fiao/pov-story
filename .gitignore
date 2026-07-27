@@ -1,0 +1,68 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jwk
+secrets/
+credentials/
+
+# Rust
+target/
+
+# Node and frontend output
+node_modules/
+dist/
+coverage/
+.vite/
+
+# Local application state and personal data
+data/
+var/
+runtime/
+blob/
+uploads/
+recordings/
+transcripts/
+backups/
+exports/
+logs/
+*.log
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Local models and inference artifacts
+models/
+artifacts/
+*.gguf
+*.safetensors
+*.onnx
+*.pt
+*.pth
+*.tflite
+
+# Local tunnel and deployment state
+.cloudflared/
+.wrangler/
+
+# Private reference material
+docs/refs/private/
+
+# IDE and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# AGENTS
+.agents
+AGENTS.md
+.codex
