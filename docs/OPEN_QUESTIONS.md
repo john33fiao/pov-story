@@ -50,6 +50,4 @@
 
 - Cloudflare zone, Tunnel replica, WAF/rate limit/Turnstile baseline과 incident alert는?
 - backup, export, restore, explicit purge policy와 recovery objective는?
-- 완료된 POV-031 current-tree inventory를 근거로 project-owned code에 MIT를 적용할지,
-  dependency-owned license metadata와 외부 contribution policy를 어떻게 분리할 것인가?
-- POV-032 residual review 뒤 repository를 public으로 다시 전환할 것인가?
+- 외부 contribution을 받을 경우 제출, 검토와 라이선스 동의 정책을 어떻게 정의할 것인가?

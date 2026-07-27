@@ -11,6 +11,11 @@
 채택했습니다. 이 ADR은 ADR-0004의 blocklist-specific 계약만 부분 supersede하며,
 나머지 authentication/session 계약은 그대로 유지합니다.
 
+같은 날 sanitized current tree를 새 public repository history에 반입해 저장소를 다시
+시작했습니다. 이 ADR의 persisted compatibility 결정은 계속 유효하지만 기존 history
+정리 계획인 [POV-032](../deps/POV-032-purge-password-blocklist-history-and-caches.md)는
+현재 저장소에 적용할 대상이 없어 superseded archive로 닫혔습니다.
+
 ## Context
 
 POV-031은 password blocklist corpus, updater와 enforcement API를 current tree에서
@@ -51,8 +56,8 @@ Migration `0004`와 `0005`는 적용된 immutable prefix입니다. 수정하거�
   있어야 합니다.
 - application rollback 시 새 persisted state를 구버전 decoder가 가능한 한 안전하게
   처리해야 합니다.
-- POV-031을 가장 작은 reviewable current-tree 변경으로 유지하고 POV-032의
-  destructive history 작업을 섞지 않아야 합니다.
+- 당시 POV-031을 가장 작은 reviewable current-tree 변경으로 유지하고 별도 승인이
+  필요했던 history-remediation 절차를 섞지 않아야 합니다.
 
 ## Compatibility Candidates
 
@@ -350,8 +355,10 @@ Candidate 1은 이 POV-031 slice에서 거절합니다.
   atomicity residual은 기존 auth transition contract에 남습니다.
 - Future schema cleanup은 table rebuild/backfill, dual read, downgrade와 backup/restore
   영향을 다시 결정해야 합니다.
-- Current-tree 제거는 Git history, clone, fork와 cache에서 과거 material을 회수하지
-  않습니다. 그 범위는 POV-032와 별도 explicit approval이 소유합니다.
+- POV-031 current-tree 제거만으로는 당시 Git history, clone, fork와 cache에서 과거
+  material을 회수하지 못했습니다. 현재 저장소는 기존 Git graph를 반입하지 않은
+  fresh-history restart로 이 상속 위험을 제거했지만, 이전 저장소의 외부 copy 부재까지
+  보증하지 않습니다.
 
 ## Rollout And Rollback
 
@@ -362,13 +369,14 @@ Candidate 1은 이 POV-031 slice에서 거절합니다.
 3. Sentinel 신규 fixture, legacy pre/post-source, mixed-state, commit-uncertainty,
    서로 다른 길이의 metadata v1 round-trip과 구버전 downgrade classification을
    검증했습니다.
-4. POV-031 current-tree inventory는 완료됐지만 license decision과 public visibility
-   review는 각각 별도 gate로 남습니다.
+4. POV-031 current-tree inventory 뒤 project-owned code에 MIT License를 적용했고,
+   sanitized current tree만 새 public repository history에 반입했습니다.
 5. Application rollback은 DB와 metadata를 rewrite하지 않습니다. 구버전 binary가
    sentinel pre-source를 만나면 rollback-only, exact post-source를 만나면
    forward-only로 처리하는 compatibility를 검증합니다.
-6. POV-032가 시작된 뒤에는 과거 material을 current tree나 public history에 복원하는
-   rollback을 사용하지 않습니다.
+6. POV-032의 destructive rewrite 절차는 repository restart로 superseded됐습니다.
+   현재 저장소 운영 정책은 과거 material 복원이나 old history force-push를 rollback
+   경로로 두지 않습니다.
 
 ## Approval Record
 
@@ -390,6 +398,6 @@ Candidate 1은 이 POV-031 slice에서 거절합니다.
 - [ADR-0004](0004-local-authentication-and-session-security-contract.md)
 - [POV-007](../tickets/POV-007-local-login-refresh-and-session-revoke.md)
 - [POV-031](../deps/POV-031-remove-password-blocklist-feature.md)
-- [POV-032](../tickets/POV-032-purge-password-blocklist-history-and-caches.md)
+- [POV-032](../deps/POV-032-purge-password-blocklist-history-and-caches.md)
 - [Architecture](../ARCHITECTURE.md)
 - [Roadmap](../WBS.md)

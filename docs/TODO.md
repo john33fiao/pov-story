@@ -4,16 +4,16 @@ Last updated: 2026-07-27
 
 Current phase: H6 follow-on direction accepted; H-1 discovery plan registered, H0 completed including Windows workspace validation baseline, H1 delivery gated by external POV-022 evidence
 
-Repository posture: password blocklist 권리·노출 검토를 위한 temporary private containment active; POV-031 current-tree cleanup completed, public 재검토는 POV-032 residual review 뒤 별도 결정
+Repository posture: public fresh-history baseline verified 2026-07-27; POV-031 compatibility preserved, POV-032 superseded by repository restart, project-owned code licensed under MIT
 
 ## Security Remediation
 
 | Item | Status | Outcome |
 | --- | --- | --- |
-| Repository private containment | Completed — user-confirmed 2026-07-26; anonymous repository/raw/known-commit URLs return `404` | 추가 unauthenticated 노출을 줄였지만 clone, fork, cache와 Git history 제거를 의미하지 않음 |
+| Fresh public repository baseline | Completed — 2026-07-27; new three-commit reachable history and tracked-content hygiene verified | sanitized current tree만 반입했고 과거 corpus/updater/module path와 unreachable object가 없음; 이전 저장소의 외부 copy 부재까지 보증하지 않음 |
 | [POV-034 Restore Windows workspace validation baseline](deps/POV-034-restore-windows-workspace-validation-baseline.md) | Completed — Windows workspace와 Unix auth suite verified 2026-07-27 | Unix auth maintenance 경계를 유지하면서 Windows `pov-core`/workspace compile·test baseline 복구 |
 | [POV-031 Remove password blocklist feature](deps/POV-031-remove-password-blocklist-feature.md) | Completed — 2026-07-27; ADR-0005 Accepted, current-tree removal and compatibility verified | corpus, updater와 enforcement를 제거하고 sentinel/legacy persisted compatibility를 fail closed로 보존 |
-| [POV-032 Purge password blocklist history and caches](tickets/POV-032-purge-password-blocklist-history-and-caches.md) | Planned — POV-031 dependency completed; explicit destructive-action approval required | affected refs/history를 정리하고 GitHub/search/archive residual을 검증 |
+| [POV-032 Purge password blocklist history and caches](deps/POV-032-purge-password-blocklist-history-and-caches.md) | Superseded — 2026-07-27 repository restart | 기존 history-remediation 절차는 새 저장소에 적용할 대상이 없어 archive로 닫고 현재 저장소 검증 경계만 보존 |
 
 ## Now
 
@@ -58,8 +58,9 @@ H3~H5 상세 delivery ticket은 [POV-021](tickets/POV-021-voice-round-trip-evide
 
 - [x] [POV-034](deps/POV-034-restore-windows-workspace-validation-baseline.md)에서 POV-031 선행 Windows workspace compile/test baseline 복구
 - [x] [ADR-0005](decisions/0005-password-blocklist-removal-and-legacy-auth-compatibility.md)에서 POV-031 persisted compatibility 전략 승인 및 [POV-031](deps/POV-031-remove-password-blocklist-feature.md) current-tree 제거 완료
-- [ ] 완료된 POV-031 current-tree inventory를 근거로 프로젝트 라이선스와 외부 contribution 정책 선택
-- [ ] POV-032 완료와 residual review 뒤 public visibility 재개 여부 결정
+- [x] 완료된 POV-031 current-tree inventory를 근거로 project-owned code에 MIT License 적용
+- [x] 새 public repository history와 tracked-content baseline을 확인하고 POV-032를 superseded archive로 종료
+- [ ] 외부 contribution을 받을 경우 제출·검토·라이선스 동의 정책 결정
 - [ ] POV-022에서 first segment, voice wedge, correction/source trust와 purge expectation 검증
 - [x] POV-001에서 Rust toolchain, Node version, package manager를 실제 manifest와 함께 고정
 - [x] [ADR-0004](decisions/0004-local-authentication-and-session-security-contract.md)에서 authentication cryptography, key lifecycle과 refresh lifetime 결정
@@ -76,14 +77,16 @@ H3~H5 상세 delivery ticket은 [POV-021](tickets/POV-021-voice-round-trip-evide
 
 ## Initialization Verification
 
-- [x] initial public repository visibility 확인; 2026-07-26 private containment으로 전환
+- [x] 2026-07-27 새 public repository visibility와 fresh reachable-history baseline 확인
 - [x] README, architecture, TODO, WBS, tickets, decisions, refs/deps spine 작성
 - [x] `.agents`, `.codex`, `AGENTS.md`를 local-only ignore 대상으로 분리
 - [x] public data/secret ignore policy 작성
-- [ ] POV-031 current-tree inventory 완료 뒤 project license와 contribution policy 별도 선택
+- [x] POV-031 current-tree inventory 뒤 project-owned code에 MIT License 적용
+- [ ] 외부 contribution policy 별도 결정
 
 ## Recently Completed
 
+- 2026-07-27: 새 public repository의 fresh reachable history와 tracked-content hygiene를 확인하고 [POV-032](deps/POV-032-purge-password-blocklist-history-and-caches.md)를 repository restart로 superseded 처리.
 - 2026-07-27: [POV-031](deps/POV-031-remove-password-blocklist-feature.md) ADR-0005 Accepted, current-tree corpus/updater/enforcement 제거와 sentinel/legacy persisted compatibility 검증 완료.
 - 2026-07-27: [POV-034](deps/POV-034-restore-windows-workspace-validation-baseline.md) Unix-only auth record module/import/type gate alignment, Windows workspace check/test and Unix auth maintenance regression evidence completed.
 - 2026-07-25: [POV-006](deps/POV-006-provider-ports-and-safe-process-supervisor.md) provider ports, actual-byte provenance and macOS/POSIX one-shot process trust, bounded output, cancellation/tree cleanup evidence completed.

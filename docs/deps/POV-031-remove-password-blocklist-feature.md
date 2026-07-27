@@ -8,18 +8,18 @@ Roadmap: Cross-cutting H0/H1 maintenance
 
 Depends on: [POV-034 completed](../deps/POV-034-restore-windows-workspace-validation-baseline.md); POV-005 accepted; current implemented POV-007 auth contract, not POV-007 completion
 
-Blocks: POV-032, POV-007 production activation, public visibility review, project-license finalization
+Blocks: None — POV-007의 이 선행 조건은 충족됐고 POV-032는 repository restart로 superseded
 
 ## Why
 
-현재 repository는 침해 사고에서 수집·재배포된 password 후보를 변환한 plaintext
-blocklist를 source asset으로 포함합니다. 각 문자열이 POV Story 사용자의 credential이나
-account mapping은 아니지만, 원천 데이터의 성격과 제3자 권리 범위가 public product
-repository에 계속 보존하기에 적절하지 않습니다.
+이 작업이 시작될 당시 repository는 침해 사고에서 수집·재배포된 password 후보를 변환한
+plaintext blocklist를 source asset으로 포함했습니다. 각 문자열이 POV Story 사용자의
+credential이나 account mapping은 아니었지만, 원천 데이터의 성격과 제3자 권리 범위가
+public product repository에 계속 보존하기에 적절하지 않았습니다.
 
-2026-07-26 private 전환은 추가 공개 노출을 줄이는 containment일 뿐 이미 공개된 Git
-object, clone, fork와 cache를 회수하지 않습니다. Current tree에서는 자료를 다른 corpus로
-교체하지 않고 password blocklist 기능 자체를 제거합니다.
+2026-07-26 당시 private 전환은 추가 공개 노출을 줄이는 containment일 뿐 이미 공개된
+Git object, clone, fork와 cache를 회수하지 못했습니다. POV-031은 자료를 다른 corpus로
+교체하지 않고 password blocklist 기능 자체를 current tree에서 제거했습니다.
 
 ## Decision
 
@@ -37,9 +37,10 @@ corpus evaluation 통과가 아니라 corpus evaluation을 주장하지 않는�
 Common/compromised password 방어가 줄어드는 trade-off는 숨기지 않고 새 ADR과 release
 review에 기록합니다.
 
-## Current Coupling
+## Removal-Time Coupling
 
-이 기능은 asset 하나가 아니라 다음 persisted/runtime contract에 연결되어 있습니다.
+제거 당시 이 기능은 asset 하나가 아니라 다음 persisted/runtime contract에 연결되어
+있었습니다.
 
 - `vendor/password-blocklist/`의 plaintext asset, manifest와 third-party notices
 - `scripts/update-password-blocklist.mjs`의 deterministic updater와 filesystem self-test
@@ -54,8 +55,8 @@ review에 기록합니다.
   `auth_password_credentials.blocklist_version`
 - ADR-0004, Architecture, POV-007, README와 project-local RTD validation
 
-Local audit에서 current plaintext asset은 437개 후보, 8,161 bytes입니다. Ticket과 log에는
-후보 문자열을 복사하지 않습니다.
+당시 local audit에서 plaintext asset은 437개 후보, 8,161 bytes였습니다. Ticket과 log에는
+후보 문자열을 복사하지 않았습니다.
 
 ## Scope
 
@@ -113,7 +114,8 @@ persisted slot은 legacy policy provenance로 유지하고 신규 write는 exact
   strategy로 기존 상태를 결정론적으로 처리합니다.
 - 모든 current/historical initialization phase가 forward, rollback, operator action 또는
   fail-closed 중 하나로 명시되고 mixed state에서 listener를 열지 않습니다.
-- current tree의 third-party inventory가 project-license 검토에 사용할 수 있게 갱신됩니다.
+- current tree의 third-party inventory가 후속 MIT License 결정에 사용할 수 있게
+  갱신됩니다.
 - 영향받는 정본 문서와 실제 fast validation command가 같은 변경에서 동기화됩니다.
 
 ## Verification
@@ -130,17 +132,24 @@ persisted slot은 legacy policy provenance로 유지하고 신규 write는 exact
 
 ## Rollout And Rollback
 
-POV-031은 history rewrite 전에 reviewable commit으로 완료합니다. 구현 문제가 생기면
-repository가 private인 동안 그 commit만 되돌리고 기존 persisted state를 보존합니다.
-POV-032가 시작된 뒤에는 removed corpus를 public history에 복원하는 방식으로 rollback하지
-않습니다.
+POV-031은 당시 별도 history-remediation 절차보다 먼저 reviewable current-tree
+변경으로 완료했습니다. Persisted state를 보존하는 application rollback 경계는
+[ADR-0005](../decisions/0005-password-blocklist-removal-and-legacy-auth-compatibility.md)를
+따릅니다.
+
+2026-07-27 sanitized current tree만 새 public repository history에 반입했습니다. 기존
+history-remediation 계획은
+[POV-032](POV-032-purge-password-blocklist-history-and-caches.md)에 superseded closure로
+보존하며 현재 저장소 운영 정책은 corpus 복원이나 old history force-push를 rollback
+경로로 두지 않습니다.
 
 ## License Boundary
 
-POV-031 완료가 곧 MIT 적용을 뜻하지 않습니다. Current tree에 남는 code, asset, generated
-material과 notice를 별도로 inventory한 뒤 project-owned 범위와 third-party 범위를 구분해
-LICENSE/NOTICE 정책을 결정합니다. 새 project license는 기존 third-party material이나 과거
-commit의 권리를 자동으로 바꾸지 않습니다.
+POV-031 완료 뒤 current tree의 code, asset, generated material과 notice를 inventory하고
+project-owned 범위에 MIT License를 적용했습니다. Rust/npm dependency와 그 license
+metadata는 dependency-owned 범위로 유지하며 MIT 적용은 기존 third-party material이나
+과거 commit의 권리를 소급해 바꾸지 않습니다. 외부 contribution policy는 별도
+미결정입니다.
 
 ## Completion Evidence
 
@@ -160,10 +169,11 @@ commit의 권리를 자동으로 바꾸지 않습니다.
   유지했습니다.
 - Current-tree inventory에서 별도 vendored source asset/notice는 남지 않았습니다.
   Rust/npm dependency declaration과 dependency-owned license metadata는 남으며 project
-  LICENSE와 contribution policy는 별도 결정입니다.
+  code에는 MIT License를 적용했고 contribution policy는 별도 결정입니다.
 - Windows 전체 workspace와 Ubuntu WSL Unix auth maintenance suite, release build,
   smoke, frontend 검증과 removal/binary 검사를 완료 조건으로 실행했습니다.
 
-POV-031은 current tree만 정리했습니다. Git history, ref, remote/cache와 public visibility는
-명시적 파괴 작업 승인이 필요한 [POV-032](../tickets/POV-032-purge-password-blocklist-history-and-caches.md)
-범위로 남습니다.
+POV-031은 current tree 제거와 persisted compatibility를 완료했습니다. 이후 repository
+restart에서 기존 Git graph를 반입하지 않았으므로 history rewrite는 현재 저장소의 pending
+작업이 아닙니다. 이 결론과 외부 copy에 대한 보증 한계는
+[POV-032](POV-032-purge-password-blocklist-history-and-caches.md)에 보존합니다.

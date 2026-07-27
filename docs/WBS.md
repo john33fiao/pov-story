@@ -32,22 +32,25 @@ Last reviewed: 2026-07-27
 - daily/weekly compaction과 search-quality tuning: 실제 corpus와 versioned regression evidence가 생길 때
 - web search와 image generation: core memory를 오염시키지 않는 allowlist, quota, approval와 retention policy가 있을 때
 
-## Urgent Repository Safety Interlock
+## Repository Safety Baseline
 
-이 maintenance track은 product horizon을 바꾸지 않지만 H1 auth activation, project-license
-finalization과 public visibility review보다 먼저 닫습니다. Temporary private 전환은
-containment이며 history/cache cleanup의 완료 증거가 아닙니다.
+이 maintenance track은 product horizon을 바꾸지 않으며 2026-07-27 repository restart로
+닫혔습니다. Sanitized current tree만 새 public history에 반입했고 현재 저장소에는 별도
+history rewrite나 visibility review가 pending 상태로 남아 있지 않습니다. 검증 결과는 현재
+저장소의 reachable object와 추적 파일에 한정하며 이전 저장소의 외부 copy 부재를
+보증하지 않습니다.
 
 | Order | Ticket | Status | Depends on | Reviewable outcome |
 | --- | --- | --- | --- | --- |
 | S0 | [POV-034 Restore Windows workspace validation baseline](deps/POV-034-restore-windows-workspace-validation-baseline.md) | Completed | POV-001 | Unix auth maintenance 경계를 활성화하지 않고 Windows `pov-core`/workspace compile·test baseline 복구 |
 | S1 | [POV-031 Remove password blocklist feature](deps/POV-031-remove-password-blocklist-feature.md) | Completed — 2026-07-27 | POV-034 completed, POV-005, POV-007 current contract | ADR-0005 Accepted, current tree corpus/updater/enforcement 제거와 immutable migration 기반 sentinel/legacy compatibility 검증 |
-| S2 | [POV-032 Purge password blocklist history and caches](tickets/POV-032-purge-password-blocklist-history-and-caches.md) | Planned; POV-031 completed, destructive execution needs explicit approval | POV-031 completed, repository private | affected refs/history 제거와 GitHub/search/archive residual evidence |
-| S3 | Project license review | Decision gate | POV-031 current-tree third-party inventory completed | project-owned MIT 범위, dependency-owned license metadata와 contribution policy 결정 |
-| S4 | Public visibility review | Decision gate | POV-032 residual review | private 유지 또는 public 재개를 별도 승인 |
+| S2 | [POV-032 Purge password blocklist history and caches](deps/POV-032-purge-password-blocklist-history-and-caches.md) | Superseded — repository restart | POV-031 completed | 새 reachable history에 과거 corpus/updater/module path와 unreachable object가 없음을 확인하고 기존 rewrite 절차를 archive |
+| S3 | Project license review | Completed — MIT | POV-031 current-tree third-party inventory completed | project-owned code는 MIT, dependency license는 dependency-owned 범위로 분리; contribution policy만 미결 |
+| S4 | Public repository posture | Confirmed — 2026-07-27 | fresh repository baseline | 새 저장소가 public이며 sanitized current tree만 반입된 상태를 정본으로 채택 |
 
-POV-032의 history rewrite는 project license를 과거 third-party material에 소급 적용하지
-않으며, public visibility는 S4 전까지 활성화하지 않습니다.
+이 track은 H1 activation을 더 이상 막지 않습니다. POV-007의 남은 수용 기준과 POV-022
+evidence gate는 각각의 active ticket을 따르며, 향후 visibility나 repository-security
+정책을 바꾸면 새 decision record로 관리합니다.
 
 ## H6 Follow-on Backlog
 
@@ -150,10 +153,10 @@ evidence를 다시 읽고 Ready 여부를 판단합니다.
 ## Decision Gates
 
 - POV-031 구현 선행 조건: [POV-034](deps/POV-034-restore-windows-workspace-validation-baseline.md) Windows baseline과 [ADR-0005](decisions/0005-password-blocklist-removal-and-legacy-auth-compatibility.md) Accepted 충족; [POV-031](deps/POV-031-remove-password-blocklist-feature.md) 완료
+- repository safety baseline: 새 public history 검증, MIT 적용과 [POV-032](deps/POV-032-purge-password-blocklist-history-and-caches.md) superseded archive 완료
 - H1 delivery 시작 전: POV-022에서 first segment와 voice wedge를 proceed 또는 좁은 scope로 확인
 - POV-007 production activation 전: ADR-0005/POV-031 gate 완료; 남은 POV-022와 POV-007 수용 기준 검증
-- project-license 결정 전: 완료된 POV-031 current-tree inventory를 검토
-- public visibility 재개 전: POV-032 history/cache residual과 detached fork/clone 한계를 검토
+- 외부 contribution 허용 전: 제출·검토·라이선스 동의 정책 확정
 - authentication 구현 전: [ADR-0004](decisions/0004-local-authentication-and-session-security-contract.md) Accepted
 - 실제 voice Blob 저장 전: POV-014의 encryption, retention, quota와 purge contract accepted
 - model artifact를 release default로 만들기 전: versioned quality threshold, artifact hash와 rollback 기준 고정

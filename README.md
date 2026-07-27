@@ -14,7 +14,7 @@ H1 delivery는 [POV-022 discovery gate](docs/tickets/POV-022-first-segment-and-v
 
 ## 빠른 실행
 
-고정된 개발 기준은 Rust `1.95.0`, Node.js `26.4.0`, npm `11.17.0`입니다. Vite asset을 Rust binary에 포함하므로 frontend를 먼저 build합니다.
+고정된 개발 기준은 Rust `1.95.0`, Node.js `26.4.0`, npm `11.17.0`입니다. Vite asset을 Rust binary에 포함하므로 frontend를 먼저 build합니다. `.nvmrc`가 Node 기준 버전의 정본이며, 아래 `nvm` 명령은 Unix 계열 shell 기준입니다. Windows PowerShell에서는 nvm-windows 등 호환 version manager로 Node.js `26.4.0`을 선택한 뒤 npm 명령부터 실행합니다.
 
 ```bash
 nvm install
@@ -46,6 +46,7 @@ git diff --check
 
 변경 영역별 전체 fast/conditional 검증은 해당 ticket과 project workflow를 따릅니다.
 [POV-034](docs/deps/POV-034-restore-windows-workspace-validation-baseline.md)는 Windows와 Unix의 platform-gated auth/storage 검증 증거를 함께 보존합니다.
+Windows에서 `scripts/smoke.sh`를 실행하려면 Git Bash 또는 WSL처럼 POSIX shell을 제공하는 환경이 필요합니다.
 
 ## 문서
 
@@ -65,7 +66,9 @@ git diff --check
 
 ## Security
 
-2026-07-26에 password blocklist 관련 권리·노출 검토를 위해 저장소를 임시 private으로 전환했습니다. [POV-031](docs/deps/POV-031-remove-password-blocklist-feature.md)은 2026-07-27 current tree의 corpus, updater와 enforcement를 제거하고 immutable migration을 보존한 compatibility 전환을 완료했습니다. Private 전환과 current-tree 제거는 기존 clone, fork, cache나 Git history를 지우지 않으며, 그 범위는 별도 승인 전까지 [POV-032](docs/tickets/POV-032-purge-password-blocklist-history-and-caches.md)가 소유합니다.
+2026-07-27 sanitized current tree를 새 public repository history에 반입해 저장소를 다시 시작했습니다. 재시작 시점의 reachable history는 세 commit뿐이며 과거 `vendor/password-blocklist/`, updater와 embedded blocklist module 경로가 없고 unreachable Git object나 추적 파일의 원본 corpus도 발견되지 않았습니다. [POV-031](docs/deps/POV-031-remove-password-blocklist-feature.md)의 immutable migration과 sentinel/legacy compatibility는 그대로 보존합니다. 기존 history 정리 계획인 [POV-032](docs/deps/POV-032-purge-password-blocklist-history-and-caches.md)는 현재 저장소에 적용할 작업이 없어 superseded archive로 닫았습니다.
+
+이 검증은 현재 저장소의 reachable object와 추적 파일 경계만 설명합니다. 이전 저장소에서 제3자가 만들었을 수 있는 clone, cache, screenshot 또는 offline archive가 없음을 보증하지 않습니다.
 
 ## License
 
