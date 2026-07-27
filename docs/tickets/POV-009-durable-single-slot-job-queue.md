@@ -112,7 +112,7 @@ dispatcher를 중지하고 queued/running job을 안전한 terminal 또는 pendi
 - POV-010이 authenticated local text intake와 durable receipt를 실제 Web Chat에 연결해야 합니다.
 - POV-011이 owner-scoped event history를 authenticated replayable SSE cursor로 노출해야 합니다.
 - POV-012가 supervised loopback provider, process-absence 확인과 job completion/result append를 연결해야 합니다.
-- POV-022 discovery 결정과 POV-013 전체 evidence gate 전에는 H1 delivery 완료를 주장하지 않습니다.
+- POV-013 전체 evidence gate 전에는 H1 delivery 완료를 주장하지 않습니다.
 
 ## Links
 

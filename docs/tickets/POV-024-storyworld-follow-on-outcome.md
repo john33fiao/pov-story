@@ -29,7 +29,7 @@ Activation gate: H5 outcome evidence and explicit H6 roadmap prioritization
 
 ## Out Of Scope
 
-- H-1~H5 lifelogging roadmap의 대체 또는 우선순위 자동 변경
+- H0~H5 lifelogging roadmap의 대체 또는 우선순위 자동 변경
 - generic character chat을 최종 제품으로 삼기
 - 한 번에 소설을 생성하는 범용 도구
 - prompt만 사고파는 marketplace
@@ -51,7 +51,7 @@ Activation gate: H5 outcome evidence and explicit H6 roadmap prioritization
 - 각 child ticket은 선행 evidence, continue/stop rule과 다음 gate를 가집니다.
 - reader demand와 playable continuity가 확인되기 전에는 creator marketplace를 production commitment로 만들지 않습니다.
 - POV-029 decision 전에는 storyworld production implementation ticket을 만들지 않습니다.
-- 현재 lifelog North Star, architecture와 H-1~H5 실행 backlog는 별도 결정 없이 바뀌지 않습니다.
+- 현재 lifelog North Star, architecture와 H0~H5 실행 backlog는 별도 결정 없이 바뀌지 않습니다.
 - 같은 제품 계보가 같은 runtime, DB 또는 개인 데이터 공유를 의미하지 않는다고 명시합니다.
 
 ## Exit Criteria

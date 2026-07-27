@@ -12,7 +12,7 @@ POV Story의 현재 구현 기반은 **독립형 local-first 개인 라이프로
 
 이 기반 이후의 H6 후속 방향은 **Persistent Playable Story Continuity**입니다. 독자는 연재형 세계의 주인공으로 선택하고, 관계·세계 상태·발견과 엔딩 조건을 회차 사이에 이어 가며 자신이 진행한 이야기로 돌아옵니다. 이는 별도 제품 가설이 아니라 같은 제품 계보의 장기 방향이지만, 현재 MVP 기능이나 production architecture commitment는 아닙니다.
 
-현재 H-1~H5의 lifelogging scope와 North Star는 유지합니다. H6 backlog는 지금 보존하되 H5 outcome evidence와 명시적 roadmap priority 뒤에 활성화합니다. 그 뒤 reader demand, story loop, persistent state, creator authoring과 architecture/safety evidence를 순서대로 통과해야 합니다. 같은 제품 계보가 같은 runtime·DB 또는 개인 lifelog의 자동 재사용을 뜻하지는 않습니다. `POV Story`는 working title이며 공개 제품명 결정은 별도 gate입니다.
+현재 H0~H5의 lifelogging scope와 North Star는 유지합니다. H6 backlog는 지금 보존하되 H5 outcome evidence와 명시적 roadmap priority 뒤에 활성화합니다. 그 뒤 reader demand, story loop, persistent state, creator authoring과 architecture/safety evidence를 순서대로 통과해야 합니다. 같은 제품 계보가 같은 runtime·DB 또는 개인 lifelog의 자동 재사용을 뜻하지는 않습니다. `POV Story`는 working title이며 공개 제품명 결정은 별도 gate입니다.
 
 이 방향, 순서와 재검토 조건은 [ADR-0003](decisions/0003-lifelogging-foundation-and-storyworld-follow-on.md)에 기록합니다.
 
@@ -41,7 +41,7 @@ POV Story의 현재 구현 기반은 **독립형 local-first 개인 라이프로
 | Later | local source of truth를 유지하면서 여러 장치나 외부 위치에서 접근하려는 self-hosting 사용자 | 데이터 소유권을 포기하지 않고 안전하게 원격 접근하고 싶다 | local product value와 backup/recovery가 먼저 증명되어야 함 |
 | Follow-on | 선택의 결과가 이어지는 연재형 세계에 반복해서 돌아오려는 interactive-story reader, 이후 이를 설계하려는 creator | 회차를 소비하는 대신 주인공으로 선택하고 관계·세계 상태·엔딩을 이어 가고 싶다 | H6 reader demand와 continuity를 먼저 증명한 뒤 creator 방향을 검증 |
 
-interactive-story reader와 creator는 현재 H-1~H5의 target segment가 아닙니다. [POV-025](tickets/POV-025-storyworld-reader-demand-and-positioning.md)가 H6의 first reader와 initial genre를 evidence로 좁힙니다.
+interactive-story reader와 creator는 현재 H0~H5의 target segment가 아닙니다. [POV-025](tickets/POV-025-storyworld-reader-demand-and-positioning.md)가 H6의 first reader와 initial genre를 evidence로 좁힙니다.
 
 ### 3. Relative Costs
 
@@ -69,7 +69,7 @@ interactive-story reader와 creator는 현재 H-1~H5의 target segment가 아닙
 
 ### 5. Trade-offs
 
-현재 H-1~H5 전략은 다음을 의도적으로 하지 않습니다.
+현재 H0~H5 전략은 다음을 의도적으로 하지 않습니다.
 
 - H6 evidence와 architecture decision 전의 storyworld production 구현, creator marketplace 또는 payment
 - 개인 lifelog source를 storyworld prompt, memory 또는 training data로 자동 재사용
@@ -184,7 +184,7 @@ H6 storyworld는 이 연속성 원리를 개인 기록에서 플레이 가능한
 
 ## Review Gates
 
-- [POV-022](tickets/POV-022-first-segment-and-voice-wedge-discovery-gate.md)에서 first segment, voice wedge, correction/source trust와 purge expectation을 검증한 뒤 H1 delivery ticket을 Ready로 올립니다.
+- H1~H5는 저장소 소유자의 single-owner 제품 완성과 dogfood evidence를 우선합니다. [POV-022](tickets/POV-022-first-segment-and-voice-wedge-discovery-gate.md)의 외부 사용자 검증은 개인용 제품 완성 뒤 또는 명시적인 확장 검증 결정 뒤에 활성화하며 현재 delivery의 선행 조건이 아닙니다.
 - [POV-013](tickets/POV-013-conversation-core-offline-evidence-gate.md)에서 text Conversation Core의 안전성과 offline 흐름을 통과한 뒤 voice intake를 시작합니다.
 - [POV-021](tickets/POV-021-voice-round-trip-evidence-gate.md)에서 첫 activation 가설을 검토한 뒤 Knowledge와 Calendar 티켓을 구체화합니다.
 - H5 outcome evidence를 검토하고 H6를 명시적으로 우선순위화한 뒤 [POV-025](tickets/POV-025-storyworld-reader-demand-and-positioning.md)를 활성화합니다.

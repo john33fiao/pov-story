@@ -2,7 +2,7 @@
 
 Last updated: 2026-07-27
 
-Current phase: H6 follow-on direction accepted; H-1 discovery plan registered, H0 completed including Windows workspace validation baseline, H1 delivery gated by external POV-022 evidence
+Current phase: H6 follow-on direction accepted; H0 completed including Windows workspace validation baseline; H1 single-owner product delivery active; external POV-022 research deferred until the personal product is complete or explicitly reprioritized
 
 Repository posture: public fresh-history baseline verified 2026-07-27; POV-031 compatibility preserved, POV-032 superseded by repository restart, project-owned code licensed under MIT
 
@@ -19,17 +19,16 @@ Repository posture: public fresh-history baseline verified 2026-07-27; POV-031 c
 
 | Ticket | Type | Status | Outcome |
 | --- | --- | --- | --- |
-| [POV-022 First segment and voice wedge discovery gate](tickets/POV-022-first-segment-and-voice-wedge-discovery-gate.md) | Discovery gate | In Progress — external research required | first segment, voice/text capture, correction/source trust와 purge expectation을 구현 전에 검증 |
-| [POV-007 Local login, refresh and session revoke](tickets/POV-007-local-login-refresh-and-session-revoke.md) | Delivery | In Progress — auth schema, typed no-commit/commit-uncertainty storage, credential primitive, canonical keyring와 pure initialization-transition metadata codec, owner-only instance/maintenance-lock/store-binding/detached-actor, read-only initialization reconciliation, sentinel/legacy pre-source recovery·rollback, exact source-CAS, active-key install, final lifecycle CAS와 deletion-only cleanup implemented; Windows validation restored by POV-034 and POV-031 completed, activation gated by POV-022 | planned/retire/compromise/loss transition, production auth mutation/JWT/session repository, local HTTP와 runtime wiring을 fail-closed slice로 연결 |
-| [POV-008 Idempotent conversation append and outbox](tickets/POV-008-idempotent-conversation-append-and-outbox.md) | Delivery | In Progress — persistence core implemented; activation gated by POV-007/022 | owner-scoped append, retry conflict, audit/outbox와 post-commit readback의 synthetic contract를 검증 |
-| [POV-009 Durable single-slot job queue](tickets/POV-009-durable-single-slot-job-queue.md) | Delivery | In Progress — durable persistence core implemented; runtime activation gated by POV-007/008/010/011/012/022 | outbox 기반 enqueue, fixed-normal FIFO, fenced single-slot lease, 보수적 recovery halt와 retry/cancellation/timing/event history를 보존 |
+| [POV-007 Local login, refresh and session revoke](tickets/POV-007-local-login-refresh-and-session-revoke.md) | Delivery | In Progress — auth schema, typed no-commit/commit-uncertainty storage, credential primitive, canonical keyring와 pure initialization-transition metadata codec, owner-only instance/maintenance-lock/store-binding/detached-actor, read-only initialization reconciliation, sentinel/legacy pre-source recovery·rollback, exact source-CAS, active-key install, final lifecycle CAS와 deletion-only cleanup implemented; Windows validation restored by POV-034 and POV-031 completed | planned/retire/compromise/loss transition, production auth mutation/JWT/session repository, local HTTP와 runtime wiring을 fail-closed slice로 연결 |
+| [POV-008 Idempotent conversation append and outbox](tickets/POV-008-idempotent-conversation-append-and-outbox.md) | Delivery | In Progress — persistence core implemented; activation gated by POV-007 | owner-scoped append, retry conflict, audit/outbox와 post-commit readback의 synthetic contract를 검증 |
+| [POV-009 Durable single-slot job queue](tickets/POV-009-durable-single-slot-job-queue.md) | Delivery | In Progress — durable persistence core implemented; runtime activation gated by POV-007/008/010/011/012 | outbox 기반 enqueue, fixed-normal FIFO, fenced single-slot lease, 보수적 recovery halt와 retry/cancellation/timing/event history를 보존 |
 
 ## Next
 
 | Horizon | Status | Outcome | Tickets |
 | --- | --- | --- | --- |
 | H0 — Reproducible local boundary | Completed including Windows validation repair | same-origin shell, source/store/auth와 process safety contract를 executable evidence로 재현 | [POV-001](deps/POV-001-local-offline-walking-skeleton.md), [POV-004](deps/POV-004-core-data-identity-and-store-boundaries.md), [POV-005](deps/POV-005-authentication-and-session-security-decision.md), [POV-006](deps/POV-006-provider-ports-and-safe-process-supervisor.md), [POV-034](deps/POV-034-restore-windows-workspace-validation-baseline.md) |
-| H1 — Trustworthy text capture | Gated by POV-022 | 한 owner가 offline에서 text를 durable하게 남기고 retry·status·local inference failure를 신뢰 | [POV-007](tickets/POV-007-local-login-refresh-and-session-revoke.md), [POV-008](tickets/POV-008-idempotent-conversation-append-and-outbox.md), [POV-009](tickets/POV-009-durable-single-slot-job-queue.md), [POV-010](tickets/POV-010-minimal-authenticated-local-text-chat.md), [POV-011](tickets/POV-011-authenticated-replayable-job-status-stream.md), [POV-012](tickets/POV-012-loopback-llm-text-round-trip.md), [POV-013](tickets/POV-013-conversation-core-offline-evidence-gate.md) |
+| H1 — Trustworthy text capture | In Progress — starts with POV-007 | 한 owner가 offline에서 text를 durable하게 남기고 retry·status·local inference failure를 신뢰 | [POV-007](tickets/POV-007-local-login-refresh-and-session-revoke.md), [POV-008](tickets/POV-008-idempotent-conversation-append-and-outbox.md), [POV-009](tickets/POV-009-durable-single-slot-job-queue.md), [POV-010](tickets/POV-010-minimal-authenticated-local-text-chat.md), [POV-011](tickets/POV-011-authenticated-replayable-job-status-stream.md), [POV-012](tickets/POV-012-loopback-llm-text-round-trip.md), [POV-013](tickets/POV-013-conversation-core-offline-evidence-gate.md) |
 | H2 — Correctable voice recall | Gated by POV-013 | 음성을 교정 가능한 current revision으로 만들고 근거와 함께 recall하며 raw audio를 policy대로 purge | [POV-002 epic](tickets/POV-002-voice-lifelog-round-trip.md), [POV-014](tickets/POV-014-temporary-blob-lifecycle-and-privacy-contract.md), [POV-015](tickets/POV-015-authenticated-idempotent-voice-intake.md), [POV-033](tickets/POV-033-windows-python-whisper-turbo-provider.md), [POV-016](tickets/POV-016-supervised-audio-normalization-and-transcription.md), [POV-017](tickets/POV-017-immutable-transcript-correction-revisions.md), [POV-018](tickets/POV-018-current-revision-hybrid-transcript-retrieval.md), [POV-019](tickets/POV-019-retry-safe-audio-purge.md), [POV-020](tickets/POV-020-evidence-grounded-next-day-recall.md), [POV-023](tickets/POV-023-source-derivative-reconciliation.md), [POV-021](tickets/POV-021-voice-round-trip-evidence-gate.md) |
 
 실행 순서, dependency와 horizon exit evidence는 [Outcome Roadmap And WBS](WBS.md)를 따릅니다.
@@ -39,6 +38,7 @@ Repository posture: public fresh-history baseline verified 2026-07-27; POV-031 c
 - H3: Trusted daily knowledge — document revision, daily note/task, activity log와 approved memory
 - H4: Internal time continuity — external Calendar 없는 event CRUD, revision, timezone과 notification
 - H5: Safe product access and recovery — full PWA, explicit export/delete, backup/restore와 선택적 Cloudflare ingress
+- Product validation: [POV-022](tickets/POV-022-first-segment-and-voice-wedge-discovery-gate.md) — 개인용 H1~H5 완성 뒤 first segment, voice wedge, correction/source trust와 purge expectation을 외부 사용자에게 검증
 - H6: Persistent playable story continuity — 독자가 선택·관계·세계 상태·엔딩을 회차 사이에 이어 가는 후속 제품 방향
 
 H3~H5 상세 delivery ticket은 [POV-021](tickets/POV-021-voice-round-trip-evidence-gate.md)의 product evidence를 검토한 뒤 만듭니다. H6는 장기 방향을 보존하기 위한 discovery·prototype·decision backlog만 작성합니다. H5 outcome evidence와 명시적 priority 뒤에 POV-025를 활성화하고, production ticket은 POV-029가 진입을 accepted하기 전에는 만들지 않습니다. multiple workers, PostgreSQL/vector adapter와 optional tools는 측정된 trigger가 생길 때만 roadmap commitment로 올립니다.
@@ -61,7 +61,7 @@ H3~H5 상세 delivery ticket은 [POV-021](tickets/POV-021-voice-round-trip-evide
 - [x] 완료된 POV-031 current-tree inventory를 근거로 project-owned code에 MIT License 적용
 - [x] 새 public repository history와 tracked-content baseline을 확인하고 POV-032를 superseded archive로 종료
 - [ ] 외부 contribution을 받을 경우 제출·검토·라이선스 동의 정책 결정
-- [ ] POV-022에서 first segment, voice wedge, correction/source trust와 purge expectation 검증
+- [ ] 개인용 H1~H5 완성 또는 명시적 재우선순위 결정 뒤 POV-022 외부 사용자 검증 활성화
 - [x] POV-001에서 Rust toolchain, Node version, package manager를 실제 manifest와 함께 고정
 - [x] [ADR-0004](decisions/0004-local-authentication-and-session-security-contract.md)에서 authentication cryptography, key lifecycle과 refresh lifetime 결정
 - [ ] POV-014에서 temporary Blob encryption, retention, quota와 irreversible purge contract 결정

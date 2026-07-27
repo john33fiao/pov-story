@@ -6,7 +6,7 @@ Last reviewed: 2026-07-27
 
 ## Product Boundary
 
-POV Story의 H-1~H5 구현 기반은 독립형 local-first 개인 라이프로깅 웹 챗 앱입니다. 채팅은 하나의 사용자 인터페이스이고, 메모·음성·일정·할 일·작업일지·장기 기억은 앱 내부 domain service와 앱 소유 저장소가 제공합니다.
+POV Story의 H0~H5 구현 기반은 독립형 local-first 개인 라이프로깅 웹 챗 앱입니다. 채팅은 하나의 사용자 인터페이스이고, 메모·음성·일정·할 일·작업일지·장기 기억은 앱 내부 domain service와 앱 소유 저장소가 제공합니다.
 
 Discord는 교체 가능한 선택적 capture adapter이며, Obsidian·운영체제 Calendar·MCP를 runtime 정본이나 필수 dependency로 사용하지 않습니다. 인터넷이 없어도 같은 장치의 `127.0.0.1:8080` Web Chat으로 핵심 기능을 사용할 수 있어야 합니다.
 

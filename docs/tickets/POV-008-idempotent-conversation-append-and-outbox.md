@@ -1,6 +1,6 @@
 # POV-008 Idempotent Conversation Append And Outbox
 
-Status: In Progress — dependency-independent persistence core implemented; production activation gated by POV-007 and POV-022
+Status: In Progress — dependency-independent persistence core implemented; production activation gated by POV-007
 
 Type: Delivery
 

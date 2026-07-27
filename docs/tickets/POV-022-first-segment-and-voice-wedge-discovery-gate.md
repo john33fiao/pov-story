@@ -1,20 +1,27 @@
-# POV-022 First Segment And Voice Wedge Discovery Gate
+# POV-022 Deferred First Segment And Voice Wedge Discovery
 
-Status: In Progress
+Status: Deferred — activate after the single-owner H1~H5 product is complete or external-user validation is explicitly reprioritized
 
 Research plan: v1 registered 2026-07-25
 
-Type: Discovery gate
+Type: Deferred discovery backlog
 
-Roadmap: H-1 — Problem and wedge evidence
+Roadmap: Later — External product validation
 
 ## Why
 
-first segment, 하나의 chat capture, voice recall, correction/source 표시와 기본 7일 raw-audio purge는 아직 사용자 evidence가 없는 핵심 제품 가설입니다. H1 구현에 들어가기 전에 낮은 비용으로 문제와 wedge가 맞는지 확인해야 합니다.
+first segment, 하나의 chat capture, voice recall, correction/source 표시와 기본 7일 raw-audio purge는 아직 외부 사용자 evidence가 없는 핵심 제품 가설입니다. 현재 제품의 첫 사용자는 저장소 소유자이며, 외부 시장 검증보다 single-owner H1~H5 완성과 dogfood를 우선합니다. 이 research는 제품 완성 뒤 확장 방향을 검증하기 위해 보존합니다.
 
 ## What
 
 problem interview, low-fidelity chat walkthrough와 concierge-style capture/next-day recall test를 수행합니다. participant profile, sample, evidence threshold와 stop rule을 실행 전에 고정하고 결과를 `proceed`, `narrow`, `pivot` 또는 `stop`으로 결정합니다.
+
+## Deferral Decision
+
+- POV-022는 H1~H5 ticket의 dependency, activation gate 또는 completion gate가 아닙니다.
+- 외부 participant 모집, consent, session과 evidence aggregation은 H5 single-owner 제품 완성 뒤 또는 사용자가 외부 사용자 검증을 명시적으로 재우선순위화할 때 시작합니다.
+- 사전 등록된 research plan v1은 폐기하지 않고 그대로 보존합니다. 실제 outreach 전에 당시 제품 상태, tool/data flow와 consent contract를 다시 검토합니다.
+- owner dogfood는 H1~H5 제품 완성 evidence로 사용할 수 있지만 이 ticket의 외부 participant threshold를 통과한 것으로 대체하지 않습니다.
 
 ## Delivery Units
 
@@ -57,9 +64,9 @@ problem interview, low-fidelity chat walkthrough와 concierge-style capture/next
 
 POV-022는 다음 질문 하나를 결정합니다.
 
-> 최근 개인 기록을 여러 surface에 남기고 다시 찾는 1인 사용자가 local-first source/revision trust를 가치 있게 여기며, voice capture를 첫 wedge로 사용할 행동 evidence가 충분해 H1 delivery를 시작할 수 있는가?
+> 완성된 single-owner 제품을 외부 사용자에게 확장할 때, 최근 개인 기록을 여러 surface에 남기고 다시 찾는 사람이 local-first source/revision trust를 가치 있게 여기며 voice capture를 첫 wedge로 사용할 행동 evidence가 충분한가?
 
-`proceed` 또는 accepted `narrow` 전에는 POV-007 이후 H1 ticket을 Ready로 올리지 않습니다. `narrow`, `pivot` 또는 `stop`이 first segment, value proposition 또는 roadmap을 바꾸면 구현보다 Product Strategy, WBS, TODO와 필요 ADR readback을 먼저 수행합니다.
+이 결정은 이미 진행 중인 H1~H5의 개인용 제품 delivery를 소급해 잠그지 않습니다. `narrow`, `pivot` 또는 `stop`이 외부 확장 segment, value proposition 또는 후속 roadmap을 바꾸면 Product Strategy, WBS, TODO와 필요 ADR readback을 먼저 수행합니다.
 
 ### Primary XYZ Hypothesis
 
@@ -91,7 +98,7 @@ facilitator는 participant 특성, scheduling 또는 앞선 결과를 보고 slo
 
 `n=3`인 각 stratum 안에서는 odd/even assignment가 각각 `1:2` 또는 `2:1`로 불균형합니다. 대신 전체 sample은 odd/even 세 명씩으로 균형을 유지하며, 이 작은 표본에서 stratum별 effect나 assignment effect를 분리해 주장하지 않습니다.
 
-이 작은 purposive sample은 시장 대표성이나 prevalence를 추정하지 않습니다. 첫 segment와 wedge를 다음 delivery에 투자할 정도로 좁힐 directional gate입니다.
+이 작은 purposive sample은 시장 대표성이나 prevalence를 추정하지 않습니다. 완성된 개인용 제품을 외부 사용자에게 확장할지 판단하는 directional gate입니다.
 
 ### Method And Task Order
 
@@ -295,17 +302,17 @@ product decision 전에 round validity를 먼저 판정합니다.
 - participant가 task method를 거부하거나 Session 2에 오지 않은 것은 withdrawal이 아닌 한 해당 behavior gate의 valid FAIL입니다. 반면 research-side tool/processor/data loss로 outcome을 관찰할 수 없으면 product FAIL로 바꾸지 않습니다.
 - unconsented processing, unresolved safety incident, missing deletion contract 또는 research-side failure 때문에 gate를 fixed denominator로 판정할 수 없으면 round는 `INVALID`입니다.
 
-`INVALID`는 다섯 번째 product outcome이 아니라 “결정 없음” 상태입니다. `proceed`/`narrow`/`pivot`/`stop`을 내리지 않고 H1을 계속 잠근 채 affected data를 consent와 retention rule에 따라 삭제하거나 격리하고, 새 plan/version review 뒤 새 round를 시작합니다.
+`INVALID`는 다섯 번째 product outcome이 아니라 “결정 없음” 상태입니다. `proceed`/`narrow`/`pivot`/`stop`을 내리지 않고 외부 사용자 확장 결정을 보류한 채 affected data를 consent와 retention rule에 따라 삭제하거나 격리하고, 새 plan/version review 뒤 새 round를 시작합니다.
 
 ### Decision Rule
 
 | Decision | Pre-registered rule | Roadmap consequence |
 | --- | --- | --- |
-| `proceed` | valid round에서 `G-PROBLEM`, `G-TEXT`, `G-X`, `G-SRC`, `G-A7`, `G-LOCAL`이 모두 PASS | anonymized evidence와 decision을 기록한 뒤 POV-007을 Ready 후보로 review |
-| `narrow — text-first` | valid round에서 `G-PROBLEM`, `G-TEXT`, `G-SRC`, `G-LOCAL`, `G-QTEXT`가 PASS하고 `G-X`는 FAIL | Product Strategy/WBS에서 H1 text foundation만 열고 voice/H2는 별도 evidence 전까지 gated |
-| `narrow — retention` | valid round에서 `G-PROBLEM`, `G-TEXT`, `G-X`, `G-SRC`, `G-LOCAL`은 PASS, `G-A7`은 FAIL하며 최소 4명이 `즉시 purge` 또는 `explicit export 후 purge` 한 가지 alternative에 동일하게 수렴하고 장기 raw 보존 필수는 최대 1명 | Product Strategy와 affected retention ticket을 먼저 좁힌 뒤 H1 진입 여부 review |
-| `pivot` | `G-PROBLEM`은 PASS하지만 `proceed`/`narrow` 조건을 충족하지 못하고, 최소 4명에게 반복되는 다른 job·solution pattern이 있음 | H1 delivery를 열지 않고 Product Strategy와 ADR-0003 재검토 |
-| `stop` | `G-PROBLEM`이 FAIL하거나, `proceed`/`narrow` 조건을 충족하지 못하면서 최소 4명이 지지하는 viable alternative도 없음 | H1 delivery를 열지 않고 POV-022와 roadmap disposition 기록 |
+| `proceed` | valid round에서 `G-PROBLEM`, `G-TEXT`, `G-X`, `G-SRC`, `G-A7`, `G-LOCAL`이 모두 PASS | anonymized evidence와 decision을 기록한 뒤 외부 사용자 확장 backlog를 review |
+| `narrow — text-first` | valid round에서 `G-PROBLEM`, `G-TEXT`, `G-SRC`, `G-LOCAL`, `G-QTEXT`가 PASS하고 `G-X`는 FAIL | 외부 확장 전략을 text-first로 좁히고 voice 확장은 별도 evidence 전까지 보류 |
+| `narrow — retention` | valid round에서 `G-PROBLEM`, `G-TEXT`, `G-X`, `G-SRC`, `G-LOCAL`은 PASS, `G-A7`은 FAIL하며 최소 4명이 `즉시 purge` 또는 `explicit export 후 purge` 한 가지 alternative에 동일하게 수렴하고 장기 raw 보존 필수는 최대 1명 | Product Strategy와 외부 사용자용 retention 정책을 먼저 좁힌 뒤 확장 여부 review |
+| `pivot` | `G-PROBLEM`은 PASS하지만 `proceed`/`narrow` 조건을 충족하지 못하고, 최소 4명에게 반복되는 다른 job·solution pattern이 있음 | 개인용 제품은 유지하고 외부 확장 Product Strategy와 ADR-0003을 재검토 |
+| `stop` | `G-PROBLEM`이 FAIL하거나, `proceed`/`narrow` 조건을 충족하지 못하면서 최소 4명이 지지하는 viable alternative도 없음 | 개인용 제품은 유지하고 외부 사용자 확장 backlog를 중단 |
 
 `pivot`의 other pattern은 최소 4명의 서로 다른 participant가 제공한 `EV-PAST` 또는 `EV-OBS`에서 같은 trigger, desired outcome과 current action/workaround 조합이 반복될 때만 성립합니다. tool 이름만 같거나 compliment, `EV-STATE`, future intent와 facilitator interpretation만 같은 것은 합치지 않습니다. facilitator와 execution manifest에 등록된 independent reviewer가 private de-identified evidence를 각각 이 세 field로 coding하고, 두 사람이 같은 normalized pattern에 동의한 participant만 numerator에 넣습니다. unresolved disagreement는 pattern evidence로 세지 않습니다.
 
@@ -349,7 +356,7 @@ backup을 사용하지 않는 것이 기본입니다. unavoidable backup은 prim
 
 recruitment message 전송, referral opt-in 연락, 일정 생성, cloud storage 생성·업로드, recording/auto-transcription 활성화와 compensation 지출은 각각 exact target, account, action과 비용을 사용자가 승인한 뒤에만 수행합니다. 이 goal은 그런 외부 action을 승인한 것으로 해석하지 않습니다.
 
-이 prerequisite가 충족되기 전에는 POV-022 결과를 결정하거나 POV-007을 Ready로 바꾸지 않습니다.
+이 prerequisite가 충족되기 전에는 POV-022 결과나 외부 사용자 확장 결정을 주장하지 않습니다. POV-007을 포함한 H1~H5 delivery 상태에는 영향을 주지 않습니다.
 
 ## Acceptance Criteria
 
@@ -370,7 +377,7 @@ recruitment message 전송, referral opt-in 연락, 일정 생성, cloud storage
 
 ## Rollback
 
-gate가 `pivot` 또는 `stop`이면 H1 delivery ticket을 Ready로 올리지 않습니다. Product Strategy, ADR-0003과 roadmap을 먼저 갱신하고 이미 완료된 reversible H0 foundation만 재사용 여부를 판단합니다.
+gate가 `pivot` 또는 `stop`이면 외부 사용자 확장 ticket을 열지 않습니다. 개인용 제품은 유지하고 Product Strategy, ADR-0003과 후속 roadmap에서 외부 확장 disposition을 갱신합니다.
 
 participant research 시작 전에 v1을 폐기하면 폐기 이유를 기록하고 ticket/TODO를 `Ready`로 되돌릴 수 있습니다. 첫 Session 1 뒤에는 v1을 소급 수정하지 않고 current round를 중단한 다음 review된 v2로만 재시작합니다.
 

@@ -6,7 +6,7 @@ Type: Evidence gate
 
 Roadmap: H1 — Trustworthy text capture
 
-Depends on: POV-004 through POV-012, POV-022
+Depends on: POV-004 through POV-012
 
 ## Why
 

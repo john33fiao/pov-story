@@ -1,12 +1,12 @@
 # POV-007 Local Login, Refresh And Session Revoke
 
-Status: In Progress — dependency-independent control plane, sentinel/legacy initialization recovery, source/final-CAS and deletion-only cleanup slices implemented; Windows workspace validation restored by POV-034 and POV-031 current-tree removal completed; activation gated by POV-022
+Status: In Progress — dependency-independent control plane, sentinel/legacy initialization recovery, source/final-CAS and deletion-only cleanup slices implemented; Windows workspace validation restored by POV-034 and POV-031 current-tree removal completed
 
 Type: Delivery
 
 Roadmap: H1 — Trustworthy text capture
 
-Depends on: POV-004, POV-005, POV-022
+Depends on: POV-004, POV-005
 
 ## Why
 
@@ -36,9 +36,10 @@ accepted auth decision에 따라 ID/password login, 짧은 수명의 access toke
 4. strict access JWT, login/session/refresh state machine와 opaque verified-owner issuer
 5. fail-closed startup, local auth HTTP/cookie boundary와 installed-browser evidence
 
-각 slice는 listener를 우회하거나 synthetic production auth context를 만들지 않습니다. POV-022가
-`proceed` 또는 compatible `narrow` 결정을 내리고 모든 slice와 conditional browser evidence가
-완료되기 전에는 production activation과 ticket completion을 주장하지 않습니다.
+각 slice는 listener를 우회하거나 synthetic production auth context를 만들지 않습니다. 모든
+slice와 conditional browser evidence가 완료되기 전에는 production activation과 ticket
+completion을 주장하지 않습니다. 외부 사용자 검증인 POV-022는 이 ticket의 선행 조건이
+아닙니다.
 
 ## Out Of Scope
 

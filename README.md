@@ -10,7 +10,7 @@ POV Story는 메모, 음성, 일정, 할 일, 작업일지와 장기 기억을 �
 - Windows Rust workspace check/test baseline은 [POV-034](docs/deps/POV-034-restore-windows-workspace-validation-baseline.md)에서 복구됐고 Unix auth maintenance capability는 Windows에서 계속 비활성입니다.
 - 실제 lifelog 접수, background dispatcher, provider/model 실행은 활성화되지 않았습니다.
 
-H1 delivery는 [POV-022 discovery gate](docs/tickets/POV-022-first-segment-and-voice-wedge-discovery-gate.md)와 [POV-007 auth delivery](docs/tickets/POV-007-local-login-refresh-and-session-revoke.md)에 gated되어 있습니다.
+현재 근접 작업은 [POV-007 auth delivery](docs/tickets/POV-007-local-login-refresh-and-session-revoke.md)부터 H1 single-owner 제품 흐름을 완성하는 것입니다. [POV-022 외부 사용자 discovery](docs/tickets/POV-022-first-segment-and-voice-wedge-discovery-gate.md)는 개인용 H1~H5 완성 뒤의 후순위 제품 검증 backlog이며 현재 delivery를 막지 않습니다.
 
 ## 빠른 실행
 

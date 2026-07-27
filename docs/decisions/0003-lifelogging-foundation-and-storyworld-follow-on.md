@@ -8,13 +8,13 @@
 
 [ADR-0002](0002-product-direction-and-repository-identity.md)는 두 private 기획 노트를 검토한 뒤 local-first 라이프로깅과 AI 스토리월드를 서로 무관한 제품 가설로 분리했습니다. 사용자는 스토리월드가 별도 가설이 아니라 라이프로깅 기반 뒤에 이어질 후속 제품 방향이라고 정정했습니다.
 
-이 정정은 장기 제품 계보를 바꾸지만, 현재 저장소의 구현 우선순위를 즉시 스토리월드로 전환하라는 뜻은 아닙니다. 현재 H-1~H5는 사용자 소유 기록의 capture, correction, source-grounded recall, daily knowledge, time continuity와 safe access를 증명하는 local-first 기반입니다. 후속 방향은 회차, 선택, 분기, 관계와 세계 상태가 이어지는 플레이 가능한 서사 경험입니다.
+이 정정은 장기 제품 계보를 바꾸지만, 현재 저장소의 구현 우선순위를 즉시 스토리월드로 전환하라는 뜻은 아닙니다. 현재 H0~H5는 사용자 소유 기록의 capture, correction, source-grounded recall, daily knowledge, time continuity와 safe access를 증명하는 local-first 기반입니다. 후속 방향은 회차, 선택, 분기, 관계와 세계 상태가 이어지는 플레이 가능한 서사 경험입니다.
 
 같은 제품 방향이라는 사실만으로 두 경험이 같은 runtime, DB, account boundary 또는 개인 데이터를 사용해야 하는 것은 아닙니다. shared creator space, cloud inference, 콘텐츠 안전, 저작권, 결제와 정산은 현재 [ADR-0001](0001-architecture-baseline.md)의 single-owner local runtime보다 넓은 별도 결정이 필요합니다.
 
 ## Decision
 
-- H-1~H5의 현재 제품·구현 기반은 **독립형 local-first 개인 라이프로깅 웹 챗 앱**으로 유지합니다.
+- H0~H5의 현재 제품·구현 기반은 **독립형 local-first 개인 라이프로깅 웹 챗 앱**으로 유지합니다.
 - H6는 별도 제품 가설이 아니라 같은 제품 계보의 **Persistent Playable Story Continuity** 후속 방향입니다.
 - H6의 reader outcome은 독자가 연재형 세계의 주인공으로 선택하고, 관계·세계 상태·발견과 엔딩 조건을 회차 사이에 이어 가며 자신이 진행한 이야기로 돌아오는 것입니다.
 - H6는 날짜나 release 약속이 아닌 strategic backlog입니다. reader demand, serialized story loop, persistent-state experience, creator authoring과 architecture/safety evidence를 순서대로 검토합니다.
