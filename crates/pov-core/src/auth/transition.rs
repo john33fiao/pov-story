@@ -527,7 +527,7 @@ impl PlannedRotationPreparationV1 {
         Self::from_keyrings(input, current_keyring, staged_keyring)
     }
 
-    fn from_keyrings(
+    pub(super) fn from_keyrings(
         input: PlannedRotationMetadataInput,
         current_keyring: &Keyring,
         staged_keyring: Keyring,
@@ -1268,6 +1268,19 @@ impl PlannedRotationMetadataV1 {
         PlannedRotationSourceExpectation { metadata: self }
     }
 
+    pub(super) fn matches_reservation_artifact(&self, artifact: TopLevelArtifactName) -> bool {
+        artifact
+            == (TopLevelArtifactName::Transition {
+                kind: TransitionKind::Planned,
+                id: self.transition_id,
+            })
+            || artifact
+                == (TopLevelArtifactName::Cleanup {
+                    kind: TransitionKind::Planned,
+                    id: self.transition_id,
+                })
+    }
+
     fn validate_semantics(&self) -> Result<(), TransitionContractError> {
         if self.expected_active_kid == self.result_kid
             || self.expected_keyring_version.get().checked_add(1)
@@ -1312,6 +1325,11 @@ impl<'a> PlannedRotationSourceExpectation<'a> {
             .expect("validated keyring version fits SQLite")
     }
 
+    pub(crate) fn expected_key_activated_at_micros(self) -> i64 {
+        i64::try_from(self.metadata.expected_key_activated_at_micros.get())
+            .expect("validated key activation fits SQLite")
+    }
+
     pub(crate) fn expected_lifecycle_revision(self) -> i64 {
         i64::try_from(self.metadata.expected_lifecycle_revision)
             .expect("validated lifecycle revision fits SQLite")
@@ -1320,6 +1338,23 @@ impl<'a> PlannedRotationSourceExpectation<'a> {
     pub(crate) fn expected_lifecycle_updated_at_micros(self) -> i64 {
         i64::try_from(self.metadata.expected_lifecycle_updated_at_micros.get())
             .expect("validated lifecycle timestamp fits SQLite")
+    }
+
+    pub(crate) fn matches_active_lifecycle(
+        self,
+        state_revision: u64,
+        expected_kid: PersistedLifecycleKeyId,
+        keyring_version: PersistedLifecycleKeyringVersion,
+        updated_at_micros: PersistedLifecycleTimestamp,
+    ) -> bool {
+        state_revision == self.metadata.expected_lifecycle_revision
+            && expected_kid.0 == self.metadata.expected_active_kid
+            && keyring_version.0 == self.metadata.expected_keyring_version
+            && updated_at_micros.0 == self.metadata.expected_lifecycle_updated_at_micros
+    }
+
+    pub(crate) fn matches_owner_id(self, raw: &[u8]) -> bool {
+        raw == self.metadata.owner_id.as_bytes()
     }
 
     pub(crate) fn result_kid(self) -> &'a str {

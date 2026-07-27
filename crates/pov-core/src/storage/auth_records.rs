@@ -18,9 +18,11 @@ use super::{
     AuthDatabaseReconciliationObservation, AuthInitializationFinalLifecycleMutationOutcome,
     AuthInitializationSourceFingerprint, AuthInitializationSourceMatch,
     AuthInitializationSourceMutationOutcome, AuthInitializingLifecycleFacts,
-    AuthTransitioningLifecycleFacts, ConversationStore, ExistingConnectionAccess, SqliteStore,
-    StoreError, StoreKind, StoreLocation, migrations_for_kind, open_existing_store_connection,
-    validate_current_migration_history, validate_store_contract_row, validate_store_location,
+    AuthPlannedRotationDatabaseObservation, AuthPlannedRotationSourceFingerprint,
+    AuthPlannedRotationSourceMatch, AuthTransitioningLifecycleFacts, ConversationStore,
+    ExistingConnectionAccess, SqliteStore, StoreError, StoreKind, StoreLocation,
+    migrations_for_kind, open_existing_store_connection, validate_current_migration_history,
+    validate_store_contract_row, validate_store_location,
 };
 #[cfg(test)]
 use super::{
@@ -29,7 +31,7 @@ use super::{
 use crate::auth::{
     InitializationSourceExpectation, InitializationSourceSeed, PersistedLifecycleKeyId,
     PersistedLifecycleKeyringVersion, PersistedLifecycleTimestamp, PersistedLifecycleTransitionId,
-    TransitionKind,
+    PlannedRotationSourceExpectation, TransitionKind,
 };
 
 #[derive(Clone)]
@@ -1056,6 +1058,82 @@ pub(super) fn inspect_auth_reconciliation(
     }
 }
 
+pub(super) fn inspect_auth_planned_rotation(
+    location: &StoreLocation,
+    expectation: Option<PlannedRotationSourceExpectation<'_>>,
+) -> Result<AuthPlannedRotationDatabaseObservation, StoreError> {
+    let mut reader = open_existing_store_connection(
+        location,
+        StoreKind::Conversation,
+        ExistingConnectionAccess::ReadOnly,
+    )?;
+    let snapshot = inspect_auth_planned_rotation_snapshot(&mut reader, expectation);
+    reader.flush_prepared_statement_cache();
+    let close = reader.close();
+    let result = match (snapshot, close) {
+        (Ok(state), Ok(())) => Ok(state),
+        (Err(error), Ok(())) => Err(error),
+        (snapshot, Err((_reader, close_error))) => Err(StoreError::LifecycleCleanup {
+            kind: StoreKind::Conversation,
+            operation: "authentication planned rotation inspection",
+            primary_error: if snapshot.is_ok() {
+                "snapshot inspection completed".to_owned()
+            } else {
+                "snapshot inspection failed".to_owned()
+            },
+            cleanup_error: close_error.to_string(),
+        }),
+    };
+    let location_validation =
+        validate_store_location(location, "auth planned rotation inspection readback");
+    match (result, location_validation) {
+        (Ok(state), Ok(())) => Ok(state),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn inspect_auth_planned_rotation_snapshot(
+    reader: &mut RawConnection,
+    expectation: Option<PlannedRotationSourceExpectation<'_>>,
+) -> Result<AuthPlannedRotationDatabaseObservation, StoreError> {
+    let transaction = reader.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let inspection = (|| {
+        validate_store_contract_row(&transaction, StoreKind::Conversation)?;
+        validate_current_migration_history(
+            &transaction,
+            StoreKind::Conversation,
+            migrations_for_kind(StoreKind::Conversation),
+        )?;
+        validate_auth_table_inventory(&transaction)?;
+        let lifecycle = read_auth_lifecycle_observation(&transaction)?;
+        let (source, source_fingerprint) = match lifecycle {
+            AuthDatabaseLifecycleObservation::Active(facts) => {
+                let inspection =
+                    read_planned_rotation_source_match(&transaction, facts, expectation)?;
+                (inspection.source_match, Some(inspection.fingerprint))
+            }
+            _ => (AuthPlannedRotationSourceMatch::NotApplicable, None),
+        };
+        validate_store_contract_row(&transaction, StoreKind::Conversation)?;
+        validate_current_migration_history(
+            &transaction,
+            StoreKind::Conversation,
+            migrations_for_kind(StoreKind::Conversation),
+        )?;
+        Ok(AuthPlannedRotationDatabaseObservation {
+            lifecycle,
+            source,
+            source_fingerprint,
+        })
+    })();
+    let rollback = transaction.rollback();
+    match (inspection, rollback) {
+        (Ok(state), Ok(())) => Ok(state),
+        (Err(error), Ok(())) => Err(error),
+        (_, Err(error)) => Err(StoreError::Sqlite(error)),
+    }
+}
+
 fn inspect_auth_reconciliation_snapshot(
     reader: &mut RawConnection,
     expectation: Option<InitializationSourceExpectation<'_>>,
@@ -1134,6 +1212,252 @@ fn inspect_auth_lifecycle_snapshot(
         (Err(error), Ok(())) => Err(error),
         (_, Err(error)) => Err(StoreError::Sqlite(error)),
     }
+}
+
+struct PlannedRotationSourceInspection {
+    source_match: AuthPlannedRotationSourceMatch,
+    fingerprint: AuthPlannedRotationSourceFingerprint,
+}
+
+const PLANNED_ROTATION_SOURCE_FINGERPRINT_DOMAIN: &[u8] =
+    b"pov.auth.planned-rotation-source-snapshot.v1\0";
+
+fn read_planned_rotation_source_match(
+    transaction: &Transaction<'_>,
+    lifecycle: AuthActiveLifecycleFacts,
+    expectation: Option<PlannedRotationSourceExpectation<'_>>,
+) -> Result<PlannedRotationSourceInspection, StoreError> {
+    let mut hasher = Sha256::new();
+    hasher.update(PLANNED_ROTATION_SOURCE_FINGERPRINT_DOMAIN);
+
+    let account = {
+        let mut statement = transaction.prepare(
+            "SELECT
+                singleton, owner_id, login_id, account_state, credential_version,
+                account_revision, created_at_micros, updated_at_micros
+             FROM auth_accounts",
+        )?;
+        let mut rows = statement.query([])?;
+        let Some(row) = rows.next()? else {
+            return Err(StoreError::AuthControlPlaneCorrupt);
+        };
+        let value = (
+            row.get::<_, i64>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, i64>(7)?,
+        );
+        if rows.next()?.is_some() {
+            return Err(StoreError::AuthControlPlaneCorrupt);
+        }
+        value
+    };
+    let (
+        account_singleton,
+        owner_id,
+        login_id,
+        account_state,
+        credential_version,
+        account_revision,
+        account_created_at,
+        account_updated_at,
+    ) = account;
+    if account_singleton != 1
+        || !InitializationSourceExpectation::is_canonical_owner_id(&owner_id)
+        || !InitializationSourceExpectation::is_canonical_login_id(login_id.as_bytes())
+        || !matches!(account_state.as_str(), "enabled" | "disabled")
+        || credential_version <= 0
+        || account_revision <= 0
+        || account_created_at < 0
+        || account_updated_at < account_created_at
+    {
+        return Err(StoreError::AuthControlPlaneCorrupt);
+    }
+    for (label, value) in [
+        (b"account.singleton".as_slice(), account_singleton),
+        (b"account.credential_version".as_slice(), credential_version),
+        (b"account.revision".as_slice(), account_revision),
+        (b"account.created_at".as_slice(), account_created_at),
+        (b"account.updated_at".as_slice(), account_updated_at),
+    ] {
+        update_initialization_source_integer(&mut hasher, label, value);
+    }
+    update_initialization_source_blob(&mut hasher, b"account.owner_id", &owner_id);
+    update_initialization_source_text(&mut hasher, b"account.login_id", login_id.as_bytes());
+    update_initialization_source_text(&mut hasher, b"account.state", account_state.as_bytes());
+
+    let password = {
+        let mut statement = transaction.prepare(
+            "SELECT
+                singleton, owner_id, verifier_phc, authenticator_state,
+                credential_revision, blocklist_version, created_at_micros,
+                updated_at_micros
+             FROM auth_password_credentials",
+        )?;
+        let mut rows = statement.query([])?;
+        let Some(row) = rows.next()? else {
+            return Err(StoreError::AuthControlPlaneCorrupt);
+        };
+        let value = (
+            row.get::<_, i64>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, i64>(7)?,
+        );
+        if rows.next()?.is_some() {
+            return Err(StoreError::AuthControlPlaneCorrupt);
+        }
+        value
+    };
+    let (
+        password_singleton,
+        password_owner,
+        password_verifier,
+        password_state,
+        password_revision,
+        legacy_policy,
+        password_created_at,
+        password_updated_at,
+    ) = password;
+    if password_singleton != 1
+        || password_owner != owner_id
+        || !InitializationSourceExpectation::is_canonical_verifier(password_verifier.as_bytes())
+        || !matches!(password_state.as_str(), "enabled" | "disabled")
+        || password_revision <= 0
+        || !InitializationSourceExpectation::is_canonical_legacy_policy_provenance(
+            legacy_policy.as_bytes(),
+        )
+        || password_created_at < 0
+        || password_updated_at < password_created_at
+    {
+        return Err(StoreError::AuthControlPlaneCorrupt);
+    }
+    for (label, value) in [
+        (b"password.singleton".as_slice(), password_singleton),
+        (b"password.revision".as_slice(), password_revision),
+        (b"password.created_at".as_slice(), password_created_at),
+        (b"password.updated_at".as_slice(), password_updated_at),
+    ] {
+        update_initialization_source_integer(&mut hasher, label, value);
+    }
+    update_initialization_source_blob(&mut hasher, b"password.owner_id", &password_owner);
+    update_initialization_source_text(
+        &mut hasher,
+        b"password.verifier",
+        password_verifier.as_bytes(),
+    );
+    update_initialization_source_text(&mut hasher, b"password.state", password_state.as_bytes());
+    update_initialization_source_text(
+        &mut hasher,
+        b"password.legacy_policy",
+        legacy_policy.as_bytes(),
+    );
+
+    let recovery = {
+        let mut statement = transaction.prepare(
+            "SELECT
+                singleton, owner_id, verifier_phc, credential_revision,
+                created_at_micros, updated_at_micros
+             FROM auth_recovery_credentials",
+        )?;
+        let mut rows = statement.query([])?;
+        let Some(row) = rows.next()? else {
+            return Err(StoreError::AuthControlPlaneCorrupt);
+        };
+        let value = (
+            row.get::<_, i64>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+        );
+        if rows.next()?.is_some() {
+            return Err(StoreError::AuthControlPlaneCorrupt);
+        }
+        value
+    };
+    let (
+        recovery_singleton,
+        recovery_owner,
+        recovery_verifier,
+        recovery_revision,
+        recovery_created_at,
+        recovery_updated_at,
+    ) = recovery;
+    if recovery_singleton != 1
+        || recovery_owner != owner_id
+        || !InitializationSourceExpectation::is_canonical_verifier(recovery_verifier.as_bytes())
+        || !InitializationSourceExpectation::verifiers_have_independent_salts(
+            password_verifier.as_bytes(),
+            recovery_verifier.as_bytes(),
+        )
+        || recovery_revision <= 0
+        || recovery_created_at < 0
+        || recovery_updated_at < recovery_created_at
+    {
+        return Err(StoreError::AuthControlPlaneCorrupt);
+    }
+    for (label, value) in [
+        (b"recovery.singleton".as_slice(), recovery_singleton),
+        (b"recovery.revision".as_slice(), recovery_revision),
+        (b"recovery.created_at".as_slice(), recovery_created_at),
+        (b"recovery.updated_at".as_slice(), recovery_updated_at),
+    ] {
+        update_initialization_source_integer(&mut hasher, label, value);
+    }
+    update_initialization_source_blob(&mut hasher, b"recovery.owner_id", &recovery_owner);
+    update_initialization_source_text(
+        &mut hasher,
+        b"recovery.verifier",
+        recovery_verifier.as_bytes(),
+    );
+
+    let audit_id_available = if let Some(expectation) = expectation {
+        let count: i64 = transaction.query_row(
+            "SELECT count(*) FROM auth_audit WHERE audit_id = ?1",
+            [expectation.audit_id().as_slice()],
+            |row| row.get(0),
+        )?;
+        if !matches!(count, 0 | 1) {
+            return Err(StoreError::AuthControlPlaneCorrupt);
+        }
+        count == 0
+    } else {
+        true
+    };
+
+    let source_match = match expectation {
+        None => AuthPlannedRotationSourceMatch::Canonical,
+        Some(expectation)
+            if expectation.matches_active_lifecycle(
+                lifecycle.state_revision,
+                lifecycle.expected_kid,
+                lifecycle.keyring_version,
+                lifecycle.updated_at_micros,
+            ) && expectation.matches_owner_id(&owner_id)
+                && expectation.credential_version() == credential_version
+                && expectation.account_revision() == account_revision
+                && expectation.password_credential_revision() == password_revision
+                && expectation.recovery_credential_revision() == recovery_revision
+                && audit_id_available =>
+        {
+            AuthPlannedRotationSourceMatch::Exact
+        }
+        Some(_) => AuthPlannedRotationSourceMatch::Mismatch,
+    };
+    Ok(PlannedRotationSourceInspection {
+        source_match,
+        fingerprint: AuthPlannedRotationSourceFingerprint::from_bytes(hasher.finalize().into()),
+    })
 }
 
 struct InitializationSourceInspection {

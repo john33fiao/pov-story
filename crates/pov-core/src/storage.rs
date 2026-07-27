@@ -25,7 +25,7 @@ use tokio_rusqlite::{
 use crate::auth::{
     InitializationSourceExpectation, InitializationSourceSeed, PersistedLifecycleKeyId,
     PersistedLifecycleKeyringVersion, PersistedLifecycleTimestamp, PersistedLifecycleTransitionId,
-    TransitionKind,
+    PlannedRotationSourceExpectation, TransitionKind,
 };
 use crate::identity::SourceDomain;
 
@@ -530,6 +530,21 @@ impl AuthConversationStoreBinding {
         result
     }
 
+    pub(crate) fn inspect_auth_planned_rotation(
+        &self,
+        expectation: Option<PlannedRotationSourceExpectation<'_>>,
+    ) -> Result<AuthPlannedRotationDatabaseObservation, StoreError> {
+        let kind = StoreKind::Conversation;
+        if self.operation_poisoned.load(Ordering::Acquire) {
+            return Err(StoreError::OperationPoisoned { kind });
+        }
+        let result = auth_records::inspect_auth_planned_rotation(&self.location, expectation);
+        if result.is_err() {
+            self.poison();
+        }
+        result
+    }
+
     pub(crate) fn commit_initialization_source(
         &self,
         seed: InitializationSourceSeed<'_>,
@@ -727,6 +742,61 @@ pub(crate) struct AuthDatabaseReconciliationObservation {
     pub(crate) lifecycle: AuthDatabaseLifecycleObservation,
     pub(crate) source: AuthInitializationSourceMatch,
     pub(crate) source_fingerprint: Option<AuthInitializationSourceFingerprint>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthPlannedRotationSourceMatch {
+    NotApplicable,
+    Canonical,
+    Exact,
+    Mismatch,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct AuthPlannedRotationSourceFingerprint([u8; 32]);
+
+#[cfg(unix)]
+impl AuthPlannedRotationSourceFingerprint {
+    pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Debug for AuthPlannedRotationSourceFingerprint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthPlannedRotationSourceFingerprint([REDACTED])")
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct AuthPlannedRotationDatabaseObservation {
+    pub(crate) lifecycle: AuthDatabaseLifecycleObservation,
+    pub(crate) source: AuthPlannedRotationSourceMatch,
+    pub(crate) source_fingerprint: Option<AuthPlannedRotationSourceFingerprint>,
+}
+
+#[cfg(unix)]
+impl fmt::Debug for AuthPlannedRotationDatabaseObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self.source {
+            AuthPlannedRotationSourceMatch::NotApplicable => {
+                "AuthPlannedRotationDatabaseObservation([REDACTED], NotApplicable)"
+            }
+            AuthPlannedRotationSourceMatch::Canonical => {
+                "AuthPlannedRotationDatabaseObservation([REDACTED], Canonical)"
+            }
+            AuthPlannedRotationSourceMatch::Exact => {
+                "AuthPlannedRotationDatabaseObservation([REDACTED], Exact)"
+            }
+            AuthPlannedRotationSourceMatch::Mismatch => {
+                "AuthPlannedRotationDatabaseObservation([REDACTED], Mismatch)"
+            }
+        })
+    }
 }
 
 #[cfg(unix)]

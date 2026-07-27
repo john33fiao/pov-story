@@ -68,10 +68,7 @@ impl KeyId {
 
 impl fmt::Debug for KeyId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_tuple("KeyId")
-            .field(&self.as_str())
-            .finish()
+        formatter.write_str("KeyId([REDACTED])")
     }
 }
 

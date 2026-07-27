@@ -35,7 +35,8 @@ use pov_platform::ExtendedAclState;
 use crate::storage::{
     AuthActiveLifecycleFacts, AuthConversationStoreBinding, AuthDatabaseLifecycleObservation,
     AuthDatabaseReconciliationObservation, AuthInitializationFinalLifecycleMutationOutcome,
-    AuthInitializationSourceMatch, AuthInitializationSourceMutationOutcome, AuthStorePoisonHandle,
+    AuthInitializationSourceMatch, AuthInitializationSourceMutationOutcome,
+    AuthPlannedRotationDatabaseObservation, AuthPlannedRotationSourceMatch, AuthStorePoisonHandle,
     ConversationStore, SqliteStore, StoreDirectoryIdentity,
 };
 #[cfg(test)]
@@ -49,6 +50,7 @@ use super::{
     transition::{
         ACTIVE_KEYRING_NAME, AUTH_MAINTENANCE_LOCK_NAME as AUTH_LOCK_FILE_NAME,
         InitializationMetadataV1, InitializationPreparationV1, MAX_INITIALIZATION_METADATA_BYTES,
+        PlannedRotationMetadataV1, PlannedRotationPreparationV1, PlannedRotationSourceExpectation,
         ReservationEntryName, TopLevelArtifactName, TransitionId, TransitionKind,
     },
 };
@@ -469,10 +471,131 @@ impl LockedAuthInstance {
         self.revalidate()?;
         Ok(AuthInitializationPersistenceOutcome::Persisted)
     }
+
+    fn persist_planned_rotation_preparation(
+        &self,
+        preparation: &PlannedRotationPreparationV1,
+        #[cfg(test)] fault: Option<AuthPlannedRotationPrepareTestFault>,
+    ) -> Result<AuthPlannedRotationPersistenceOutcome, SecretFsError> {
+        let artifact = preparation.transition_artifact();
+        let reservation_name = artifact.format();
+        if TopLevelArtifactName::parse(reservation_name.as_bytes()) != Ok(artifact) {
+            return Err(SecretFsError::UnsafeAuthArtifact);
+        }
+
+        let immediate_namespace = self.capture_secret_artifacts()?;
+        immediate_namespace.revalidate(&self.layout.secret_fd)?;
+        self.revalidate()?;
+        if !immediate_namespace.is_clean_active_namespace() {
+            return Ok(AuthPlannedRotationPersistenceOutcome::PreconditionNotClean);
+        }
+
+        mkdirat(
+            &self.layout.secret_fd,
+            reservation_name.as_str(),
+            Mode::RWXU,
+        )
+        .map_err(map_creation_errno)?;
+        let reservation_fd = openat(
+            &self.layout.secret_fd,
+            reservation_name.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(map_artifact_errno)?;
+        ensure_cloexec(&reservation_fd)?;
+        let reservation_stat = validate_reservation_directory_fd(&reservation_fd)?;
+        let reservation_path_stat = validate_reservation_directory_stat(
+            &statat(
+                &self.layout.secret_fd,
+                reservation_name.as_str(),
+                AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(map_artifact_errno)?,
+        )?;
+        if reservation_stat != reservation_path_stat {
+            return Err(SecretFsError::ArtifactChanged);
+        }
+        fsync(&reservation_fd).map_err(SecretFsError::errno)?;
+        fsync(&self.layout.secret_fd).map_err(SecretFsError::errno)?;
+        self.revalidate()?;
+        revalidate_created_reservation(
+            &self.layout.secret_fd,
+            &reservation_fd,
+            reservation_name.as_str(),
+            reservation_stat.identity,
+        )?;
+        #[cfg(test)]
+        if fault == Some(AuthPlannedRotationPrepareTestFault::Reservation) {
+            return Err(SecretFsError::Io(io::ErrorKind::Other));
+        }
+
+        let encoded_metadata = preparation
+            .encoded_metadata()
+            .map_err(|_| SecretFsError::UnsafeAuthArtifact)?;
+        persist_new_known_file(
+            &reservation_fd,
+            ReservationEntryName::Metadata.as_str(),
+            KnownFilePurpose::Metadata,
+            encoded_metadata.expose_secret(),
+        )?;
+        revalidate_created_reservation(
+            &self.layout.secret_fd,
+            &reservation_fd,
+            reservation_name.as_str(),
+            reservation_stat.identity,
+        )?;
+        #[cfg(test)]
+        if fault == Some(AuthPlannedRotationPrepareTestFault::Metadata) {
+            return Err(SecretFsError::Io(io::ErrorKind::Other));
+        }
+
+        persist_new_known_file(
+            &reservation_fd,
+            ReservationEntryName::StagedKeyring.as_str(),
+            KnownFilePurpose::StagedKeyring,
+            preparation.staged_keyring_bytes(),
+        )?;
+        revalidate_created_reservation(
+            &self.layout.secret_fd,
+            &reservation_fd,
+            reservation_name.as_str(),
+            reservation_stat.identity,
+        )?;
+        #[cfg(test)]
+        if fault == Some(AuthPlannedRotationPrepareTestFault::Staged) {
+            return Err(SecretFsError::Io(io::ErrorKind::Other));
+        }
+
+        persist_new_known_file(
+            &reservation_fd,
+            ReservationEntryName::Prepared.as_str(),
+            KnownFilePurpose::Prepared,
+            &[],
+        )?;
+        revalidate_created_reservation(
+            &self.layout.secret_fd,
+            &reservation_fd,
+            reservation_name.as_str(),
+            reservation_stat.identity,
+        )?;
+        #[cfg(test)]
+        if fault == Some(AuthPlannedRotationPrepareTestFault::Prepared) {
+            return Err(SecretFsError::Io(io::ErrorKind::Other));
+        }
+        self.revalidate()?;
+        Ok(AuthPlannedRotationPersistenceOutcome::Persisted)
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum AuthInitializationPersistenceOutcome {
+    Persisted,
+    PreconditionNotClean,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AuthPlannedRotationPersistenceOutcome {
     Persisted,
     PreconditionNotClean,
 }
@@ -610,6 +733,155 @@ impl PinnedAuthArtifactSnapshot {
         let mut copy = Zeroizing::new(Vec::with_capacity(file.content.expose().len()));
         copy.extend_from_slice(file.content.expose());
         InitializationMetadataV1::decode(SecretBytes::from_zeroizing(copy)).ok()
+    }
+
+    fn decode_planned_rotation_metadata(&self) -> Option<PlannedRotationMetadataV1> {
+        let reservation = self.observations.iter().find_map(|entry| match entry {
+            PinnedTopLevelArtifact::Transition { directory, .. }
+            | PinnedTopLevelArtifact::Cleanup { directory, .. }
+                if matches!(
+                    directory.artifact,
+                    TopLevelArtifactName::Transition {
+                        kind: TransitionKind::Planned,
+                        ..
+                    } | TopLevelArtifactName::Cleanup {
+                        kind: TransitionKind::Planned,
+                        ..
+                    }
+                ) =>
+            {
+                Some(directory)
+            }
+            _ => None,
+        })?;
+        let file = reservation.entries.iter().find_map(|entry| match entry {
+            PinnedReservationEntry::Metadata {
+                file,
+                codec: CodecObservation::Valid,
+                ..
+            } => Some(file),
+            _ => None,
+        })?;
+        let mut copy = Zeroizing::new(Vec::with_capacity(file.content.expose().len()));
+        copy.extend_from_slice(file.content.expose());
+        PlannedRotationMetadataV1::decode(SecretBytes::from_zeroizing(copy)).ok()
+    }
+
+    fn reconcile_planned_rotation(
+        &self,
+        database: AuthPlannedRotationDatabaseObservation,
+        metadata: Option<&PlannedRotationMetadataV1>,
+    ) -> AuthPlannedRotationReconciliation {
+        if self.has_unrecognized_artifacts() {
+            return AuthPlannedRotationReconciliation::Blocked(
+                AuthPlannedRotationBlocker::UnrecognizedArtifacts,
+            );
+        }
+        if !self.namespace.is_valid {
+            return AuthPlannedRotationReconciliation::Blocked(
+                AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+            );
+        }
+        let AuthDatabaseLifecycleObservation::Active(lifecycle) = database.lifecycle else {
+            return AuthPlannedRotationReconciliation::Blocked(
+                AuthPlannedRotationBlocker::UnsupportedLifecycleState,
+            );
+        };
+        if !self.active_matches_current_lifecycle(lifecycle)
+            || self.install_file().is_some()
+            || self.cleanup_directory().is_some()
+        {
+            return AuthPlannedRotationReconciliation::Blocked(
+                AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+            );
+        }
+
+        let Some(reservation) = self.transition_directory() else {
+            if database.source == AuthPlannedRotationSourceMatch::Canonical
+                && metadata.is_none()
+                && self.is_clean_active_namespace()
+            {
+                return AuthPlannedRotationReconciliation::CleanActive;
+            }
+            return AuthPlannedRotationReconciliation::Blocked(
+                AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+            );
+        };
+        if !matches!(
+            reservation.artifact,
+            TopLevelArtifactName::Transition {
+                kind: TransitionKind::Planned,
+                ..
+            }
+        ) {
+            return AuthPlannedRotationReconciliation::Blocked(
+                AuthPlannedRotationBlocker::UnsupportedLifecycleState,
+            );
+        }
+        let parts = RetainedReservationParts::from_directory(reservation);
+        let phase = match (
+            parts.metadata.map(|(_, codec)| codec),
+            parts.staged.map(|(_, codec)| codec),
+            parts.prepared,
+        ) {
+            (None, None, None) => AuthPlannedRotationPreSourcePhase::ReservationOnly,
+            (Some(CodecObservation::Incomplete), None, None) => {
+                AuthPlannedRotationPreSourcePhase::MetadataIncomplete
+            }
+            (Some(CodecObservation::Valid), None, None) => {
+                AuthPlannedRotationPreSourcePhase::MetadataComplete
+            }
+            (Some(CodecObservation::Valid), Some(CodecObservation::Incomplete), None) => {
+                AuthPlannedRotationPreSourcePhase::StagedIncomplete
+            }
+            (Some(CodecObservation::Valid), Some(CodecObservation::Valid), None)
+                if reservation.linkage == SemanticLinkageObservation::Consistent =>
+            {
+                AuthPlannedRotationPreSourcePhase::StagedComplete
+            }
+            (Some(CodecObservation::Valid), Some(CodecObservation::Valid), Some(_))
+                if reservation.linkage == SemanticLinkageObservation::Consistent =>
+            {
+                AuthPlannedRotationPreSourcePhase::Prepared
+            }
+            _ => {
+                return AuthPlannedRotationReconciliation::Blocked(
+                    AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+                );
+            }
+        };
+
+        let metadata_complete = !matches!(
+            phase,
+            AuthPlannedRotationPreSourcePhase::ReservationOnly
+                | AuthPlannedRotationPreSourcePhase::MetadataIncomplete
+        );
+        if metadata_complete {
+            if database.source != AuthPlannedRotationSourceMatch::Exact
+                || metadata.is_none()
+                || !metadata.is_some_and(|metadata| self.active_matches_planned_metadata(metadata))
+            {
+                return AuthPlannedRotationReconciliation::Blocked(
+                    AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+                );
+            }
+        } else if database.source != AuthPlannedRotationSourceMatch::Canonical || metadata.is_some()
+        {
+            return AuthPlannedRotationReconciliation::Blocked(
+                AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+            );
+        }
+
+        let recovery = if matches!(
+            phase,
+            AuthPlannedRotationPreSourcePhase::StagedComplete
+                | AuthPlannedRotationPreSourcePhase::Prepared
+        ) {
+            AuthPlannedRotationRecovery::ResumeOrRollbackCandidate
+        } else {
+            AuthPlannedRotationRecovery::RollbackOnlyCandidate
+        };
+        AuthPlannedRotationReconciliation::PlannedPreSource { phase, recovery }
     }
 
     fn reconcile_initialization(
@@ -976,6 +1248,49 @@ impl PinnedAuthArtifactSnapshot {
                 .is_at_or_after(keyring.active_activated_at())
     }
 
+    fn active_matches_current_lifecycle(&self, lifecycle: AuthActiveLifecycleFacts) -> bool {
+        let Some(active) = self.active_file() else {
+            return false;
+        };
+        if active.content.expose().len() != ACTIVE_ONLY_LENGTH {
+            return false;
+        }
+        let Ok(keyring) = Keyring::decode(SecretBytes::new(active.content.expose().to_vec()))
+        else {
+            return false;
+        };
+        lifecycle.expected_kid.matches_key(keyring.active_kid())
+            && lifecycle.keyring_version.matches_version(keyring.version())
+            && lifecycle
+                .updated_at_micros
+                .is_at_or_after(keyring.active_activated_at())
+    }
+
+    fn active_matches_planned_metadata(&self, metadata: &PlannedRotationMetadataV1) -> bool {
+        self.active_matches_planned_expectation(metadata.source_expectation())
+    }
+
+    fn active_matches_planned_expectation(
+        &self,
+        expectation: PlannedRotationSourceExpectation<'_>,
+    ) -> bool {
+        let Some(active) = self.active_file() else {
+            return false;
+        };
+        if active.content.expose().len() != ACTIVE_ONLY_LENGTH {
+            return false;
+        }
+        let Ok(keyring) = Keyring::decode(SecretBytes::new(active.content.expose().to_vec()))
+        else {
+            return false;
+        };
+        keyring.active_kid().as_str() == expectation.expected_active_kid()
+            && i64::try_from(keyring.version().get()).ok()
+                == Some(expectation.expected_keyring_version())
+            && i64::try_from(keyring.active_activated_at().get()).ok()
+                == Some(expectation.expected_key_activated_at_micros())
+    }
+
     fn is_terminal_initialization_namespace(&self) -> bool {
         self.namespace.is_valid
             && self.observations.len() == 2
@@ -991,6 +1306,60 @@ impl PinnedAuthArtifactSnapshot {
                 .filter(|entry| matches!(entry, PinnedTopLevelArtifact::ActiveKeyring { .. }))
                 .count()
                 == 1
+    }
+
+    fn is_clean_active_namespace(&self) -> bool {
+        self.namespace.is_valid
+            && self.observations.len() == 2
+            && self
+                .observations
+                .iter()
+                .filter(|entry| matches!(entry, PinnedTopLevelArtifact::MaintenanceLock { .. }))
+                .count()
+                == 1
+            && self
+                .observations
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry,
+                        PinnedTopLevelArtifact::ActiveKeyring {
+                            file,
+                            codec: CodecObservation::Valid,
+                            ..
+                        } if file.content.expose().len() == ACTIVE_ONLY_LENGTH
+                    )
+                })
+                .count()
+                == 1
+    }
+
+    fn matches_planned_preparation(
+        &self,
+        preparation: &PlannedRotationPreparationV1,
+    ) -> Result<bool, SecretFsError> {
+        let Some(reservation) = self.transition_directory() else {
+            return Ok(false);
+        };
+        if reservation.artifact != preparation.transition_artifact() {
+            return Ok(false);
+        }
+        let parts = RetainedReservationParts::from_directory(reservation);
+        let Some((metadata, CodecObservation::Valid)) = parts.metadata else {
+            return Ok(false);
+        };
+        let Some((staged, CodecObservation::Valid)) = parts.staged else {
+            return Ok(false);
+        };
+        if parts.prepared.is_none() || reservation.linkage != SemanticLinkageObservation::Consistent
+        {
+            return Ok(false);
+        }
+        let encoded = preparation
+            .encoded_metadata()
+            .map_err(|_| SecretFsError::UnsafeAuthArtifact)?;
+        Ok(metadata.content.expose() == encoded.expose_secret()
+            && staged.content.expose() == preparation.staged_keyring_bytes())
     }
 
     fn active_file(&self) -> Option<&PinnedKnownFile> {
@@ -1026,6 +1395,27 @@ impl PinnedAuthArtifactSnapshot {
             .transition_directory()
             .ok_or(SecretFsError::ArtifactChanged)?;
         original.revalidate_pre_source_rollback_progress(parent_fd, current)
+    }
+
+    fn revalidate_planned_rotation_rollback_progress(
+        &self,
+        parent_fd: &OwnedFd,
+        current: &Self,
+    ) -> Result<(), SecretFsError> {
+        self.revalidate_pre_source_rollback_progress(parent_fd, current)?;
+        let original_active = self.active_file().ok_or(SecretFsError::ArtifactChanged)?;
+        let current_active = current
+            .active_file()
+            .ok_or(SecretFsError::ArtifactChanged)?;
+        if original_active.stat != current_active.stat
+            || original_active.content.expose() != current_active.content.expose()
+            || original_active.content_sha256 != current_active.content_sha256
+        {
+            return Err(SecretFsError::ArtifactChanged);
+        }
+        let raw_name = RedactedBytes::new(ACTIVE_KEYRING_NAME.as_bytes().to_vec());
+        original_active.revalidate(parent_fd, &raw_name)?;
+        current_active.revalidate(parent_fd, &raw_name)
     }
 
     fn revalidate_pre_source_recovery_completion(
@@ -2336,11 +2726,33 @@ fn keyring_codec_observation(bytes: &[u8], partial_is_incomplete: bool) -> Codec
 }
 
 fn metadata_codec_observation(bytes: &[u8], artifact: TopLevelArtifactName) -> CodecObservation {
-    match InitializationMetadataV1::decode(SecretBytes::new(bytes.to_vec())) {
-        Ok(metadata) if metadata.matches_reservation_artifact(artifact) => CodecObservation::Valid,
-        Ok(_) => CodecObservation::Invalid,
-        Err(_) if metadata_is_incomplete(bytes) => CodecObservation::Incomplete,
-        Err(_) => CodecObservation::Invalid,
+    let valid = match artifact {
+        TopLevelArtifactName::Transition {
+            kind: TransitionKind::Initialize,
+            ..
+        }
+        | TopLevelArtifactName::Cleanup {
+            kind: TransitionKind::Initialize,
+            ..
+        } => InitializationMetadataV1::decode(SecretBytes::new(bytes.to_vec()))
+            .is_ok_and(|metadata| metadata.matches_reservation_artifact(artifact)),
+        TopLevelArtifactName::Transition {
+            kind: TransitionKind::Planned,
+            ..
+        }
+        | TopLevelArtifactName::Cleanup {
+            kind: TransitionKind::Planned,
+            ..
+        } => PlannedRotationMetadataV1::decode(SecretBytes::new(bytes.to_vec()))
+            .is_ok_and(|metadata| metadata.matches_reservation_artifact(artifact)),
+        _ => false,
+    };
+    if valid {
+        CodecObservation::Valid
+    } else if metadata_is_incomplete(bytes) {
+        CodecObservation::Incomplete
+    } else {
+        CodecObservation::Invalid
     }
 }
 
@@ -2382,16 +2794,46 @@ fn observe_reservation_linkage(
         CodecObservation::Invalid => return SemanticLinkageObservation::Invalid,
         CodecObservation::Valid => {}
     }
-    let Ok(metadata) =
-        InitializationMetadataV1::decode(SecretBytes::new(metadata_file.content.expose().to_vec()))
-    else {
-        return SemanticLinkageObservation::Invalid;
+    let linked = match artifact {
+        TopLevelArtifactName::Transition {
+            kind: TransitionKind::Initialize,
+            ..
+        }
+        | TopLevelArtifactName::Cleanup {
+            kind: TransitionKind::Initialize,
+            ..
+        } => InitializationMetadataV1::decode(SecretBytes::new(
+            metadata_file.content.expose().to_vec(),
+        ))
+        .is_ok_and(|metadata| {
+            metadata.matches_reservation_artifact(artifact)
+                && metadata
+                    .validate_staged_keyring(SecretBytes::new(
+                        staged_file.content.expose().to_vec(),
+                    ))
+                    .is_ok()
+        }),
+        TopLevelArtifactName::Transition {
+            kind: TransitionKind::Planned,
+            ..
+        }
+        | TopLevelArtifactName::Cleanup {
+            kind: TransitionKind::Planned,
+            ..
+        } => PlannedRotationMetadataV1::decode(SecretBytes::new(
+            metadata_file.content.expose().to_vec(),
+        ))
+        .is_ok_and(|metadata| {
+            metadata.matches_reservation_artifact(artifact)
+                && metadata
+                    .validate_staged_keyring(SecretBytes::new(
+                        staged_file.content.expose().to_vec(),
+                    ))
+                    .is_ok()
+        }),
+        _ => false,
     };
-    if metadata.matches_reservation_artifact(artifact)
-        && metadata
-            .validate_staged_keyring(SecretBytes::new(staged_file.content.expose().to_vec()))
-            .is_ok()
-    {
+    if linked {
         SemanticLinkageObservation::Consistent
     } else {
         SemanticLinkageObservation::Invalid
@@ -2900,6 +3342,53 @@ pub(crate) enum AuthInitializationReconciliation {
     Blocked(AuthInitializationBlocker),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthPlannedRotationPreSourcePhase {
+    ReservationOnly,
+    MetadataIncomplete,
+    MetadataComplete,
+    StagedIncomplete,
+    StagedComplete,
+    Prepared,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthPlannedRotationRecovery {
+    RollbackOnlyCandidate,
+    ResumeOrRollbackCandidate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthPlannedRotationBlocker {
+    UnrecognizedArtifacts,
+    UnsupportedLifecycleState,
+    InconsistentDbFilesystem,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthPlannedRotationReconciliation {
+    CleanActive,
+    PlannedPreSource {
+        phase: AuthPlannedRotationPreSourcePhase,
+        recovery: AuthPlannedRotationRecovery,
+    },
+    Blocked(AuthPlannedRotationBlocker),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum AuthPlannedRotationPrepareOutcome {
+    Prepared,
+    AlreadyPrepared,
+    PreconditionNotClean(AuthPlannedRotationReconciliation),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum AuthPlannedRotationRollbackOutcome {
+    RolledBack,
+    AlreadyClean,
+    NotRollbackable(AuthPlannedRotationReconciliation),
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum AuthInitializationPrepareOutcome {
     Prepared,
@@ -2963,6 +3452,24 @@ pub(super) enum AuthInitializationPrepareTestFault {
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AuthPlannedRotationPrepareTestFault {
+    Reservation,
+    Metadata,
+    Staged,
+    Prepared,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AuthPlannedRotationRollbackTestFault {
+    Prepared,
+    Staged,
+    Metadata,
+    Directory,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AuthInitializationRollbackTestFault {
     Prepared,
     Staged,
@@ -3011,6 +3518,30 @@ impl fmt::Debug for AuthInitializationPrepareOutcome {
             Self::PreconditionNotClean(_) => formatter
                 .write_str("AuthInitializationPrepareOutcome::PreconditionNotClean([REDACTED])"),
         }
+    }
+}
+
+impl fmt::Debug for AuthPlannedRotationPrepareOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Prepared => "AuthPlannedRotationPrepareOutcome::Prepared",
+            Self::AlreadyPrepared => "AuthPlannedRotationPrepareOutcome::AlreadyPrepared",
+            Self::PreconditionNotClean(_) => {
+                "AuthPlannedRotationPrepareOutcome::PreconditionNotClean([REDACTED])"
+            }
+        })
+    }
+}
+
+impl fmt::Debug for AuthPlannedRotationRollbackOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::RolledBack => "AuthPlannedRotationRollbackOutcome::RolledBack",
+            Self::AlreadyClean => "AuthPlannedRotationRollbackOutcome::AlreadyClean",
+            Self::NotRollbackable(_) => {
+                "AuthPlannedRotationRollbackOutcome::NotRollbackable([REDACTED])"
+            }
+        })
     }
 }
 
@@ -3254,6 +3785,36 @@ impl OwnedAuthMaintenanceContext {
         &self,
     ) -> Result<AuthInitializationReconciliation, AuthStoreBindingError> {
         self.inspect_initialization_reconciliation_inner(|| {}, || {})
+    }
+
+    pub(super) fn inspect_planned_rotation_reconciliation(
+        &self,
+    ) -> Result<AuthPlannedRotationReconciliation, AuthStoreBindingError> {
+        self.inspect_planned_rotation_reconciliation_inner(|| {}, || {})
+    }
+
+    pub(super) fn prepare_planned_rotation(
+        &self,
+        preparation: &PlannedRotationPreparationV1,
+    ) -> Result<AuthPlannedRotationPrepareOutcome, AuthStoreBindingError> {
+        self.prepare_planned_rotation_inner(
+            preparation,
+            #[cfg(test)]
+            None,
+            || {},
+        )
+    }
+
+    pub(super) fn rollback_planned_rotation_pre_source(
+        &self,
+    ) -> Result<AuthPlannedRotationRollbackOutcome, AuthStoreBindingError> {
+        self.rollback_planned_rotation_pre_source_inner(
+            #[cfg(test)]
+            None,
+            || {},
+            || {},
+            || {},
+        )
     }
 
     pub(super) fn prepare_initialization(
@@ -4804,6 +5365,487 @@ impl OwnedAuthMaintenanceContext {
         Ok(())
     }
 
+    fn capture_stable_planned_rotation_reconciliation(
+        &self,
+    ) -> Result<
+        (
+            PinnedAuthArtifactSnapshot,
+            AuthPlannedRotationReconciliation,
+            AuthPlannedRotationDatabaseObservation,
+        ),
+        AuthStoreBindingError,
+    > {
+        self.revalidate()?;
+        let artifacts = self.locked.capture_secret_artifacts()?;
+        let metadata = artifacts.decode_planned_rotation_metadata();
+        let expectation = metadata
+            .as_ref()
+            .map(PlannedRotationMetadataV1::source_expectation);
+        let database_a = self
+            .conversation
+            .inspect_auth_planned_rotation(expectation)
+            .map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        let database_b = self
+            .conversation
+            .inspect_auth_planned_rotation(expectation)
+            .map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        if database_a != database_b {
+            return Err(AuthStoreBindingError::ConversationStoreChanged);
+        }
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()?;
+        let reconciliation = artifacts.reconcile_planned_rotation(database_a, metadata.as_ref());
+        Ok((artifacts, reconciliation, database_a))
+    }
+
+    fn capture_planned_rotation_preparation_precondition(
+        &self,
+        preparation: &PlannedRotationPreparationV1,
+    ) -> Result<(PinnedAuthArtifactSnapshot, bool), AuthStoreBindingError> {
+        self.revalidate()?;
+        let artifacts = self.locked.capture_secret_artifacts()?;
+        let expectation = preparation.source_expectation();
+        let database_a = self
+            .conversation
+            .inspect_auth_planned_rotation(Some(expectation))
+            .map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        let database_b = self
+            .conversation
+            .inspect_auth_planned_rotation(Some(expectation))
+            .map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        if database_a != database_b {
+            return Err(AuthStoreBindingError::ConversationStoreChanged);
+        }
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()?;
+        let exact = matches!(
+            database_a.lifecycle,
+            AuthDatabaseLifecycleObservation::Active(lifecycle)
+                if artifacts.active_matches_current_lifecycle(lifecycle)
+        ) && database_a.source == AuthPlannedRotationSourceMatch::Exact
+            && database_a.source_fingerprint.is_some()
+            && artifacts.is_clean_active_namespace()
+            && artifacts.active_matches_planned_expectation(expectation);
+        Ok((artifacts, exact))
+    }
+
+    fn planned_rotation_database_unchanged(
+        expected: AuthPlannedRotationDatabaseObservation,
+        current: AuthPlannedRotationDatabaseObservation,
+    ) -> bool {
+        expected.lifecycle == current.lifecycle
+            && expected.source_fingerprint.is_some()
+            && expected.source_fingerprint == current.source_fingerprint
+            && matches!(
+                current.source,
+                AuthPlannedRotationSourceMatch::Canonical | AuthPlannedRotationSourceMatch::Exact
+            )
+    }
+
+    #[cfg(test)]
+    pub(super) fn prepare_planned_rotation_with_test_control(
+        &self,
+        preparation: &PlannedRotationPreparationV1,
+        fault: Option<AuthPlannedRotationPrepareTestFault>,
+        after_outer_precondition: impl FnOnce(),
+    ) -> Result<AuthPlannedRotationPrepareOutcome, AuthStoreBindingError> {
+        self.prepare_planned_rotation_inner(preparation, fault, after_outer_precondition)
+    }
+
+    fn prepare_planned_rotation_inner<AfterOuterPrecondition>(
+        &self,
+        preparation: &PlannedRotationPreparationV1,
+        #[cfg(test)] fault: Option<AuthPlannedRotationPrepareTestFault>,
+        after_outer_precondition: AfterOuterPrecondition,
+    ) -> Result<AuthPlannedRotationPrepareOutcome, AuthStoreBindingError>
+    where
+        AfterOuterPrecondition: FnOnce(),
+    {
+        let (existing, reconciliation, _) =
+            self.capture_stable_planned_rotation_reconciliation()?;
+        if reconciliation
+            == (AuthPlannedRotationReconciliation::PlannedPreSource {
+                phase: AuthPlannedRotationPreSourcePhase::Prepared,
+                recovery: AuthPlannedRotationRecovery::ResumeOrRollbackCandidate,
+            })
+            && existing.matches_planned_preparation(preparation)?
+        {
+            return Ok(AuthPlannedRotationPrepareOutcome::AlreadyPrepared);
+        }
+        if reconciliation != AuthPlannedRotationReconciliation::CleanActive {
+            return Ok(AuthPlannedRotationPrepareOutcome::PreconditionNotClean(
+                reconciliation,
+            ));
+        }
+
+        let (outer_artifacts, exact_outer) =
+            self.capture_planned_rotation_preparation_precondition(preparation)?;
+        if !exact_outer {
+            return Ok(AuthPlannedRotationPrepareOutcome::PreconditionNotClean(
+                AuthPlannedRotationReconciliation::Blocked(
+                    AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+                ),
+            ));
+        }
+        after_outer_precondition();
+
+        let (verified_artifacts, exact_verified) =
+            self.capture_planned_rotation_preparation_precondition(preparation)?;
+        if !exact_verified {
+            return Ok(AuthPlannedRotationPrepareOutcome::PreconditionNotClean(
+                AuthPlannedRotationReconciliation::Blocked(
+                    AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+                ),
+            ));
+        }
+        outer_artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        verified_artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()?;
+
+        let persistence = self.locked.persist_planned_rotation_preparation(
+            preparation,
+            #[cfg(test)]
+            fault,
+        )?;
+        if persistence == AuthPlannedRotationPersistenceOutcome::PreconditionNotClean {
+            let (_, observed, _) = self.capture_stable_planned_rotation_reconciliation()?;
+            if observed == AuthPlannedRotationReconciliation::CleanActive {
+                return Err(AuthStoreBindingError::Filesystem(
+                    SecretFsError::ArtifactChanged,
+                ));
+            }
+            return Ok(AuthPlannedRotationPrepareOutcome::PreconditionNotClean(
+                observed,
+            ));
+        }
+        let (readback_artifacts, readback, _) =
+            self.capture_stable_planned_rotation_reconciliation()?;
+        let expected = AuthPlannedRotationReconciliation::PlannedPreSource {
+            phase: AuthPlannedRotationPreSourcePhase::Prepared,
+            recovery: AuthPlannedRotationRecovery::ResumeOrRollbackCandidate,
+        };
+        if readback != expected || !readback_artifacts.matches_planned_preparation(preparation)? {
+            return Err(AuthStoreBindingError::Filesystem(
+                SecretFsError::ArtifactChanged,
+            ));
+        }
+        self.revalidate()?;
+        Ok(AuthPlannedRotationPrepareOutcome::Prepared)
+    }
+
+    #[cfg(test)]
+    pub(super) fn rollback_planned_rotation_pre_source_with_test_control(
+        &self,
+        fault: Option<AuthPlannedRotationRollbackTestFault>,
+        before_mutation: impl FnOnce(),
+        after_first_mutation: impl FnOnce(),
+        after_rollback: impl FnOnce(),
+    ) -> Result<AuthPlannedRotationRollbackOutcome, AuthStoreBindingError> {
+        self.rollback_planned_rotation_pre_source_inner(
+            fault,
+            before_mutation,
+            after_first_mutation,
+            after_rollback,
+        )
+    }
+
+    fn rollback_planned_rotation_pre_source_inner<
+        BeforeMutation,
+        AfterFirstMutation,
+        AfterRollback,
+    >(
+        &self,
+        #[cfg(test)] fault: Option<AuthPlannedRotationRollbackTestFault>,
+        before_mutation: BeforeMutation,
+        after_first_mutation: AfterFirstMutation,
+        after_rollback: AfterRollback,
+    ) -> Result<AuthPlannedRotationRollbackOutcome, AuthStoreBindingError>
+    where
+        BeforeMutation: FnOnce(),
+        AfterFirstMutation: FnOnce(),
+        AfterRollback: FnOnce(),
+    {
+        let mut before_mutation = Some(before_mutation);
+        let mut after_first_mutation = Some(after_first_mutation);
+        let mut after_rollback = Some(after_rollback);
+        let mut filesystem_mutated = false;
+        let mut rollback_evidence: Option<PinnedAuthArtifactSnapshot> = None;
+        let mut database_evidence: Option<AuthPlannedRotationDatabaseObservation> = None;
+        let mut expected_reconciliation = None;
+
+        for _ in 0..5 {
+            let (artifacts, reconciliation, database) =
+                self.capture_stable_planned_rotation_reconciliation()?;
+            if expected_reconciliation
+                .take()
+                .is_some_and(|expected| expected != reconciliation)
+            {
+                return Err(AuthStoreBindingError::Filesystem(
+                    SecretFsError::ArtifactChanged,
+                ));
+            }
+            if let Some(expected_database) = database_evidence
+                && !Self::planned_rotation_database_unchanged(expected_database, database)
+            {
+                if filesystem_mutated {
+                    return Err(AuthStoreBindingError::ConversationStoreChanged);
+                }
+                return Ok(AuthPlannedRotationRollbackOutcome::NotRollbackable(
+                    reconciliation,
+                ));
+            }
+
+            let (phase, recovery) = match reconciliation {
+                AuthPlannedRotationReconciliation::CleanActive => {
+                    if !filesystem_mutated {
+                        return Ok(AuthPlannedRotationRollbackOutcome::AlreadyClean);
+                    }
+                    after_rollback
+                        .take()
+                        .ok_or(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ))?();
+                    let rollback_evidence =
+                        rollback_evidence
+                            .as_ref()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    rollback_evidence
+                        .revalidate_completed_cleanup_evidence(&self.locked.layout.secret_fd)?;
+                    let (terminal_artifacts, terminal, terminal_database) =
+                        self.capture_stable_planned_rotation_reconciliation()?;
+                    if terminal != AuthPlannedRotationReconciliation::CleanActive
+                        || !Self::planned_rotation_database_unchanged(
+                            database_evidence
+                                .ok_or(AuthStoreBindingError::ConversationStoreChanged)?,
+                            terminal_database,
+                        )
+                    {
+                        return Err(AuthStoreBindingError::ConversationStoreChanged);
+                    }
+                    terminal_artifacts.revalidate(&self.locked.layout.secret_fd)?;
+                    rollback_evidence
+                        .revalidate_completed_cleanup_evidence(&self.locked.layout.secret_fd)?;
+                    self.revalidate()?;
+                    return Ok(AuthPlannedRotationRollbackOutcome::RolledBack);
+                }
+                AuthPlannedRotationReconciliation::PlannedPreSource { phase, recovery } => {
+                    (phase, recovery)
+                }
+                _ => {
+                    if filesystem_mutated {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    }
+                    return Ok(AuthPlannedRotationRollbackOutcome::NotRollbackable(
+                        reconciliation,
+                    ));
+                }
+            };
+
+            let artifacts = if !filesystem_mutated {
+                database_evidence = Some(database);
+                rollback_evidence = Some(artifacts);
+                before_mutation
+                    .take()
+                    .ok_or(AuthStoreBindingError::Filesystem(
+                        SecretFsError::ArtifactChanged,
+                    ))?();
+                let (verified_artifacts, verified, verified_database) =
+                    self.capture_stable_planned_rotation_reconciliation()?;
+                if verified != reconciliation
+                    || !Self::planned_rotation_database_unchanged(database, verified_database)
+                {
+                    return Ok(AuthPlannedRotationRollbackOutcome::NotRollbackable(
+                        verified,
+                    ));
+                }
+                rollback_evidence
+                    .as_ref()
+                    .ok_or(AuthStoreBindingError::Filesystem(
+                        SecretFsError::ArtifactChanged,
+                    ))?
+                    .revalidate_planned_rotation_rollback_progress(
+                        &self.locked.layout.secret_fd,
+                        &verified_artifacts,
+                    )?;
+                verified_artifacts
+            } else {
+                rollback_evidence
+                    .as_ref()
+                    .ok_or(AuthStoreBindingError::Filesystem(
+                        SecretFsError::ArtifactChanged,
+                    ))?
+                    .revalidate_planned_rotation_rollback_progress(
+                        &self.locked.layout.secret_fd,
+                        &artifacts,
+                    )?;
+                artifacts
+            };
+
+            let reservation =
+                artifacts
+                    .transition_directory()
+                    .ok_or(AuthStoreBindingError::Filesystem(
+                        SecretFsError::ArtifactChanged,
+                    ))?;
+            let transition_artifact = match reservation.artifact {
+                TopLevelArtifactName::Transition {
+                    kind: TransitionKind::Planned,
+                    id,
+                } => TopLevelArtifactName::Transition {
+                    kind: TransitionKind::Planned,
+                    id,
+                },
+                _ => {
+                    return Err(AuthStoreBindingError::Filesystem(
+                        SecretFsError::ArtifactChanged,
+                    ));
+                }
+            };
+            let transition_name = transition_artifact.format();
+            if TopLevelArtifactName::parse(transition_name.as_bytes()) != Ok(transition_artifact) {
+                return Err(AuthStoreBindingError::Filesystem(
+                    SecretFsError::UnsafeAuthArtifact,
+                ));
+            }
+            let parts = RetainedReservationParts::from_directory(reservation);
+            artifacts.revalidate(&self.locked.layout.secret_fd)?;
+            self.revalidate()?;
+
+            match phase {
+                AuthPlannedRotationPreSourcePhase::Prepared => {
+                    let prepared = parts.prepared.ok_or(AuthStoreBindingError::Filesystem(
+                        SecretFsError::ArtifactChanged,
+                    ))?;
+                    remove_exact_known_file(
+                        &reservation.directory_fd,
+                        ReservationEntryName::Prepared.as_str(),
+                        KnownFilePurpose::Prepared,
+                        prepared.stat,
+                        prepared.content.expose(),
+                        || {},
+                    )?;
+                    if !filesystem_mutated {
+                        filesystem_mutated = true;
+                        after_first_mutation
+                            .take()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?();
+                    }
+                    #[cfg(test)]
+                    if fault == Some(AuthPlannedRotationRollbackTestFault::Prepared) {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                    expected_reconciliation =
+                        Some(AuthPlannedRotationReconciliation::PlannedPreSource {
+                            phase: AuthPlannedRotationPreSourcePhase::StagedComplete,
+                            recovery,
+                        });
+                }
+                AuthPlannedRotationPreSourcePhase::StagedIncomplete
+                | AuthPlannedRotationPreSourcePhase::StagedComplete => {
+                    let staged = parts.staged.map(|(file, _)| file).ok_or(
+                        AuthStoreBindingError::Filesystem(SecretFsError::ArtifactChanged),
+                    )?;
+                    remove_exact_known_file(
+                        &reservation.directory_fd,
+                        ReservationEntryName::StagedKeyring.as_str(),
+                        KnownFilePurpose::StagedKeyring,
+                        staged.stat,
+                        staged.content.expose(),
+                        || {},
+                    )?;
+                    if !filesystem_mutated {
+                        filesystem_mutated = true;
+                        after_first_mutation
+                            .take()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?();
+                    }
+                    #[cfg(test)]
+                    if fault == Some(AuthPlannedRotationRollbackTestFault::Staged) {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                    expected_reconciliation =
+                        Some(AuthPlannedRotationReconciliation::PlannedPreSource {
+                            phase: AuthPlannedRotationPreSourcePhase::MetadataComplete,
+                            recovery: AuthPlannedRotationRecovery::RollbackOnlyCandidate,
+                        });
+                }
+                AuthPlannedRotationPreSourcePhase::MetadataIncomplete
+                | AuthPlannedRotationPreSourcePhase::MetadataComplete => {
+                    let metadata = parts.metadata.map(|(file, _)| file).ok_or(
+                        AuthStoreBindingError::Filesystem(SecretFsError::ArtifactChanged),
+                    )?;
+                    remove_exact_known_file(
+                        &reservation.directory_fd,
+                        ReservationEntryName::Metadata.as_str(),
+                        KnownFilePurpose::Metadata,
+                        metadata.stat,
+                        metadata.content.expose(),
+                        || {},
+                    )?;
+                    if !filesystem_mutated {
+                        filesystem_mutated = true;
+                        after_first_mutation
+                            .take()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?();
+                    }
+                    #[cfg(test)]
+                    if fault == Some(AuthPlannedRotationRollbackTestFault::Metadata) {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                    expected_reconciliation =
+                        Some(AuthPlannedRotationReconciliation::PlannedPreSource {
+                            phase: AuthPlannedRotationPreSourcePhase::ReservationOnly,
+                            recovery: AuthPlannedRotationRecovery::RollbackOnlyCandidate,
+                        });
+                }
+                AuthPlannedRotationPreSourcePhase::ReservationOnly => {
+                    remove_exact_empty_reservation_directory(
+                        &self.locked.layout.secret_fd,
+                        transition_name.as_str(),
+                        reservation,
+                    )?;
+                    if !filesystem_mutated {
+                        filesystem_mutated = true;
+                        after_first_mutation
+                            .take()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?();
+                    }
+                    #[cfg(test)]
+                    if fault == Some(AuthPlannedRotationRollbackTestFault::Directory) {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                    expected_reconciliation = Some(AuthPlannedRotationReconciliation::CleanActive);
+                }
+            }
+        }
+
+        Err(AuthStoreBindingError::Filesystem(
+            SecretFsError::ArtifactChanged,
+        ))
+    }
+
     fn capture_stable_initialization_reconciliation(
         &self,
     ) -> Result<(PinnedAuthArtifactSnapshot, AuthInitializationReconciliation), AuthStoreBindingError>
@@ -4918,6 +5960,56 @@ impl OwnedAuthMaintenanceContext {
         AfterDatabaseB: FnOnce(),
     {
         self.inspect_initialization_reconciliation_inner(after_filesystem_b, after_database_b)
+    }
+
+    #[cfg(test)]
+    pub(super) fn inspect_planned_rotation_reconciliation_with_checkpoints<
+        AfterFilesystemB,
+        AfterDatabaseB,
+    >(
+        &self,
+        after_filesystem_b: AfterFilesystemB,
+        after_database_b: AfterDatabaseB,
+    ) -> Result<AuthPlannedRotationReconciliation, AuthStoreBindingError>
+    where
+        AfterFilesystemB: FnOnce(),
+        AfterDatabaseB: FnOnce(),
+    {
+        self.inspect_planned_rotation_reconciliation_inner(after_filesystem_b, after_database_b)
+    }
+
+    fn inspect_planned_rotation_reconciliation_inner<AfterFilesystemB, AfterDatabaseB>(
+        &self,
+        after_filesystem_b: AfterFilesystemB,
+        after_database_b: AfterDatabaseB,
+    ) -> Result<AuthPlannedRotationReconciliation, AuthStoreBindingError>
+    where
+        AfterFilesystemB: FnOnce(),
+        AfterDatabaseB: FnOnce(),
+    {
+        self.revalidate()?;
+        let artifacts = self.locked.capture_secret_artifacts()?;
+        let metadata = artifacts.decode_planned_rotation_metadata();
+        let expectation = metadata
+            .as_ref()
+            .map(PlannedRotationMetadataV1::source_expectation);
+        let database_a = self
+            .conversation
+            .inspect_auth_planned_rotation(expectation)
+            .map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        after_filesystem_b();
+        let database_b = self
+            .conversation
+            .inspect_auth_planned_rotation(expectation)
+            .map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        if database_a != database_b {
+            return Err(AuthStoreBindingError::ConversationStoreChanged);
+        }
+        after_database_b();
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()?;
+        Ok(artifacts.reconcile_planned_rotation(database_a, metadata.as_ref()))
     }
 
     fn inspect_initialization_reconciliation_inner<AfterFilesystemB, AfterDatabaseB>(

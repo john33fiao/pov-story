@@ -1,6 +1,6 @@
 # POV-007 Local Login, Refresh And Session Revoke
 
-Status: In Progress — dependency-independent control plane, sentinel/legacy initialization recovery, source/final-CAS, deletion-only cleanup and pure planned-rotation keyring/metadata contract slices implemented; Windows workspace validation restored by POV-034 and POV-031 current-tree removal completed
+Status: In Progress — dependency-independent control plane, sentinel/legacy initialization recovery, source/final-CAS, deletion-only cleanup, planned-rotation keyring/metadata contract and planned pre-source preparation/reconciliation/rollback slices implemented; Windows workspace validation restored by POV-034 and POV-031 current-tree removal completed
 
 Type: Delivery
 
@@ -126,9 +126,9 @@ completion을 주장하지 않습니다. 외부 사용자 검증인 POV-022는 �
   source expectation만 발급합니다. 모든 truncation, append, version/kind/checksum,
   revision/time/version corruption, unrelated current key와 changed stage를 무변경
   거부하고 durable bytes decode/validate round trip 및 redacted Debug를 unit test로
-  검증합니다. 이 planned pure codec은 filesystem이나 DB를 변경하지 않으며
-  retire/compromise/loss metadata persistence와 planned actor/source-CAS/install/final-CAS/
-  cleanup은 아직 unsupported입니다.
+  검증합니다. 이 planned pure codec 자체는 filesystem이나 DB를 변경하지 않습니다.
+  Retire/compromise/loss metadata persistence와 planned source-CAS/install/final-CAS/cleanup은
+  아직 unsupported입니다.
 - Unix crate-private instance primitive는 exact `stores/`와 `secrets/` directory 및 persistent
   empty `auth-maintenance.lock`을 owner-only mode, no-follow/pinned identity와 close-on-exec로
   검증합니다. Synthetic tests는 unsafe root/child/lock artifact 무변경 거부, root
@@ -287,6 +287,35 @@ completion을 주장하지 않습니다. 외부 사용자 검증인 POV-022는 �
   filesystem evidence를 되돌리지 않고 그대로 보존하면서 actor/store를 poison합니다. 실제 abrupt process
   termination, power-loss/filesystem durability, 마지막 검사 직후 malicious same-UID ABA와
   unlink의 physical secure erase는 conditional residual입니다.
+- Planned rotation pre-source command는 같은 lock-owning actor에서 canonical active-only
+  170-byte keyring과 exact `active` lifecycle, account/password/recovery current source를 fresh
+  private DB observation으로 다시 검증합니다. Lifecycle KID/version/time과 metadata의 current
+  key, lifecycle/source revision, owner가 모두 일치하고 verify-only overlap이 없는
+  active-key-only namespace일 때만 `.auth-transition-planned-<uuidv4>`를 no-replace로
+  reservation합니다. Canonical 305-byte `metadata`, matching 261-byte `staged-keyring`, empty
+  `prepared`를 owner-only/no-follow/exclusive-create/readback/file+containing-directory fsync
+  규칙으로 순서대로 내구화하며 DB lifecycle, active key와 auth source row는 변경하지 않습니다.
+- Planned read-only reconciliation은 initialization으로 가장하지 않는 별도 typed result로
+  `ReservationOnly|MetadataIncomplete|MetadataComplete|StagedIncomplete|StagedComplete|Prepared`
+  여섯 pre-source phase를 구분합니다. Complete metadata의 current source/KID/version/revision과
+  staged bytes가 exact match하는 legal state만 resume-or-rollback candidate이고 incomplete
+  reservation은 rollback-only입니다. Verify-only overlap, unknown/noncanonical artifact,
+  unrelated/changed staged bytes, hard link, source/lifecycle mismatch와 filesystem/context drift는
+  자동 채택하거나 정리하지 않고 fail closed합니다.
+- Planned explicit rollback은 caller path/digest/KID/관찰 phase를 받지 않고 retained typed
+  artifacts와 verified transition ID에서만 exact deletion target을 derive합니다. Original
+  active-key inode/content, reservation inode/content와 typed DB source fingerprint를 유지한 채
+  `prepared → staged-keyring → metadata → transition directory` 역순으로 exact unlink하고
+  각 containing directory를 fsync합니다. Mutation 전 drift와 stable clean replay는
+  mutation-free typed outcome이고 첫 mutation 뒤 drift 또는 durability uncertainty는 remaining
+  evidence를 보존하고 actor/store를 poison합니다.
+- Planned synthetic actor tests는 clean active에서 `Prepared`와 explicit rollback의 exact
+  round trip, prepared/clean replay, reservation/metadata/staged/prepared preparation checkpoint,
+  네 rollback deletion checkpoint의 fresh-actor phase, 여섯 pre-source phase, lifecycle/KID/
+  version/source revision mismatch, verify-only/unknown/changed/hard-link 거부, reservation inode
+  ABA, pre/post-mutation drift, redaction과 dropped receiver 뒤 admitted completion 및 lock
+  lifetime을 검증합니다. 실제 abrupt process termination, power-loss와 filesystem별
+  atomicity/durability는 직접 재현하지 않았습니다.
 - Crate-private no-payload initialization source command는 exact maintenance lock과 bound store를
   소유한 전용 actor OS thread에서 동기적으로 실행됩니다. Retained secret snapshot과 zeroizing
   metadata를 유지한 채 typed DB observation A/B, retained filesystem과 context를 확인하고,
@@ -388,13 +417,14 @@ completion을 주장하지 않습니다. 외부 사용자 검증인 POV-022는 �
   initialization-only pre-source durable preparation·recovery·exact rollback,
   exact `Prepared → initializing` source-CAS와 pre-writer durability fence,
   active-key install, final `initializing → active` lifecycle CAS와 deletion-only cleanup primitive
-  slice 및 pure planned-rotation keyring/metadata recovery contract에 한정됩니다.
+  slice, planned-rotation keyring/metadata recovery contract와 planned pre-source durable
+  preparation·read-only reconciliation·explicit rollback slice에 한정됩니다.
   `InitializationComplete`와 cleanup `Completed|AlreadyCompleted`는 metadata가
   제거된 뒤 active revision/KID/version/key/namespace만 확인하는 protocol terminal이며 full
   mutable auth source, auth validity 또는 listener readiness 증명이 아닙니다. Actor에는
-  planned/retire/compromise/loss transition command가 없고 planned metadata도 reservation,
-  source-CAS, key install/final-CAS 또는 cleanup에 연결되지 않았으며 production auth
-  mutation repository, listener,
+  planned pre-source inspect/prepare/rollback command만 연결됐으며 planned source-CAS,
+  active-key replacement, final lifecycle CAS, cleanup 및 retire/compromise/loss transition
+  command는 없습니다. Production auth mutation repository, listener,
   dummy verifier/account selection, JWT, refresh mutation, controlling-TTY flow, reference-device
   Argon2 benchmark, local HTTP와 production instance-root/runtime wiring, preparation/source
   predicate 직후 same-UID ABA의 원자적 차단, process crash/power-loss state-machine과

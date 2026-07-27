@@ -19,7 +19,8 @@ use super::secret_fs::{
     AuthInitializationCleanupOutcome, AuthInitializationFinalLifecycleOutcome,
     AuthInitializationPreSourceRecoveryOutcome, AuthInitializationPrepareOutcome,
     AuthInitializationReconciliation, AuthInitializationRollbackOutcome,
-    AuthInitializationSourceOutcome, AuthMaintenanceContext, AuthStoreBindingError,
+    AuthInitializationSourceOutcome, AuthMaintenanceContext, AuthPlannedRotationPrepareOutcome,
+    AuthPlannedRotationReconciliation, AuthPlannedRotationRollbackOutcome, AuthStoreBindingError,
     OwnedAuthMaintenanceContext,
 };
 #[cfg(test)]
@@ -27,8 +28,9 @@ use super::secret_fs::{
     AuthInitializationActiveKeyInstallTestFault, AuthInitializationCleanupTestFault,
     AuthInitializationPreSourceRecoveryTestFault, AuthInitializationPrepareTestFault,
     AuthInitializationRollbackTestFault, AuthInitializationSourceDurabilityTestFault,
+    AuthPlannedRotationPrepareTestFault, AuthPlannedRotationRollbackTestFault,
 };
-use super::transition::InitializationPreparationV1;
+use super::transition::{InitializationPreparationV1, PlannedRotationPreparationV1};
 #[cfg(test)]
 use crate::storage::{
     AuthInitializationFinalLifecycleMutationTestFault, AuthInitializationSourceMutationTestFault,
@@ -142,6 +144,124 @@ impl AuthMaintenanceActor {
         &self,
     ) -> Result<AuthInitializationReconciliation, AuthMaintenanceActorError> {
         self.start_initialization_reconciliation()?.await
+    }
+
+    pub(crate) fn start_planned_rotation_reconciliation(
+        &self,
+    ) -> Result<AuthMaintenanceRun<AuthPlannedRotationReconciliation>, AuthMaintenanceActorError>
+    {
+        let (response, receiver) = oneshot::channel();
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or(AuthMaintenanceActorError::Unavailable)?;
+        sender
+            .try_send(MaintenanceCommand::InspectPlannedRotationReconciliation { response })
+            .map_err(map_send_error)?;
+        Ok(AuthMaintenanceRun { receiver })
+    }
+
+    pub(crate) async fn inspect_planned_rotation_reconciliation(
+        &self,
+    ) -> Result<AuthPlannedRotationReconciliation, AuthMaintenanceActorError> {
+        self.start_planned_rotation_reconciliation()?.await
+    }
+
+    pub(crate) fn start_prepare_planned_rotation(
+        &self,
+        preparation: PlannedRotationPreparationV1,
+    ) -> Result<AuthMaintenanceRun<AuthPlannedRotationPrepareOutcome>, AuthMaintenanceActorError>
+    {
+        self.start_prepare_planned_rotation_command(
+            preparation,
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn start_prepare_planned_rotation_command(
+        &self,
+        preparation: PlannedRotationPreparationV1,
+        #[cfg(test)] fault: Option<AuthPlannedRotationPrepareTestFault>,
+        #[cfg(test)] pre_mutation_gate: Option<ActorTestGate>,
+    ) -> Result<AuthMaintenanceRun<AuthPlannedRotationPrepareOutcome>, AuthMaintenanceActorError>
+    {
+        let (response, receiver) = oneshot::channel();
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or(AuthMaintenanceActorError::Unavailable)?;
+        sender
+            .try_send(MaintenanceCommand::PreparePlannedRotation {
+                preparation: Box::new(preparation),
+                #[cfg(test)]
+                fault,
+                #[cfg(test)]
+                pre_mutation_gate,
+                response,
+            })
+            .map_err(map_send_error)?;
+        Ok(AuthMaintenanceRun { receiver })
+    }
+
+    pub(crate) async fn prepare_planned_rotation(
+        &self,
+        preparation: PlannedRotationPreparationV1,
+    ) -> Result<AuthPlannedRotationPrepareOutcome, AuthMaintenanceActorError> {
+        self.start_prepare_planned_rotation(preparation)?.await
+    }
+
+    pub(crate) fn start_rollback_planned_rotation_pre_source(
+        &self,
+    ) -> Result<AuthMaintenanceRun<AuthPlannedRotationRollbackOutcome>, AuthMaintenanceActorError>
+    {
+        self.start_rollback_planned_rotation_pre_source_command(
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn start_rollback_planned_rotation_pre_source_command(
+        &self,
+        #[cfg(test)] fault: Option<AuthPlannedRotationRollbackTestFault>,
+        #[cfg(test)] before_mutation_gate: Option<ActorTestGate>,
+        #[cfg(test)] after_first_mutation_gate: Option<ActorTestGate>,
+        #[cfg(test)] after_rollback_gate: Option<ActorTestGate>,
+    ) -> Result<AuthMaintenanceRun<AuthPlannedRotationRollbackOutcome>, AuthMaintenanceActorError>
+    {
+        let (response, receiver) = oneshot::channel();
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or(AuthMaintenanceActorError::Unavailable)?;
+        sender
+            .try_send(MaintenanceCommand::RollbackPlannedRotationPreSource {
+                #[cfg(test)]
+                fault,
+                #[cfg(test)]
+                before_mutation_gate,
+                #[cfg(test)]
+                after_first_mutation_gate,
+                #[cfg(test)]
+                after_rollback_gate,
+                response,
+            })
+            .map_err(map_send_error)?;
+        Ok(AuthMaintenanceRun { receiver })
+    }
+
+    pub(crate) async fn rollback_planned_rotation_pre_source(
+        &self,
+    ) -> Result<AuthPlannedRotationRollbackOutcome, AuthMaintenanceActorError> {
+        self.start_rollback_planned_rotation_pre_source()?.await
     }
 
     pub(crate) fn start_prepare_initialization(
@@ -563,6 +683,62 @@ impl AuthMaintenanceActor {
     }
 
     #[cfg(test)]
+    fn start_prepare_planned_rotation_with_fault(
+        &self,
+        preparation: PlannedRotationPreparationV1,
+        fault: AuthPlannedRotationPrepareTestFault,
+    ) -> Result<AuthMaintenanceRun<AuthPlannedRotationPrepareOutcome>, AuthMaintenanceActorError>
+    {
+        self.start_prepare_planned_rotation_command(preparation, Some(fault), None)
+    }
+
+    #[cfg(test)]
+    fn start_prepare_planned_rotation_with_pre_mutation_gate(
+        &self,
+        preparation: PlannedRotationPreparationV1,
+        gate: ActorTestGate,
+    ) -> Result<AuthMaintenanceRun<AuthPlannedRotationPrepareOutcome>, AuthMaintenanceActorError>
+    {
+        self.start_prepare_planned_rotation_command(preparation, None, Some(gate))
+    }
+
+    #[cfg(test)]
+    fn start_rollback_planned_rotation_pre_source_with_fault(
+        &self,
+        fault: AuthPlannedRotationRollbackTestFault,
+    ) -> Result<AuthMaintenanceRun<AuthPlannedRotationRollbackOutcome>, AuthMaintenanceActorError>
+    {
+        self.start_rollback_planned_rotation_pre_source_command(Some(fault), None, None, None)
+    }
+
+    #[cfg(test)]
+    fn start_rollback_planned_rotation_pre_source_with_before_mutation_gate(
+        &self,
+        gate: ActorTestGate,
+    ) -> Result<AuthMaintenanceRun<AuthPlannedRotationRollbackOutcome>, AuthMaintenanceActorError>
+    {
+        self.start_rollback_planned_rotation_pre_source_command(None, Some(gate), None, None)
+    }
+
+    #[cfg(test)]
+    fn start_rollback_planned_rotation_pre_source_with_after_first_mutation_gate(
+        &self,
+        gate: ActorTestGate,
+    ) -> Result<AuthMaintenanceRun<AuthPlannedRotationRollbackOutcome>, AuthMaintenanceActorError>
+    {
+        self.start_rollback_planned_rotation_pre_source_command(None, None, Some(gate), None)
+    }
+
+    #[cfg(test)]
+    fn start_rollback_planned_rotation_pre_source_with_after_rollback_gate(
+        &self,
+        gate: ActorTestGate,
+    ) -> Result<AuthMaintenanceRun<AuthPlannedRotationRollbackOutcome>, AuthMaintenanceActorError>
+    {
+        self.start_rollback_planned_rotation_pre_source_command(None, None, None, Some(gate))
+    }
+
+    #[cfg(test)]
     fn start_prepare_initialization_with_gate(
         &self,
         preparation: InitializationPreparationV1,
@@ -969,6 +1145,31 @@ enum MaintenanceCommand {
         response:
             oneshot::Sender<Result<AuthInitializationReconciliation, AuthMaintenanceActorError>>,
     },
+    InspectPlannedRotationReconciliation {
+        response:
+            oneshot::Sender<Result<AuthPlannedRotationReconciliation, AuthMaintenanceActorError>>,
+    },
+    PreparePlannedRotation {
+        preparation: Box<PlannedRotationPreparationV1>,
+        #[cfg(test)]
+        fault: Option<AuthPlannedRotationPrepareTestFault>,
+        #[cfg(test)]
+        pre_mutation_gate: Option<ActorTestGate>,
+        response:
+            oneshot::Sender<Result<AuthPlannedRotationPrepareOutcome, AuthMaintenanceActorError>>,
+    },
+    RollbackPlannedRotationPreSource {
+        #[cfg(test)]
+        fault: Option<AuthPlannedRotationRollbackTestFault>,
+        #[cfg(test)]
+        before_mutation_gate: Option<ActorTestGate>,
+        #[cfg(test)]
+        after_first_mutation_gate: Option<ActorTestGate>,
+        #[cfg(test)]
+        after_rollback_gate: Option<ActorTestGate>,
+        response:
+            oneshot::Sender<Result<AuthPlannedRotationRollbackOutcome, AuthMaintenanceActorError>>,
+    },
     PrepareInitialization {
         preparation: Box<InitializationPreparationV1>,
         #[cfg(test)]
@@ -1075,6 +1276,15 @@ impl MaintenanceCommand {
             Self::InspectInitializationReconciliation { response } => {
                 let _ = response.send(Err(AuthMaintenanceActorError::Poisoned));
             }
+            Self::InspectPlannedRotationReconciliation { response } => {
+                let _ = response.send(Err(AuthMaintenanceActorError::Poisoned));
+            }
+            Self::PreparePlannedRotation { response, .. } => {
+                let _ = response.send(Err(AuthMaintenanceActorError::Poisoned));
+            }
+            Self::RollbackPlannedRotationPreSource { response, .. } => {
+                let _ = response.send(Err(AuthMaintenanceActorError::Poisoned));
+            }
             Self::PrepareInitialization { response, .. } => {
                 let _ = response.send(Err(AuthMaintenanceActorError::Poisoned));
             }
@@ -1162,6 +1372,102 @@ fn actor_thread(
                     context.inspect_initialization_reconciliation()
                 })) {
                     Ok(result) => result.map_err(AuthMaintenanceActorError::Binding),
+                    Err(_) => Err(AuthMaintenanceActorError::OperationFailed),
+                };
+                update_actor_integrity(&context, &mut poisoned, &result);
+                let _ = response.send(result);
+            }
+            MaintenanceCommand::InspectPlannedRotationReconciliation { response } => {
+                let result = match catch_unwind(AssertUnwindSafe(|| {
+                    context.inspect_planned_rotation_reconciliation()
+                })) {
+                    Ok(result) => result.map_err(AuthMaintenanceActorError::Binding),
+                    Err(_) => Err(AuthMaintenanceActorError::OperationFailed),
+                };
+                update_actor_integrity(&context, &mut poisoned, &result);
+                let _ = response.send(result);
+            }
+            MaintenanceCommand::PreparePlannedRotation {
+                preparation,
+                #[cfg(test)]
+                fault,
+                #[cfg(test)]
+                pre_mutation_gate,
+                response,
+            } => {
+                let result = match catch_unwind(AssertUnwindSafe(|| {
+                    #[cfg(test)]
+                    let result = match (fault, pre_mutation_gate) {
+                        (None, None) => context.prepare_planned_rotation(&preparation),
+                        (fault, gate) => context.prepare_planned_rotation_with_test_control(
+                            &preparation,
+                            fault,
+                            move || {
+                                if let Some(gate) = gate {
+                                    gate.pause();
+                                }
+                            },
+                        ),
+                    };
+                    #[cfg(not(test))]
+                    let result = context.prepare_planned_rotation(&preparation);
+                    result.map_err(AuthMaintenanceActorError::Binding)
+                })) {
+                    Ok(result) => result,
+                    Err(_) => Err(AuthMaintenanceActorError::OperationFailed),
+                };
+                update_actor_integrity(&context, &mut poisoned, &result);
+                let _ = response.send(result);
+            }
+            MaintenanceCommand::RollbackPlannedRotationPreSource {
+                #[cfg(test)]
+                fault,
+                #[cfg(test)]
+                before_mutation_gate,
+                #[cfg(test)]
+                after_first_mutation_gate,
+                #[cfg(test)]
+                after_rollback_gate,
+                response,
+            } => {
+                let result = match catch_unwind(AssertUnwindSafe(|| {
+                    #[cfg(test)]
+                    let result = match (
+                        fault,
+                        before_mutation_gate,
+                        after_first_mutation_gate,
+                        after_rollback_gate,
+                    ) {
+                        (None, None, None, None) => context.rollback_planned_rotation_pre_source(),
+                        (
+                            fault,
+                            before_mutation_gate,
+                            after_first_mutation_gate,
+                            after_rollback_gate,
+                        ) => context.rollback_planned_rotation_pre_source_with_test_control(
+                            fault,
+                            move || {
+                                if let Some(gate) = before_mutation_gate {
+                                    gate.pause();
+                                }
+                            },
+                            move || {
+                                if let Some(gate) = after_first_mutation_gate {
+                                    gate.pause();
+                                }
+                            },
+                            move || {
+                                if let Some(gate) = after_rollback_gate {
+                                    gate.pause();
+                                }
+                            },
+                        ),
+                    };
+                    #[cfg(not(test))]
+                    let result = context.rollback_planned_rotation_pre_source();
+                    result.map_err(AuthMaintenanceActorError::Binding)
+                })) {
+                    Ok(result) => result,
                     Err(_) => Err(AuthMaintenanceActorError::OperationFailed),
                 };
                 update_actor_integrity(&context, &mut poisoned, &result);
@@ -1620,11 +1926,12 @@ mod tests {
     use crate::{
         auth::{
             SecretBytes, ValidatedVerifier,
-            keyring::Keyring,
+            keyring::{AuthTimestampMicros, Keyring},
             transition::{
                 AuditId, AuthOwnerId, InitializationMetadataInput, InitializationMetadataV1,
                 InitializationPreparationV1, LoginId, NO_BLOCKLIST_CHECK_SENTINEL,
-                SourceTimestampMicros, TransitionContractError, TransitionId,
+                PlannedRotationMetadataInput, PlannedRotationPreparationV1, SourceTimestampMicros,
+                TransitionContractError, TransitionId,
             },
         },
         storage::{
@@ -1647,7 +1954,11 @@ mod tests {
         AuthInitializationPrepareTestFault, AuthInitializationReconciliation,
         AuthInitializationRecovery, AuthInitializationRollbackOutcome,
         AuthInitializationRollbackTestFault, AuthInitializationSourceDurabilityTestFault,
-        AuthInitializationSourceOutcome, AuthInstanceLayout, SecretFsError,
+        AuthInitializationSourceOutcome, AuthInstanceLayout, AuthPlannedRotationBlocker,
+        AuthPlannedRotationPreSourcePhase, AuthPlannedRotationPrepareOutcome,
+        AuthPlannedRotationPrepareTestFault, AuthPlannedRotationReconciliation,
+        AuthPlannedRotationRecovery, AuthPlannedRotationRollbackOutcome,
+        AuthPlannedRotationRollbackTestFault, SecretFsError,
     };
     use crate::auth::transition::AUTH_MAINTENANCE_LOCK_NAME as AUTH_LOCK_FILE_NAME;
 
@@ -1670,6 +1981,14 @@ mod tests {
         0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x84, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44,
         0x44,
     ];
+    const PLANNED_TRANSITION: [u8; 16] = [
+        0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x45, 0x55, 0x85, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+        0x55,
+    ];
+    const PLANNED_AUDIT: [u8; 16] = [
+        0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x46, 0x66, 0x86, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+        0x66,
+    ];
     const SOURCE_AT_MICROS: i64 = 1_700_000_000_000_001;
 
     struct InitializationFixture {
@@ -1679,6 +1998,23 @@ mod tests {
         login_id: &'static str,
         password_phc: Zeroizing<String>,
         recovery_phc: Zeroizing<String>,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct PlannedSourceSnapshot {
+        lifecycle: (
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<Vec<u8>>,
+            Option<i64>,
+            i64,
+        ),
+        account: (Vec<u8>, i64, i64),
+        password: (Vec<u8>, i64),
+        recovery: (Vec<u8>, i64),
+        audit_count: i64,
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -1760,6 +2096,57 @@ mod tests {
             &keyring,
         )
         .expect("initialization preparation")
+    }
+
+    fn planned_rotation_input() -> PlannedRotationMetadataInput {
+        PlannedRotationMetadataInput {
+            transition_id: TransitionId::from_uuid(Uuid::from_bytes(PLANNED_TRANSITION))
+                .expect("planned transition ID"),
+            owner_id: AuthOwnerId::from_uuid(Uuid::from_bytes(TEST_OWNER))
+                .expect("planned owner ID"),
+            audit_id: AuditId::from_uuid(Uuid::from_bytes(PLANNED_AUDIT))
+                .expect("planned audit ID"),
+            key_activated_at_micros: AuthTimestampMicros::new(SOURCE_AT_MICROS as u64 + 10)
+                .expect("planned activation"),
+            source_at_micros: SourceTimestampMicros::new(SOURCE_AT_MICROS as u64 + 11)
+                .expect("planned source timestamp"),
+            expected_lifecycle_revision: 2,
+            expected_lifecycle_updated_at_micros: SourceTimestampMicros::new(
+                SOURCE_AT_MICROS as u64,
+            )
+            .expect("active lifecycle timestamp"),
+            credential_version: 1,
+            account_revision: 1,
+            password_credential_revision: 1,
+            recovery_credential_revision: 1,
+        }
+    }
+
+    fn current_active_keyring(root: &Path) -> Keyring {
+        let bytes = fs::read(root.join(SECRET_DIRECTORY_NAME).join("auth-keyring.v1"))
+            .expect("current active keyring");
+        Keyring::decode(SecretBytes::new(bytes)).expect("canonical current active keyring")
+    }
+
+    fn planned_rotation_preparation(root: &Path) -> PlannedRotationPreparationV1 {
+        let current = current_active_keyring(root);
+        let staged = current
+            .planned_rotation_from_test_seed(SOURCE_AT_MICROS as u64 + 10, [0x41; 32])
+            .expect("fixed planned staged keyring");
+        PlannedRotationPreparationV1::from_keyrings(planned_rotation_input(), &current, staged)
+            .expect("planned rotation preparation")
+    }
+
+    fn planned_rotation_preparation_with_input(
+        root: &Path,
+        input: PlannedRotationMetadataInput,
+    ) -> PlannedRotationPreparationV1 {
+        let current = current_active_keyring(root);
+        let staged = current
+            .planned_rotation_from_test_seed(SOURCE_AT_MICROS as u64 + 10, [0x41; 32])
+            .expect("fixed planned staged keyring");
+        PlannedRotationPreparationV1::from_keyrings(input, &current, staged)
+            .expect("planned rotation preparation")
     }
 
     fn owner_file(path: &Path, bytes: &[u8]) {
@@ -1857,6 +2244,59 @@ mod tests {
             .expect("auth lifecycle state")
     }
 
+    fn planned_source_snapshot(database: &Path) -> PlannedSourceSnapshot {
+        let reader = RawConnection::open(database).expect("planned source reader");
+        PlannedSourceSnapshot {
+            lifecycle: reader
+                .query_row(
+                    "SELECT
+                        state, state_revision, expected_kid, transition_kind, transition_id,
+                        keyring_version, updated_at_micros
+                     FROM auth_key_lifecycle WHERE singleton = 1",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
+                )
+                .expect("planned lifecycle snapshot"),
+            account: reader
+                .query_row(
+                    "SELECT owner_id, credential_version, account_revision
+                     FROM auth_accounts WHERE singleton = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("planned account snapshot"),
+            password: reader
+                .query_row(
+                    "SELECT owner_id, credential_revision
+                     FROM auth_password_credentials WHERE singleton = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("planned password snapshot"),
+            recovery: reader
+                .query_row(
+                    "SELECT owner_id, credential_revision
+                     FROM auth_recovery_credentials WHERE singleton = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("planned recovery snapshot"),
+            audit_count: reader
+                .query_row("SELECT count(*) FROM auth_audit", [], |row| row.get(0))
+                .expect("planned audit count"),
+        }
+    }
+
     fn persisted_legacy_policy_provenance(database: &Path) -> String {
         RawConnection::open(database)
             .expect("legacy policy provenance reader")
@@ -1902,6 +2342,17 @@ mod tests {
                 .await
                 .expect("activated initialization lifecycle"),
             AuthInitializationFinalLifecycleOutcome::ActivatedAwaitingCleanup
+        );
+    }
+
+    async fn advance_initialization_to_clean_active(actor: &AuthMaintenanceActor) {
+        advance_initialization_to_awaiting_cleanup(actor).await;
+        assert_eq!(
+            actor
+                .cleanup_initialization()
+                .await
+                .expect("clean initialization evidence"),
+            AuthInitializationCleanupOutcome::Completed
         );
     }
 
@@ -1996,6 +2447,50 @@ mod tests {
                     &reservation.join("staged-keyring"),
                     fixture.staged.expose_secret(),
                 );
+                owner_file(&reservation.join("prepared"), b"");
+            }
+        }
+        reservation
+    }
+
+    fn write_planned_pre_source_reservation(
+        root: &Path,
+        preparation: &PlannedRotationPreparationV1,
+        phase: AuthPlannedRotationPreSourcePhase,
+    ) -> std::path::PathBuf {
+        let reservation = root
+            .join(SECRET_DIRECTORY_NAME)
+            .join(".auth-transition-planned-55555555-5555-4555-8555-555555555555");
+        fs::create_dir(&reservation).expect("planned reservation");
+        fs::set_permissions(&reservation, fs::Permissions::from_mode(0o700))
+            .expect("owner-only planned reservation");
+        let metadata = preparation
+            .encoded_metadata()
+            .expect("planned metadata bytes");
+        let staged = preparation.staged_keyring_bytes();
+
+        match phase {
+            AuthPlannedRotationPreSourcePhase::ReservationOnly => {}
+            AuthPlannedRotationPreSourcePhase::MetadataIncomplete => {
+                owner_file(&reservation.join("metadata"), b"POV");
+            }
+            AuthPlannedRotationPreSourcePhase::MetadataComplete => {
+                owner_file(&reservation.join("metadata"), metadata.expose_secret());
+            }
+            AuthPlannedRotationPreSourcePhase::StagedIncomplete => {
+                owner_file(&reservation.join("metadata"), metadata.expose_secret());
+                owner_file(
+                    &reservation.join("staged-keyring"),
+                    &staged[..staged.len() - 1],
+                );
+            }
+            AuthPlannedRotationPreSourcePhase::StagedComplete => {
+                owner_file(&reservation.join("metadata"), metadata.expose_secret());
+                owner_file(&reservation.join("staged-keyring"), staged);
+            }
+            AuthPlannedRotationPreSourcePhase::Prepared => {
+                owner_file(&reservation.join("metadata"), metadata.expose_secret());
+                owner_file(&reservation.join("staged-keyring"), staged);
                 owner_file(&reservation.join("prepared"), b"");
             }
         }
@@ -7347,6 +7842,844 @@ mod tests {
         actor.shutdown().await.expect("joined poisoned shutdown");
         assert!(moved_lock_path.exists());
         assert!(lock_path.exists());
+    }
+
+    #[tokio::test]
+    async fn planned_rotation_prepares_replays_and_rolls_back_to_exact_clean_active_state() {
+        let directory = tempdir().expect("temporary parent");
+        let root = directory.path().join("instance");
+        let database = root.join(STORE_DIRECTORY_NAME).join("conversation.sqlite3");
+        let active = root.join(SECRET_DIRECTORY_NAME).join("auth-keyring.v1");
+        let (actor, stores) = actor_and_stores(&root).await;
+        advance_initialization_to_clean_active(&actor).await;
+        let source_before = planned_source_snapshot(&database);
+        let active_before = fs::read(&active).expect("active bytes before planned rotation");
+        let active_inode_before = fs::symlink_metadata(&active)
+            .expect("active metadata before planned rotation")
+            .ino();
+
+        assert_eq!(
+            actor
+                .inspect_planned_rotation_reconciliation()
+                .await
+                .expect("clean active reconciliation"),
+            AuthPlannedRotationReconciliation::CleanActive
+        );
+        assert_eq!(
+            actor
+                .prepare_planned_rotation(planned_rotation_preparation(&root))
+                .await
+                .expect("prepared planned rotation"),
+            AuthPlannedRotationPrepareOutcome::Prepared
+        );
+        assert_eq!(
+            actor
+                .prepare_planned_rotation(planned_rotation_preparation(&root))
+                .await
+                .expect("replayed planned preparation"),
+            AuthPlannedRotationPrepareOutcome::AlreadyPrepared
+        );
+        assert_eq!(
+            actor
+                .inspect_planned_rotation_reconciliation()
+                .await
+                .expect("prepared planned reconciliation"),
+            AuthPlannedRotationReconciliation::PlannedPreSource {
+                phase: AuthPlannedRotationPreSourcePhase::Prepared,
+                recovery: AuthPlannedRotationRecovery::ResumeOrRollbackCandidate,
+            }
+        );
+        assert_eq!(
+            actor
+                .rollback_planned_rotation_pre_source()
+                .await
+                .expect("planned rollback"),
+            AuthPlannedRotationRollbackOutcome::RolledBack
+        );
+        assert_eq!(
+            actor
+                .rollback_planned_rotation_pre_source()
+                .await
+                .expect("clean planned rollback replay"),
+            AuthPlannedRotationRollbackOutcome::AlreadyClean
+        );
+        assert_eq!(
+            actor
+                .inspect_planned_rotation_reconciliation()
+                .await
+                .expect("terminal planned reconciliation"),
+            AuthPlannedRotationReconciliation::CleanActive
+        );
+        assert_eq!(planned_source_snapshot(&database), source_before);
+        assert_eq!(
+            fs::read(&active).expect("active bytes after planned rollback"),
+            active_before
+        );
+        assert_eq!(
+            fs::symlink_metadata(&active)
+                .expect("active metadata after planned rollback")
+                .ino(),
+            active_inode_before
+        );
+        assert!(stores.conversation.report().await.is_ok());
+        actor.shutdown().await.expect("joined planned actor");
+    }
+
+    #[tokio::test]
+    async fn planned_rotation_preparation_durability_faults_have_exact_fresh_actor_phases() {
+        for (fault, expected) in [
+            (
+                AuthPlannedRotationPrepareTestFault::Reservation,
+                AuthPlannedRotationReconciliation::PlannedPreSource {
+                    phase: AuthPlannedRotationPreSourcePhase::ReservationOnly,
+                    recovery: AuthPlannedRotationRecovery::RollbackOnlyCandidate,
+                },
+            ),
+            (
+                AuthPlannedRotationPrepareTestFault::Metadata,
+                AuthPlannedRotationReconciliation::PlannedPreSource {
+                    phase: AuthPlannedRotationPreSourcePhase::MetadataComplete,
+                    recovery: AuthPlannedRotationRecovery::RollbackOnlyCandidate,
+                },
+            ),
+            (
+                AuthPlannedRotationPrepareTestFault::Staged,
+                AuthPlannedRotationReconciliation::PlannedPreSource {
+                    phase: AuthPlannedRotationPreSourcePhase::StagedComplete,
+                    recovery: AuthPlannedRotationRecovery::ResumeOrRollbackCandidate,
+                },
+            ),
+            (
+                AuthPlannedRotationPrepareTestFault::Prepared,
+                AuthPlannedRotationReconciliation::PlannedPreSource {
+                    phase: AuthPlannedRotationPreSourcePhase::Prepared,
+                    recovery: AuthPlannedRotationRecovery::ResumeOrRollbackCandidate,
+                },
+            ),
+        ] {
+            let directory = tempdir().expect("temporary parent");
+            let root = directory.path().join("instance");
+            let database = root.join(STORE_DIRECTORY_NAME).join("conversation.sqlite3");
+            let active = root.join(SECRET_DIRECTORY_NAME).join("auth-keyring.v1");
+            let (actor, stores) = actor_and_stores(&root).await;
+            advance_initialization_to_clean_active(&actor).await;
+            let source_before = planned_source_snapshot(&database);
+            let active_before = fs::read(&active).expect("active bytes");
+
+            let failure = actor
+                .start_prepare_planned_rotation_with_fault(
+                    planned_rotation_preparation(&root),
+                    fault,
+                )
+                .expect("admitted planned preparation")
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                failure,
+                AuthMaintenanceActorError::Binding(AuthStoreBindingError::Filesystem(
+                    SecretFsError::Io(io::ErrorKind::Other)
+                ))
+            ));
+            assert_eq!(
+                actor.revalidate().await.unwrap_err(),
+                AuthMaintenanceActorError::Poisoned
+            );
+            assert_eq!(planned_source_snapshot(&database), source_before);
+            assert_eq!(fs::read(&active).expect("active preserved"), active_before);
+            actor.shutdown().await.expect("joined poisoned actor");
+            drop(stores);
+
+            let (fresh_actor, fresh_stores) = actor_and_stores(&root).await;
+            assert_eq!(
+                fresh_actor
+                    .inspect_planned_rotation_reconciliation()
+                    .await
+                    .expect("fresh planned reconciliation"),
+                expected
+            );
+            assert_eq!(
+                fresh_actor
+                    .rollback_planned_rotation_pre_source()
+                    .await
+                    .expect("fresh planned rollback"),
+                AuthPlannedRotationRollbackOutcome::RolledBack
+            );
+            assert_eq!(
+                fresh_actor
+                    .inspect_planned_rotation_reconciliation()
+                    .await
+                    .expect("fresh terminal reconciliation"),
+                AuthPlannedRotationReconciliation::CleanActive
+            );
+            assert_eq!(planned_source_snapshot(&database), source_before);
+            assert!(fresh_stores.conversation.report().await.is_ok());
+            fresh_actor
+                .shutdown()
+                .await
+                .expect("joined fresh planned actor");
+        }
+    }
+
+    #[tokio::test]
+    async fn planned_rotation_reconciliation_and_rollback_cover_all_six_pre_source_phases() {
+        for phase in [
+            AuthPlannedRotationPreSourcePhase::ReservationOnly,
+            AuthPlannedRotationPreSourcePhase::MetadataIncomplete,
+            AuthPlannedRotationPreSourcePhase::MetadataComplete,
+            AuthPlannedRotationPreSourcePhase::StagedIncomplete,
+            AuthPlannedRotationPreSourcePhase::StagedComplete,
+            AuthPlannedRotationPreSourcePhase::Prepared,
+        ] {
+            let directory = tempdir().expect("temporary parent");
+            let root = directory.path().join("instance");
+            let database = root.join(STORE_DIRECTORY_NAME).join("conversation.sqlite3");
+            let active = root.join(SECRET_DIRECTORY_NAME).join("auth-keyring.v1");
+            let (actor, stores) = actor_and_stores(&root).await;
+            advance_initialization_to_clean_active(&actor).await;
+            let source_before = planned_source_snapshot(&database);
+            let active_before = fs::read(&active).expect("active bytes");
+            let preparation = planned_rotation_preparation(&root);
+            write_planned_pre_source_reservation(&root, &preparation, phase);
+            let recovery = if matches!(
+                phase,
+                AuthPlannedRotationPreSourcePhase::StagedComplete
+                    | AuthPlannedRotationPreSourcePhase::Prepared
+            ) {
+                AuthPlannedRotationRecovery::ResumeOrRollbackCandidate
+            } else {
+                AuthPlannedRotationRecovery::RollbackOnlyCandidate
+            };
+            assert_eq!(
+                actor
+                    .inspect_planned_rotation_reconciliation()
+                    .await
+                    .expect("planned pre-source phase"),
+                AuthPlannedRotationReconciliation::PlannedPreSource { phase, recovery }
+            );
+            assert_eq!(
+                actor
+                    .rollback_planned_rotation_pre_source()
+                    .await
+                    .expect("planned phase rollback"),
+                AuthPlannedRotationRollbackOutcome::RolledBack
+            );
+            assert_eq!(planned_source_snapshot(&database), source_before);
+            assert_eq!(fs::read(&active).expect("active preserved"), active_before);
+            assert!(stores.conversation.report().await.is_ok());
+            actor.shutdown().await.expect("joined phase actor");
+        }
+    }
+
+    #[tokio::test]
+    async fn planned_rotation_rollback_faults_resume_in_reverse_creation_order() {
+        for (fault, expected) in [
+            (
+                AuthPlannedRotationRollbackTestFault::Prepared,
+                AuthPlannedRotationReconciliation::PlannedPreSource {
+                    phase: AuthPlannedRotationPreSourcePhase::StagedComplete,
+                    recovery: AuthPlannedRotationRecovery::ResumeOrRollbackCandidate,
+                },
+            ),
+            (
+                AuthPlannedRotationRollbackTestFault::Staged,
+                AuthPlannedRotationReconciliation::PlannedPreSource {
+                    phase: AuthPlannedRotationPreSourcePhase::MetadataComplete,
+                    recovery: AuthPlannedRotationRecovery::RollbackOnlyCandidate,
+                },
+            ),
+            (
+                AuthPlannedRotationRollbackTestFault::Metadata,
+                AuthPlannedRotationReconciliation::PlannedPreSource {
+                    phase: AuthPlannedRotationPreSourcePhase::ReservationOnly,
+                    recovery: AuthPlannedRotationRecovery::RollbackOnlyCandidate,
+                },
+            ),
+            (
+                AuthPlannedRotationRollbackTestFault::Directory,
+                AuthPlannedRotationReconciliation::CleanActive,
+            ),
+        ] {
+            let directory = tempdir().expect("temporary parent");
+            let root = directory.path().join("instance");
+            let database = root.join(STORE_DIRECTORY_NAME).join("conversation.sqlite3");
+            let active = root.join(SECRET_DIRECTORY_NAME).join("auth-keyring.v1");
+            let (actor, stores) = actor_and_stores(&root).await;
+            advance_initialization_to_clean_active(&actor).await;
+            let source_before = planned_source_snapshot(&database);
+            let active_before = fs::read(&active).expect("active bytes");
+            assert_eq!(
+                actor
+                    .prepare_planned_rotation(planned_rotation_preparation(&root))
+                    .await
+                    .expect("prepared planned rollback fixture"),
+                AuthPlannedRotationPrepareOutcome::Prepared
+            );
+
+            let failure = actor
+                .start_rollback_planned_rotation_pre_source_with_fault(fault)
+                .expect("admitted planned rollback")
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                failure,
+                AuthMaintenanceActorError::Binding(AuthStoreBindingError::Filesystem(
+                    SecretFsError::Io(io::ErrorKind::Other)
+                ))
+            ));
+            assert_eq!(planned_source_snapshot(&database), source_before);
+            assert_eq!(fs::read(&active).expect("active preserved"), active_before);
+            actor.shutdown().await.expect("joined poisoned actor");
+            drop(stores);
+
+            let (fresh_actor, fresh_stores) = actor_and_stores(&root).await;
+            assert_eq!(
+                fresh_actor
+                    .inspect_planned_rotation_reconciliation()
+                    .await
+                    .expect("fresh planned rollback phase"),
+                expected
+            );
+            let replay = fresh_actor
+                .rollback_planned_rotation_pre_source()
+                .await
+                .expect("resumed planned rollback");
+            assert_eq!(
+                replay,
+                if expected == AuthPlannedRotationReconciliation::CleanActive {
+                    AuthPlannedRotationRollbackOutcome::AlreadyClean
+                } else {
+                    AuthPlannedRotationRollbackOutcome::RolledBack
+                }
+            );
+            assert_eq!(planned_source_snapshot(&database), source_before);
+            assert!(fresh_stores.conversation.report().await.is_ok());
+            fresh_actor
+                .shutdown()
+                .await
+                .expect("joined fresh planned rollback actor");
+        }
+    }
+
+    #[tokio::test]
+    async fn planned_rotation_rejects_metadata_source_and_current_key_mismatches_without_mutation()
+    {
+        let directory = tempdir().expect("temporary parent");
+        let root = directory.path().join("instance");
+        let database = root.join(STORE_DIRECTORY_NAME).join("conversation.sqlite3");
+        let secrets = root.join(SECRET_DIRECTORY_NAME);
+        let active = secrets.join("auth-keyring.v1");
+        let (actor, stores) = actor_and_stores(&root).await;
+        advance_initialization_to_clean_active(&actor).await;
+        let source_before = planned_source_snapshot(&database);
+        let active_before = fs::read(&active).expect("active bytes");
+
+        for case in 0..6 {
+            let mut input = planned_rotation_input();
+            match case {
+                0 => input.expected_lifecycle_revision = 4,
+                1 => {
+                    input.expected_lifecycle_updated_at_micros =
+                        SourceTimestampMicros::new(SOURCE_AT_MICROS as u64 + 1)
+                            .expect("mismatched lifecycle timestamp")
+                }
+                2 => input.credential_version = 2,
+                3 => input.account_revision = 2,
+                4 => input.password_credential_revision = 2,
+                5 => input.recovery_credential_revision = 2,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                actor
+                    .prepare_planned_rotation(
+                        planned_rotation_preparation_with_input(&root, input,)
+                    )
+                    .await
+                    .expect("typed planned mismatch"),
+                AuthPlannedRotationPrepareOutcome::PreconditionNotClean(
+                    AuthPlannedRotationReconciliation::Blocked(
+                        AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+                    )
+                )
+            );
+        }
+
+        let unrelated_current =
+            Keyring::from_test_seeds(2, SOURCE_AT_MICROS as u64 - 1, [0x51; 32], None)
+                .expect("unrelated active keyring");
+        let unrelated_staged = unrelated_current
+            .planned_rotation_from_test_seed(SOURCE_AT_MICROS as u64 + 10, [0x52; 32])
+            .expect("unrelated staged keyring");
+        let unrelated_preparation = PlannedRotationPreparationV1::from_keyrings(
+            planned_rotation_input(),
+            &unrelated_current,
+            unrelated_staged,
+        )
+        .expect("unrelated planned preparation");
+        assert_eq!(
+            actor
+                .prepare_planned_rotation(unrelated_preparation)
+                .await
+                .expect("typed current key mismatch"),
+            AuthPlannedRotationPrepareOutcome::PreconditionNotClean(
+                AuthPlannedRotationReconciliation::Blocked(
+                    AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+                )
+            )
+        );
+        assert_eq!(planned_source_snapshot(&database), source_before);
+        assert_eq!(fs::read(&active).expect("active unchanged"), active_before);
+        assert!(
+            fs::read_dir(&secrets)
+                .expect("secret inventory")
+                .all(|entry| !entry
+                    .expect("secret entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".auth-transition-planned-"))
+        );
+        assert!(stores.conversation.report().await.is_ok());
+        actor.shutdown().await.expect("joined mismatch actor");
+    }
+
+    #[tokio::test]
+    async fn planned_rotation_rejects_verify_only_unknown_changed_and_hard_link_artifacts() {
+        let verify_directory = tempdir().expect("temporary parent");
+        let verify_root = verify_directory.path().join("instance");
+        let (verify_actor, verify_stores) = actor_and_stores(&verify_root).await;
+        advance_initialization_to_clean_active(&verify_actor).await;
+        let current = current_active_keyring(&verify_root);
+        let overlap = current
+            .planned_rotation_from_test_seed(SOURCE_AT_MICROS as u64 + 10, [0x41; 32])
+            .expect("verify-only overlap")
+            .encode();
+        owner_file(
+            &verify_root
+                .join(SECRET_DIRECTORY_NAME)
+                .join("auth-keyring.v1"),
+            overlap.expose_secret(),
+        );
+        assert_eq!(
+            verify_actor
+                .inspect_planned_rotation_reconciliation()
+                .await
+                .expect("verify-only rejection"),
+            AuthPlannedRotationReconciliation::Blocked(
+                AuthPlannedRotationBlocker::InconsistentDbFilesystem
+            )
+        );
+        assert!(verify_stores.conversation.report().await.is_ok());
+        verify_actor
+            .shutdown()
+            .await
+            .expect("joined verify-only actor");
+
+        for case in ["unknown", "changed", "hard-link"] {
+            let directory = tempdir().expect("temporary parent");
+            let root = directory.path().join("instance");
+            let (actor, stores) = actor_and_stores(&root).await;
+            advance_initialization_to_clean_active(&actor).await;
+            assert_eq!(
+                actor
+                    .prepare_planned_rotation(planned_rotation_preparation(&root))
+                    .await
+                    .expect("prepared blocker fixture"),
+                AuthPlannedRotationPrepareOutcome::Prepared
+            );
+            let reservation = root
+                .join(SECRET_DIRECTORY_NAME)
+                .join(".auth-transition-planned-55555555-5555-4555-8555-555555555555");
+            match case {
+                "unknown" => owner_file(&reservation.join("unknown"), b"preserve"),
+                "changed" => {
+                    let current = current_active_keyring(&root).encode();
+                    owner_file(&reservation.join("staged-keyring"), current.expose_secret());
+                }
+                "hard-link" => fs::hard_link(
+                    reservation.join("staged-keyring"),
+                    reservation.join("linked-staged"),
+                )
+                .expect("staged hard link"),
+                _ => unreachable!(),
+            }
+            let injected = reservation_snapshot(&reservation);
+
+            if case == "hard-link" {
+                assert!(
+                    actor
+                        .inspect_planned_rotation_reconciliation()
+                        .await
+                        .is_err()
+                );
+                assert!(matches!(
+                    stores.conversation.report().await,
+                    Err(StoreError::OperationPoisoned {
+                        kind: StoreKind::Conversation
+                    })
+                ));
+            } else {
+                assert!(matches!(
+                    actor
+                        .rollback_planned_rotation_pre_source()
+                        .await
+                        .expect("typed planned blocker"),
+                    AuthPlannedRotationRollbackOutcome::NotRollbackable(
+                        AuthPlannedRotationReconciliation::Blocked(_)
+                    )
+                ));
+                assert!(stores.conversation.report().await.is_ok());
+            }
+            let after = reservation_snapshot(&reservation);
+            assert_eq!(after, injected);
+            actor.shutdown().await.expect("joined blocker actor");
+        }
+    }
+
+    #[tokio::test]
+    async fn planned_rotation_pre_mutation_source_drift_is_rejected_without_deletion() {
+        let directory = tempdir().expect("temporary parent");
+        let root = directory.path().join("instance");
+        let database = root.join(STORE_DIRECTORY_NAME).join("conversation.sqlite3");
+        let reservation = root
+            .join(SECRET_DIRECTORY_NAME)
+            .join(".auth-transition-planned-55555555-5555-4555-8555-555555555555");
+        let (actor, stores) = actor_and_stores(&root).await;
+        advance_initialization_to_clean_active(&actor).await;
+        assert_eq!(
+            actor
+                .prepare_planned_rotation(planned_rotation_preparation(&root))
+                .await
+                .expect("prepared drift fixture"),
+            AuthPlannedRotationPrepareOutcome::Prepared
+        );
+        let before = reservation_snapshot(&reservation);
+        let gate = ActorTestGate::new();
+        let run = actor
+            .start_rollback_planned_rotation_pre_source_with_before_mutation_gate(gate.clone())
+            .expect("admitted pre-mutation drift rollback");
+        gate.wait_until_reached();
+        RawConnection::open(&database)
+            .expect("source drift writer")
+            .execute(
+                "UPDATE auth_accounts
+                 SET account_revision = account_revision + 1
+                 WHERE singleton = 1",
+                [],
+            )
+            .expect("source revision drift");
+        gate.resume();
+        assert!(matches!(
+            run.await.expect("typed drift result"),
+            AuthPlannedRotationRollbackOutcome::NotRollbackable(
+                AuthPlannedRotationReconciliation::Blocked(_)
+            )
+        ));
+        assert_eq!(reservation_snapshot(&reservation), before);
+        assert!(stores.conversation.report().await.is_ok());
+        actor.shutdown().await.expect("joined drift actor");
+    }
+
+    #[tokio::test]
+    async fn planned_rotation_post_mutation_drift_preserves_evidence_and_poisons() {
+        let directory = tempdir().expect("temporary parent");
+        let root = directory.path().join("instance");
+        let database = root.join(STORE_DIRECTORY_NAME).join("conversation.sqlite3");
+        let reservation = root
+            .join(SECRET_DIRECTORY_NAME)
+            .join(".auth-transition-planned-55555555-5555-4555-8555-555555555555");
+        let (actor, stores) = actor_and_stores(&root).await;
+        advance_initialization_to_clean_active(&actor).await;
+        assert_eq!(
+            actor
+                .prepare_planned_rotation(planned_rotation_preparation(&root))
+                .await
+                .expect("prepared post-mutation drift fixture"),
+            AuthPlannedRotationPrepareOutcome::Prepared
+        );
+        let gate = ActorTestGate::new();
+        let run = actor
+            .start_rollback_planned_rotation_pre_source_with_after_first_mutation_gate(gate.clone())
+            .expect("admitted post-mutation drift rollback");
+        gate.wait_until_reached();
+        assert!(!reservation.join("prepared").exists());
+        assert!(reservation.join("staged-keyring").exists());
+        RawConnection::open(&database)
+            .expect("post-mutation source drift writer")
+            .execute(
+                "UPDATE auth_accounts
+                 SET account_revision = account_revision + 1
+                 WHERE singleton = 1",
+                [],
+            )
+            .expect("post-mutation source revision drift");
+        gate.resume();
+        assert!(run.await.is_err());
+        assert!(reservation.join("metadata").exists());
+        assert!(reservation.join("staged-keyring").exists());
+        assert!(!reservation.join("prepared").exists());
+        assert!(matches!(
+            stores.conversation.report().await,
+            Err(StoreError::OperationPoisoned {
+                kind: StoreKind::Conversation
+            })
+        ));
+        assert_eq!(
+            AuthInstanceLayout::open_or_create(&root)
+                .expect("contending layout")
+                .lock()
+                .unwrap_err(),
+            SecretFsError::AlreadyLocked
+        );
+        actor.shutdown().await.expect("joined poisoned drift actor");
+    }
+
+    #[tokio::test]
+    async fn planned_rotation_read_only_reconciliation_detects_source_drift_without_mutation() {
+        let directory = tempdir().expect("temporary parent");
+        let root = directory.path().join("instance");
+        let database = root.join(STORE_DIRECTORY_NAME).join("conversation.sqlite3");
+        let reservation = root
+            .join(SECRET_DIRECTORY_NAME)
+            .join(".auth-transition-planned-55555555-5555-4555-8555-555555555555");
+        let (actor, stores) = actor_and_stores(&root).await;
+        advance_initialization_to_clean_active(&actor).await;
+        actor.shutdown().await.expect("joined setup actor");
+        drop(stores);
+
+        let (context, stores) = owned_context_and_stores(&root).await;
+        let preparation = planned_rotation_preparation(&root);
+        assert_eq!(
+            context
+                .prepare_planned_rotation(&preparation)
+                .expect("direct planned preparation"),
+            AuthPlannedRotationPrepareOutcome::Prepared
+        );
+        let before = reservation_snapshot(&reservation);
+        let drift_database = database.clone();
+        assert_eq!(
+            context
+                .inspect_planned_rotation_reconciliation_with_checkpoints(
+                    move || {
+                        RawConnection::open(&drift_database)
+                            .expect("read-only drift writer")
+                            .execute(
+                                "UPDATE auth_accounts
+                                 SET account_revision = account_revision + 1
+                                 WHERE singleton = 1",
+                                [],
+                            )
+                            .expect("read-only source drift");
+                    },
+                    || {},
+                )
+                .unwrap_err(),
+            AuthStoreBindingError::ConversationStoreChanged
+        );
+        assert_eq!(reservation_snapshot(&reservation), before);
+        assert!(stores.conversation.report().await.is_ok());
+        drop(context);
+    }
+
+    #[tokio::test]
+    async fn planned_rotation_terminal_post_mutation_drift_poisons_without_undoing_drift() {
+        let directory = tempdir().expect("temporary parent");
+        let root = directory.path().join("instance");
+        let database = root.join(STORE_DIRECTORY_NAME).join("conversation.sqlite3");
+        let reservation = root
+            .join(SECRET_DIRECTORY_NAME)
+            .join(".auth-transition-planned-55555555-5555-4555-8555-555555555555");
+        let (actor, stores) = actor_and_stores(&root).await;
+        advance_initialization_to_clean_active(&actor).await;
+        assert_eq!(
+            actor
+                .prepare_planned_rotation(planned_rotation_preparation(&root))
+                .await
+                .expect("prepared terminal drift fixture"),
+            AuthPlannedRotationPrepareOutcome::Prepared
+        );
+        let gate = ActorTestGate::new();
+        let run = actor
+            .start_rollback_planned_rotation_pre_source_with_after_rollback_gate(gate.clone())
+            .expect("admitted terminal drift rollback");
+        gate.wait_until_reached();
+        assert!(!reservation.exists());
+        RawConnection::open(&database)
+            .expect("terminal drift writer")
+            .execute(
+                "UPDATE auth_accounts
+                 SET account_revision = account_revision + 1
+                 WHERE singleton = 1",
+                [],
+            )
+            .expect("terminal source drift");
+        gate.resume();
+        assert!(run.await.is_err());
+        assert!(!reservation.exists());
+        assert_eq!(
+            RawConnection::open(&database)
+                .expect("terminal drift reader")
+                .query_row(
+                    "SELECT account_revision FROM auth_accounts WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("terminal account revision"),
+            2
+        );
+        assert!(matches!(
+            stores.conversation.report().await,
+            Err(StoreError::OperationPoisoned {
+                kind: StoreKind::Conversation
+            })
+        ));
+        actor.shutdown().await.expect("joined terminal drift actor");
+    }
+
+    #[tokio::test]
+    async fn planned_rotation_reservation_inode_aba_is_rejected_before_deletion() {
+        let directory = tempdir().expect("temporary parent");
+        let root = directory.path().join("instance");
+        let reservation = root
+            .join(SECRET_DIRECTORY_NAME)
+            .join(".auth-transition-planned-55555555-5555-4555-8555-555555555555");
+        let retained = directory.path().join("retained-planned-reservation");
+        let (actor, stores) = actor_and_stores(&root).await;
+        advance_initialization_to_clean_active(&actor).await;
+        assert_eq!(
+            actor
+                .prepare_planned_rotation(planned_rotation_preparation(&root))
+                .await
+                .expect("prepared ABA fixture"),
+            AuthPlannedRotationPrepareOutcome::Prepared
+        );
+        let original = reservation_snapshot(&reservation);
+        let gate = ActorTestGate::new();
+        let run = actor
+            .start_rollback_planned_rotation_pre_source_with_before_mutation_gate(gate.clone())
+            .expect("admitted ABA rollback");
+        gate.wait_until_reached();
+        fs::rename(&reservation, &retained).expect("retain original reservation inode");
+        fs::create_dir(&reservation).expect("replacement reservation");
+        fs::set_permissions(&reservation, fs::Permissions::from_mode(0o700))
+            .expect("replacement reservation mode");
+        for entry in &original.entries {
+            owner_file(
+                &reservation.join(&entry.name),
+                entry.bytes.as_deref().expect("known planned file"),
+            );
+        }
+        gate.resume();
+        assert!(run.await.is_err());
+        let replacement = reservation_snapshot(&reservation);
+        let retained_original = reservation_snapshot(&retained);
+        assert_eq!(retained_original, original);
+        assert_eq!(replacement.mode, 0o700);
+        assert_eq!(replacement.entries.len(), original.entries.len());
+        for original_entry in &original.entries {
+            let replacement_entry = replacement
+                .entries
+                .iter()
+                .find(|entry| entry.name == original_entry.name)
+                .expect("replacement evidence");
+            assert_eq!(replacement_entry.bytes, original_entry.bytes);
+            assert_eq!(replacement_entry.mode, original_entry.mode);
+        }
+        assert!(matches!(
+            stores.conversation.report().await,
+            Err(StoreError::OperationPoisoned {
+                kind: StoreKind::Conversation
+            })
+        ));
+        actor.shutdown().await.expect("joined ABA actor");
+    }
+
+    #[tokio::test]
+    async fn planned_rotation_debug_and_errors_redact_key_and_transition_identifiers() {
+        let directory = tempdir().expect("temporary parent");
+        let root = directory.path().join("instance");
+        let (actor, _stores) = actor_and_stores(&root).await;
+        advance_initialization_to_clean_active(&actor).await;
+        let current = current_active_keyring(&root);
+        let current_kid = current.active_kid().as_str().to_owned();
+        let preparation = planned_rotation_preparation(&root);
+        let debug = format!(
+            "{preparation:?} {:?} {:?} {:?}",
+            current.active_kid(),
+            AuthPlannedRotationPrepareOutcome::PreconditionNotClean(
+                AuthPlannedRotationReconciliation::Blocked(
+                    AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+                )
+            ),
+            AuthPlannedRotationRollbackOutcome::NotRollbackable(
+                AuthPlannedRotationReconciliation::Blocked(
+                    AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+                )
+            )
+        );
+        assert!(!debug.contains(&current_kid));
+        assert!(!debug.contains("55555555-5555-4555-8555-555555555555"));
+        assert!(!debug.contains("66666666-6666-4666-8666-666666666666"));
+        assert!(debug.contains("[REDACTED]"));
+        actor.shutdown().await.expect("joined redaction actor");
+    }
+
+    #[tokio::test]
+    async fn dropped_planned_preparation_receiver_does_not_cancel_work_or_release_lock() {
+        let directory = tempdir().expect("temporary parent");
+        let root = directory.path().join("instance");
+        let reservation = root
+            .join(SECRET_DIRECTORY_NAME)
+            .join(".auth-transition-planned-55555555-5555-4555-8555-555555555555");
+        let (actor, stores) = actor_and_stores(&root).await;
+        advance_initialization_to_clean_active(&actor).await;
+        let gate = ActorTestGate::new();
+        let run = actor
+            .start_prepare_planned_rotation_with_pre_mutation_gate(
+                planned_rotation_preparation(&root),
+                gate.clone(),
+            )
+            .expect("admitted dropped planned preparation");
+        gate.wait_until_reached();
+        drop(run);
+        assert_eq!(
+            AuthInstanceLayout::open_or_create(&root)
+                .expect("contending layout")
+                .lock()
+                .unwrap_err(),
+            SecretFsError::AlreadyLocked
+        );
+        gate.resume();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !reservation.join("prepared").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "dropped planned preparation did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            actor
+                .inspect_planned_rotation_reconciliation()
+                .await
+                .expect("planned preparation completed after receiver drop"),
+            AuthPlannedRotationReconciliation::PlannedPreSource {
+                phase: AuthPlannedRotationPreSourcePhase::Prepared,
+                recovery: AuthPlannedRotationRecovery::ResumeOrRollbackCandidate,
+            }
+        );
+        assert_eq!(
+            AuthInstanceLayout::open_or_create(&root)
+                .expect("contending layout after command")
+                .lock()
+                .unwrap_err(),
+            SecretFsError::AlreadyLocked
+        );
+        assert!(stores.conversation.report().await.is_ok());
+        actor
+            .shutdown()
+            .await
+            .expect("joined dropped-receiver actor");
+        wait_until_lock_available(&root);
     }
 
     fn wait_until_lock_available(root: &Path) {
