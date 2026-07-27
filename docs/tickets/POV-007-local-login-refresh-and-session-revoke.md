@@ -1,6 +1,6 @@
 # POV-007 Local Login, Refresh And Session Revoke
 
-Status: In Progress — dependency-independent control plane, sentinel/legacy initialization recovery, source/final-CAS and deletion-only cleanup slices implemented; Windows workspace validation restored by POV-034 and POV-031 current-tree removal completed
+Status: In Progress — dependency-independent control plane, sentinel/legacy initialization recovery, source/final-CAS, deletion-only cleanup and pure planned-rotation keyring/metadata contract slices implemented; Windows workspace validation restored by POV-034 and POV-031 current-tree removal completed
 
 Type: Delivery
 
@@ -95,9 +95,13 @@ completion을 주장하지 않습니다. 외부 사용자 검증인 POV-022는 �
   context, embedded digest, updater와 enforcement API는 POV-031에서 제거됐습니다.
 - Crate-private keyring codec은 Ed25519 signing seed에서 public key와 RFC 7638 `kid`를
   재계산하고 active-only 170-byte/verify-only 261-byte canonical v1 형식을 encode/decode합니다.
+  Planned rotation constructor는 active-only current keyring에서 version을 exact 1 증가시키고
+  새 CSPRNG active private key만 sign에 사용하며 이전 private key는 새 keyring에 복사하지
+  않고 이전 public key/KID만 exact 11분 verify-only overlap으로 보존합니다. 기존 overlap,
+  clock regression, duplicate key material과 version overflow는 stage 생성 전에 거부합니다.
   RFC 8032 golden vector, 모든 truncation, appended/unknown form, checksum/semantic corruption,
   zero/weak/mismatched/duplicate key, SQLite integer/time overflow, exact 11-minute overlap와
-  redacted Debug를 synthetic unit tests로 검증합니다.
+  planned normal/reject/recovery round trip 및 redacted Debug를 synthetic unit tests로 검증합니다.
 - Crate-private pure transition contract는 exact `auth-keyring.v1`, five-kind
   transition/cleanup과 derived install temp의 lowercase hyphenated RFC 4122 UUID v4 basename,
   reservation의 exact `metadata`/`staged-keyring`/`prepared` 이름을 format/parse합니다.
@@ -113,8 +117,18 @@ completion을 주장하지 않습니다. 외부 사용자 검증인 POV-022는 �
   PHC를 보존하며 모든 truncation, append, alternate UUID spelling/version/variant, unknown tag,
   length/checksum, timestamp regression/overflow, semantic corruption, salt reuse와 Debug/error
   disclosure를 거부합니다.
-  Planned/retire/compromise/loss metadata persistence는 kind-specific source-CAS payload 계약이
-  accepted될 때까지 unsupported이며 이 pure codec은 filesystem이나 DB를 변경하지 않습니다.
+  Planned rotation metadata v1은 별도 fixed 305-byte checksummed format으로 current
+  lifecycle revision/time, active KID/version/activation, owner와 account/password/recovery
+  revision, audit/transition ID, result KID/version/activation/source time 및 canonical
+  261-byte staged keyring의 actual length/SHA-256을 묶습니다. Recovery decode는 exact
+  canonical bytes와 strict staged keyring을 다시 대조하고 이전 public KID/activation,
+  새 active key, version `+1`, monotonic time 및 positive SQLite revision을 모두 확인한
+  source expectation만 발급합니다. 모든 truncation, append, version/kind/checksum,
+  revision/time/version corruption, unrelated current key와 changed stage를 무변경
+  거부하고 durable bytes decode/validate round trip 및 redacted Debug를 unit test로
+  검증합니다. 이 planned pure codec은 filesystem이나 DB를 변경하지 않으며
+  retire/compromise/loss metadata persistence와 planned actor/source-CAS/install/final-CAS/
+  cleanup은 아직 unsupported입니다.
 - Unix crate-private instance primitive는 exact `stores/`와 `secrets/` directory 및 persistent
   empty `auth-maintenance.lock`을 owner-only mode, no-follow/pinned identity와 close-on-exec로
   검증합니다. Synthetic tests는 unsafe root/child/lock artifact 무변경 거부, root
@@ -374,10 +388,12 @@ completion을 주장하지 않습니다. 외부 사용자 검증인 POV-022는 �
   initialization-only pre-source durable preparation·recovery·exact rollback,
   exact `Prepared → initializing` source-CAS와 pre-writer durability fence,
   active-key install, final `initializing → active` lifecycle CAS와 deletion-only cleanup primitive
-  slice에 한정됩니다. `InitializationComplete`와 cleanup `Completed|AlreadyCompleted`는 metadata가
+  slice 및 pure planned-rotation keyring/metadata recovery contract에 한정됩니다.
+  `InitializationComplete`와 cleanup `Completed|AlreadyCompleted`는 metadata가
   제거된 뒤 active revision/KID/version/key/namespace만 확인하는 protocol terminal이며 full
   mutable auth source, auth validity 또는 listener readiness 증명이 아닙니다. Actor에는
-  planned/retire/compromise/loss transition command가 없으며 production auth
+  planned/retire/compromise/loss transition command가 없고 planned metadata도 reservation,
+  source-CAS, key install/final-CAS 또는 cleanup에 연결되지 않았으며 production auth
   mutation repository, listener,
   dummy verifier/account selection, JWT, refresh mutation, controlling-TTY flow, reference-device
   Argon2 benchmark, local HTTP와 production instance-root/runtime wiring, preparation/source

@@ -321,6 +321,65 @@ impl Keyring {
                 .checked_add(PLANNED_ROTATION_MICROS)?)
     }
 
+    pub(crate) fn planned_rotation(
+        &self,
+        activated_at: AuthTimestampMicros,
+    ) -> Result<Self, KeyringError> {
+        if self.verify_only.is_some() || activated_at < self.active.activated_at {
+            return Err(KeyringError::InvalidLifecycle);
+        }
+        let next_version = KeyringVersion::new(
+            self.version
+                .get()
+                .checked_add(1)
+                .ok_or(KeyringError::InvalidLifecycle)?,
+        )?;
+        let verify_until = activated_at.checked_add(VERIFY_ONLY_OVERLAP_MICROS)?;
+
+        for _ in 0..8 {
+            let mut seed = Zeroizing::new([0_u8; KEY_BYTES]);
+            getrandom::fill(seed.as_mut()).map_err(|_| KeyringError::OperationFailed)?;
+            if let Ok(rotated) =
+                self.planned_rotation_from_seed(next_version, activated_at, verify_until, &seed)
+            {
+                return Ok(rotated);
+            }
+        }
+        Err(KeyringError::OperationFailed)
+    }
+
+    fn planned_rotation_from_seed(
+        &self,
+        version: KeyringVersion,
+        activated_at: AuthTimestampMicros,
+        verify_until: AuthTimestampMicros,
+        seed: &[u8; KEY_BYTES],
+    ) -> Result<Self, KeyringError> {
+        let active = active_from_seed(activated_at, seed)?;
+        if active.kid == self.active.kid {
+            return Err(KeyringError::InvalidKeyMaterial);
+        }
+        let previous_public = self.active.signing_key.verifying_key();
+        Ok(Self {
+            version,
+            active,
+            verify_only: Some(VerifyOnlyKey {
+                activated_at: self.active.activated_at,
+                verify_until,
+                verifying_key: previous_public,
+                kid: self.active.kid,
+            }),
+        })
+    }
+
+    pub(super) fn verify_only_facts(
+        &self,
+    ) -> Option<(KeyId, AuthTimestampMicros, AuthTimestampMicros)> {
+        self.verify_only
+            .as_ref()
+            .map(|key| (key.kid, key.activated_at, key.verify_until))
+    }
+
     pub(crate) fn sign(&self, message: &[u8]) -> [u8; 64] {
         self.active.signing_key.sign(message).to_bytes()
     }
@@ -356,6 +415,29 @@ impl Keyring {
                 .is_ok());
         }
         Ok(false)
+    }
+
+    #[cfg(test)]
+    pub(super) fn planned_rotation_from_test_seed(
+        &self,
+        activated_at: u64,
+        seed: [u8; KEY_BYTES],
+    ) -> Result<Self, KeyringError> {
+        if self.verify_only.is_some() {
+            return Err(KeyringError::InvalidLifecycle);
+        }
+        let activated_at = AuthTimestampMicros::new(activated_at)?;
+        if activated_at < self.active.activated_at {
+            return Err(KeyringError::InvalidLifecycle);
+        }
+        let version = KeyringVersion::new(
+            self.version
+                .get()
+                .checked_add(1)
+                .ok_or(KeyringError::InvalidLifecycle)?,
+        )?;
+        let verify_until = activated_at.checked_add(VERIFY_ONLY_OVERLAP_MICROS)?;
+        self.planned_rotation_from_seed(version, activated_at, verify_until, &seed)
     }
 
     #[cfg(test)]
@@ -864,6 +946,123 @@ mod tests {
         refresh_checksum(&mut overflow);
         assert_eq!(
             Keyring::decode(SecretBytes::new(overflow)).unwrap_err(),
+            KeyringError::InvalidLifecycle
+        );
+    }
+
+    #[test]
+    fn planned_rotation_replaces_private_material_and_keeps_only_bounded_public_overlap() {
+        let current =
+            Keyring::from_test_seeds(1, PREVIOUS_AT, RFC8032_SEED_ONE, None).expect("current");
+        let rotated = current
+            .planned_rotation_from_test_seed(ACTIVE_AT, RFC8032_SEED_TWO)
+            .expect("planned rotation");
+        let recovered =
+            Keyring::decode(rotated.encode()).expect("recover canonical planned keyring");
+
+        assert_eq!(recovered.version().get(), 2);
+        assert_ne!(recovered.active_kid(), current.active_kid());
+        let (previous_kid, previous_activated_at, verify_until) =
+            recovered.verify_only_facts().expect("verify-only record");
+        assert_eq!(previous_kid, current.active_kid());
+        assert_eq!(previous_activated_at.get(), PREVIOUS_AT);
+        assert_eq!(verify_until.get(), ACTIVE_AT + VERIFY_ONLY_OVERLAP_MICROS);
+
+        let message = b"planned rotation boundary";
+        let current_signature = current.sign(message);
+        assert!(
+            recovered
+                .verify(
+                    current.active_kid(),
+                    message,
+                    &current_signature,
+                    AuthTimestampMicros::new(ACTIVE_AT).unwrap()
+                )
+                .unwrap()
+        );
+        assert!(
+            !recovered
+                .verify(
+                    current.active_kid(),
+                    message,
+                    &current_signature,
+                    AuthTimestampMicros::new(ACTIVE_AT + VERIFY_ONLY_OVERLAP_MICROS).unwrap()
+                )
+                .unwrap()
+        );
+        let rotated_signature = recovered.sign(message);
+        assert!(
+            recovered
+                .verify(
+                    recovered.active_kid(),
+                    message,
+                    &rotated_signature,
+                    AuthTimestampMicros::new(ACTIVE_AT + VERIFY_ONLY_OVERLAP_MICROS).unwrap()
+                )
+                .unwrap()
+        );
+
+        let generated = current
+            .planned_rotation(AuthTimestampMicros::new(ACTIVE_AT).unwrap())
+            .expect("generated planned rotation");
+        assert_eq!(generated.version().get(), 2);
+        assert_ne!(generated.active_kid(), current.active_kid());
+        assert_eq!(
+            generated.encode().expose_secret().len(),
+            WITH_VERIFY_ONLY_LENGTH
+        );
+    }
+
+    #[test]
+    fn planned_rotation_rejects_regression_duplicate_overlap_and_version_exhaustion() {
+        let current =
+            Keyring::from_test_seeds(1, ACTIVE_AT, RFC8032_SEED_ONE, None).expect("current");
+        assert_eq!(
+            current
+                .planned_rotation_from_test_seed(ACTIVE_AT - 1, RFC8032_SEED_TWO)
+                .unwrap_err(),
+            KeyringError::InvalidLifecycle
+        );
+        assert_eq!(
+            current
+                .planned_rotation_from_test_seed(ACTIVE_AT, RFC8032_SEED_ONE)
+                .unwrap_err(),
+            KeyringError::InvalidKeyMaterial
+        );
+
+        let with_overlap = Keyring::from_test_seeds(
+            2,
+            ACTIVE_AT,
+            RFC8032_SEED_TWO,
+            Some((PREVIOUS_AT, RFC8032_SEED_ONE)),
+        )
+        .expect("rotated keyring");
+        assert_eq!(
+            with_overlap
+                .planned_rotation_from_test_seed(
+                    ACTIVE_AT + VERIFY_ONLY_OVERLAP_MICROS,
+                    RFC8032_SEED_ONE
+                )
+                .unwrap_err(),
+            KeyringError::InvalidLifecycle
+        );
+
+        let exhausted =
+            Keyring::from_test_seeds(i64::MAX as u64, ACTIVE_AT, RFC8032_SEED_ONE, None)
+                .expect("maximum-version keyring");
+        assert_eq!(
+            exhausted
+                .planned_rotation_from_test_seed(ACTIVE_AT, RFC8032_SEED_TWO)
+                .unwrap_err(),
+            KeyringError::InvalidLifecycle
+        );
+        assert_eq!(
+            current
+                .planned_rotation_from_test_seed(
+                    i64::MAX as u64 - VERIFY_ONLY_OVERLAP_MICROS + 1,
+                    RFC8032_SEED_TWO
+                )
+                .unwrap_err(),
             KeyringError::InvalidLifecycle
         );
     }

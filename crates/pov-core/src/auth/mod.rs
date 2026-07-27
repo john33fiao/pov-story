@@ -32,5 +32,5 @@ pub use throttle::{AuthenticatorKind, ThrottleFailureUpdate, ThrottleMathError, 
 pub(crate) use transition::{
     InitializationSourceExpectation, InitializationSourceSeed, PersistedLifecycleKeyId,
     PersistedLifecycleKeyringVersion, PersistedLifecycleTimestamp, PersistedLifecycleTransitionId,
-    TransitionKind,
+    PlannedRotationSourceExpectation, TransitionKind,
 };
