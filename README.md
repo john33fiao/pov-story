@@ -69,4 +69,4 @@ git diff --check
 
 ## License
 
-프로젝트 라이선스와 외부 contribution 정책은 아직 선택하지 않았습니다. POV-031 current-tree inventory에서 별도 vendored source asset/notice는 남지 않았고 Rust/npm dependency metadata와 각 dependency의 license는 dependency-owned 범위로 확인했습니다. MIT 적용 범위와 contribution 정책은 여전히 별도 결정이며, 라이선스가 추가되기 전에는 열람 가능성과 재사용 허가를 같은 의미로 해석하지 마세요.
+별도 표기가 없는 이 저장소의 프로젝트 소스 코드는 [MIT License](LICENSE)에 따라 배포됩니다. 외부 dependency는 각 dependency의 고유 라이선스를 따릅니다.
