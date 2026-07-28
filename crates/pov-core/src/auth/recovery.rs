@@ -65,6 +65,10 @@ impl RecoveryCode {
         self.secret.copy_for_worker()
     }
 
+    pub(super) fn expose_to_operator(&self) -> &[u8] {
+        self.secret.expose_secret()
+    }
+
     #[cfg(test)]
     pub(super) fn synthetic_display_bytes(&self) -> &[u8] {
         self.secret.expose_secret()

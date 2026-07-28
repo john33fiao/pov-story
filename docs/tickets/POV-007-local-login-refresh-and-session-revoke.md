@@ -1,6 +1,6 @@
 # POV-007 Local Login, Refresh And Session Revoke
 
-Status: In Progress — initialization/planned/retire lifecycle와 local login/JWT/session/revoke/HTTP runtime 구현; controlling-TTY operator와 compromise/loss 및 installed-browser evidence 남음
+Status: In Progress — initialization/planned/retire lifecycle, local login/JWT/session/revoke/HTTP runtime와 controlling-TTY `auth init` operator 구현; compromise/loss 및 installed-browser evidence 남음
 
 Type: Delivery
 
@@ -23,6 +23,7 @@ accepted auth decision에 따라 ID/password login, 짧은 수명의 access toke
 - login, refresh rotation, logout와 active session persistence
 - [ADR-0004](../decisions/0004-local-authentication-and-session-security-contract.md)의 access token verification과 owner context middleware
 - auth verifier 내부에서만 production `VerifiedAuthContext` 발급; public/raw owner constructor 금지
+- explicit instance root/login ID만 받는 production `auth init`; password echo suppression, `/dev/tty` foreground 검증, CSPRNG recovery code 단회 표시와 저장 확인 전 durable mutation 금지
 - refresh replay detection과 related session revoke
 - password change, saved recovery-code rotation/recovery와 user disable/re-enable
 - local browser token/cookie profile
