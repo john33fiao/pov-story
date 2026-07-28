@@ -34,7 +34,9 @@ pub use kdf::{
 #[cfg(all(test, unix))]
 pub(crate) use keyring::{AuthTimestampMicros, Keyring};
 #[cfg(unix)]
-pub use operator::{AuthInitializationError, initialize_confirmed};
+pub use operator::{
+    AuthInitializationError, OperatorInitError, initialize_confirmed, run_operator_init,
+};
 pub use password::{NormalizedPassword, PasswordInputError};
 pub use recovery::{RecoveryCode, RecoveryCodeError};
 pub use secret::SecretBytes;

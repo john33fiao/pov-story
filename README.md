@@ -24,6 +24,12 @@ npm --prefix web run build
 cargo run --locked --release -p pov-api
 ```
 
+최초 owner 인증은 redirect할 수 없는 controlling TTY에서 별도로 초기화합니다. password나 recovery code를 인자나 환경 변수로 전달하는 형식은 제공하지 않습니다.
+
+```bash
+cargo run --locked --release -p pov-api -- auth init --instance-root /absolute/private/path --login-id owner_01
+```
+
 다른 terminal에서 health endpoint를 확인합니다.
 
 ```bash

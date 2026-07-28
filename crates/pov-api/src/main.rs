@@ -3,7 +3,10 @@ use std::{error::Error, io, path::PathBuf, sync::Arc, time::SystemTime};
 #[cfg(unix)]
 use pov_api::{DEFAULT_BIND_ADDRESS, app_with_auth};
 #[cfg(unix)]
-use pov_core::{auth::AuthRuntime, storage::StoreSet};
+use pov_core::{
+    auth::{AuthRuntime, run_operator_init},
+    storage::StoreSet,
+};
 #[cfg(unix)]
 use tokio::net::TcpListener;
 
@@ -14,9 +17,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 #[cfg(unix)]
 async fn run() -> Result<(), Box<dyn Error>> {
-    let instance_root = parse_instance_root(std::env::args_os().skip(1))?;
+    let command = parse_command(std::env::args_os().skip(1))?;
+    let (instance_root, login_id) = match command {
+        Command::Serve { instance_root } => (instance_root, None),
+        Command::AuthInit {
+            instance_root,
+            login_id,
+        } => (instance_root, Some(login_id)),
+    };
     let stores = StoreSet::open(instance_root.join("stores")).await?;
     let now_micros = current_time_micros()?;
+    if let Some(login_id) = login_id {
+        let result = run_operator_init(&instance_root, &stores, &login_id, now_micros).await;
+        stores.close().await?;
+        return result.map_err(Into::into);
+    }
     let runtime = Arc::new(AuthRuntime::open(&instance_root, &stores, now_micros).await?);
     let listener = TcpListener::bind(DEFAULT_BIND_ADDRESS).await?;
     axum::serve(listener, app_with_auth(runtime)).await?;
@@ -30,28 +45,56 @@ async fn run() -> Result<(), Box<dyn Error>> {
 }
 
 #[cfg(unix)]
-fn parse_instance_root(
+#[derive(Debug, Eq, PartialEq)]
+enum Command {
+    Serve {
+        instance_root: PathBuf,
+    },
+    AuthInit {
+        instance_root: PathBuf,
+        login_id: String,
+    },
+}
+
+fn usage() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "usage: pov-api --instance-root <path> | pov-api auth init --instance-root <path> --login-id <id>",
+    )
+}
+
+fn parse_command(
     mut arguments: impl Iterator<Item = std::ffi::OsString>,
-) -> Result<PathBuf, io::Error> {
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--instance-root")) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "usage: pov-api --instance-root <path>",
-        ));
+) -> Result<Command, io::Error> {
+    let first = arguments.next().ok_or_else(usage)?;
+    if first == "--instance-root" {
+        let root = arguments.next().ok_or_else(usage)?;
+        if root.is_empty() || arguments.next().is_some() {
+            return Err(usage());
+        }
+        return Ok(Command::Serve {
+            instance_root: root.into(),
+        });
     }
-    let root = arguments.next().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "usage: pov-api --instance-root <path>",
-        )
-    })?;
-    if arguments.next().is_some() || root.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "usage: pov-api --instance-root <path>",
-        ));
+    if first != "auth"
+        || arguments.next().as_deref() != Some(std::ffi::OsStr::new("init"))
+        || arguments.next().as_deref() != Some(std::ffi::OsStr::new("--instance-root"))
+    {
+        return Err(usage());
     }
-    Ok(PathBuf::from(root))
+    let root = arguments.next().ok_or_else(usage)?;
+    if root.is_empty() || arguments.next().as_deref() != Some(std::ffi::OsStr::new("--login-id")) {
+        return Err(usage());
+    }
+    let login = arguments.next().ok_or_else(usage)?;
+    if login.is_empty() || arguments.next().is_some() {
+        return Err(usage());
+    }
+    let login_id = login.into_string().map_err(|_| usage())?;
+    Ok(Command::AuthInit {
+        instance_root: root.into(),
+        login_id,
+    })
 }
 
 #[cfg(unix)]
@@ -65,18 +108,39 @@ fn current_time_micros() -> Result<u64, io::Error> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::parse_instance_root;
+    use super::{Command, parse_command};
 
     #[test]
     fn production_instance_root_is_explicit_and_exact() {
         assert_eq!(
-            parse_instance_root(
+            parse_command(
                 ["--instance-root", "/tmp/pov-instance"]
                     .into_iter()
                     .map(Into::into)
             )
             .expect("explicit root"),
-            std::path::PathBuf::from("/tmp/pov-instance")
+            Command::Serve {
+                instance_root: std::path::PathBuf::from("/tmp/pov-instance")
+            }
+        );
+        assert_eq!(
+            parse_command(
+                [
+                    "auth",
+                    "init",
+                    "--instance-root",
+                    "/tmp/pov-instance",
+                    "--login-id",
+                    "owner_01"
+                ]
+                .into_iter()
+                .map(Into::into)
+            )
+            .unwrap(),
+            Command::AuthInit {
+                instance_root: "/tmp/pov-instance".into(),
+                login_id: "owner_01".into()
+            }
         );
         for arguments in [
             Vec::<std::ffi::OsString>::new(),
@@ -89,7 +153,30 @@ mod tests {
                 "extra".into(),
             ],
         ] {
-            assert!(parse_instance_root(arguments.into_iter()).is_err());
+            assert!(parse_command(arguments.into_iter()).is_err());
+        }
+        for forbidden in [
+            vec![
+                "auth",
+                "init",
+                "--instance-root",
+                "/tmp/x",
+                "--login-id",
+                "owner",
+                "--password",
+                "secret",
+            ],
+            vec![
+                "auth",
+                "init",
+                "--instance-root",
+                "/tmp/x",
+                "--login-id",
+                "owner",
+                "secret",
+            ],
+        ] {
+            assert!(parse_command(forbidden.into_iter().map(Into::into)).is_err());
         }
     }
 }
