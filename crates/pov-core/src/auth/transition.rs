@@ -8,7 +8,10 @@ use zeroize::Zeroizing;
 
 use super::{
     SecretBytes, ValidatedVerifier,
-    keyring::{ACTIVE_ONLY_LENGTH, AuthTimestampMicros, KeyId, Keyring, KeyringVersion},
+    keyring::{
+        ACTIVE_ONLY_LENGTH, AuthTimestampMicros, KeyId, Keyring, KeyringVersion,
+        WITH_VERIFY_ONLY_LENGTH,
+    },
 };
 
 pub(crate) const AUTH_MAINTENANCE_LOCK_NAME: &str = "auth-maintenance.lock";
@@ -27,12 +30,15 @@ const METADATA_MAGIC: &[u8; 8] = b"POVAUTHM";
 const METADATA_FORMAT_VERSION: u16 = 1;
 const INITIALIZE_METADATA_TAG: u8 = 1;
 const PLANNED_METADATA_TAG: u8 = 2;
+const RETIRE_METADATA_TAG: u8 = 3;
 const METADATA_CHECKSUM_BYTES: usize = 32;
 const METADATA_FIXED_HEADER_BYTES: usize = 166;
 pub(super) const MAX_INITIALIZATION_METADATA_BYTES: usize = 512;
 pub(super) const PLANNED_ROTATION_METADATA_BYTES: usize = 305;
 const PLANNED_ROTATION_CHECKSUM_OFFSET: usize =
     PLANNED_ROTATION_METADATA_BYTES - METADATA_CHECKSUM_BYTES;
+pub(super) const RETIRE_METADATA_BYTES: usize = 349;
+const RETIRE_CHECKSUM_OFFSET: usize = RETIRE_METADATA_BYTES - METADATA_CHECKSUM_BYTES;
 const KID_BYTES: usize = 43;
 const STAGED_HASH_BYTES: usize = 32;
 const MAX_LOGIN_ID_BYTES: usize = 32;
@@ -510,9 +516,108 @@ pub(crate) struct PlannedRotationPreparationV1 {
     staged_keyring: SecretBytes,
 }
 
+pub(crate) struct RetireMetadataInput {
+    pub(crate) transition_id: TransitionId,
+    pub(crate) owner_id: AuthOwnerId,
+    pub(crate) audit_id: AuditId,
+    pub(crate) source_at_micros: SourceTimestampMicros,
+    pub(crate) expected_lifecycle_revision: u64,
+    pub(crate) expected_lifecycle_updated_at_micros: SourceTimestampMicros,
+    pub(crate) credential_version: u64,
+    pub(crate) account_revision: u64,
+    pub(crate) password_credential_revision: u64,
+    pub(crate) recovery_credential_revision: u64,
+}
+
+impl fmt::Debug for RetireMetadataInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RetireMetadataInput([REDACTED])")
+    }
+}
+
+pub(crate) struct RetireMetadataV1 {
+    transition_id: TransitionId,
+    owner_id: AuthOwnerId,
+    audit_id: AuditId,
+    expected_active_kid: KeyId,
+    expected_verify_only_kid: KeyId,
+    expected_keyring_version: KeyringVersion,
+    expected_active_activated_at_micros: AuthTimestampMicros,
+    expected_verify_only_activated_at_micros: AuthTimestampMicros,
+    expected_verify_until_micros: AuthTimestampMicros,
+    expected_lifecycle_revision: u64,
+    expected_lifecycle_updated_at_micros: SourceTimestampMicros,
+    source_at_micros: SourceTimestampMicros,
+    result_keyring_version: KeyringVersion,
+    current_keyring_length: u32,
+    current_keyring_hash: [u8; STAGED_HASH_BYTES],
+    staged_keyring_length: u32,
+    staged_keyring_hash: [u8; STAGED_HASH_BYTES],
+    credential_version: u64,
+    account_revision: u64,
+    password_credential_revision: u64,
+    recovery_credential_revision: u64,
+}
+
+pub(crate) struct RetirePreparationV1 {
+    metadata: RetireMetadataV1,
+    staged_keyring: SecretBytes,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct PlannedRotationSourceExpectation<'a> {
     metadata: &'a PlannedRotationMetadataV1,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RetireSourceExpectation<'a> {
+    metadata: &'a RetireMetadataV1,
+}
+
+pub(crate) trait KeyTransitionSourceExpectation: Copy {
+    fn transition_kind(self) -> TransitionKind;
+    fn audit_action(self) -> &'static str;
+    fn transition_id(&self) -> &[u8; 16];
+    fn owner_id(&self) -> &[u8; 16];
+    fn audit_id(&self) -> &[u8; 16];
+    fn expected_active_kid(&self) -> &str;
+    fn expected_keyring_version(self) -> i64;
+    fn expected_key_activated_at_micros(self) -> i64;
+    fn expected_lifecycle_revision(self) -> i64;
+    fn expected_lifecycle_updated_at_micros(self) -> i64;
+    fn matches_active_lifecycle(
+        self,
+        state_revision: u64,
+        expected_kid: PersistedLifecycleKeyId,
+        keyring_version: PersistedLifecycleKeyringVersion,
+        updated_at_micros: PersistedLifecycleTimestamp,
+    ) -> bool;
+    fn matches_owner_id(self, raw: &[u8]) -> bool;
+    fn result_kid(&self) -> &str;
+    fn result_keyring_version(self) -> i64;
+    fn source_at_micros(self) -> i64;
+    fn transitioning_lifecycle_revision(self) -> i64;
+    fn final_lifecycle_revision(self) -> i64;
+    fn matches_transitioning_lifecycle(
+        self,
+        state_revision: u64,
+        kind: TransitionKind,
+        transition_id: PersistedLifecycleTransitionId,
+        expected_kid: PersistedLifecycleKeyId,
+        keyring_version: PersistedLifecycleKeyringVersion,
+        updated_at_micros: PersistedLifecycleTimestamp,
+    ) -> bool;
+    fn matches_final_active_lifecycle(
+        self,
+        state_revision: u64,
+        expected_kid: PersistedLifecycleKeyId,
+        keyring_version: PersistedLifecycleKeyringVersion,
+        updated_at_micros: PersistedLifecycleTimestamp,
+    ) -> bool;
+    fn credential_version(self) -> i64;
+    fn account_revision(self) -> i64;
+    fn password_credential_revision(self) -> i64;
+    fn recovery_credential_revision(self) -> i64;
 }
 
 impl PlannedRotationPreparationV1 {
@@ -567,6 +672,68 @@ impl PlannedRotationPreparationV1 {
 impl fmt::Debug for PlannedRotationPreparationV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("PlannedRotationPreparationV1([REDACTED])")
+    }
+}
+
+impl RetirePreparationV1 {
+    pub(crate) fn from_current_keyring(
+        input: RetireMetadataInput,
+        current_keyring: &Keyring,
+    ) -> Result<Self, TransitionContractError> {
+        validate_retire_input(&input)?;
+        let retired_at = AuthTimestampMicros::new(input.source_at_micros.get())
+            .map_err(|_| TransitionContractError::InvalidRetirementKeyring)?;
+        let staged_keyring = current_keyring
+            .retire_verify_only(retired_at)
+            .map_err(|_| TransitionContractError::InvalidRetirementKeyring)?;
+        Self::from_keyrings(input, current_keyring, staged_keyring)
+    }
+
+    pub(super) fn from_keyrings(
+        input: RetireMetadataInput,
+        current_keyring: &Keyring,
+        staged_keyring: Keyring,
+    ) -> Result<Self, TransitionContractError> {
+        validate_retire_input(&input)?;
+        let metadata = RetireMetadataV1::from_keyrings(input, current_keyring, &staged_keyring)?;
+        let staged_keyring = staged_keyring.encode();
+        metadata
+            .validate_staged_keyring(SecretBytes::new(staged_keyring.expose_secret().to_vec()))?;
+        Ok(Self {
+            metadata,
+            staged_keyring,
+        })
+    }
+
+    pub(super) fn transition_artifact(&self) -> TopLevelArtifactName {
+        TopLevelArtifactName::Transition {
+            kind: TransitionKind::Retire,
+            id: self.metadata.transition_id,
+        }
+    }
+
+    pub(super) fn encoded_metadata(&self) -> Result<SecretBytes, TransitionContractError> {
+        self.metadata.encode()
+    }
+
+    pub(super) fn staged_keyring_bytes(&self) -> &[u8] {
+        self.staged_keyring.expose_secret()
+    }
+
+    pub(super) fn matches_current_keyring(&self, bytes: &[u8]) -> bool {
+        self.metadata
+            .validate_current_keyring(SecretBytes::new(bytes.to_vec()))
+            .is_ok()
+    }
+
+    pub(crate) const fn source_expectation(&self) -> RetireSourceExpectation<'_> {
+        self.metadata.source_expectation()
+    }
+}
+
+impl fmt::Debug for RetirePreparationV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RetirePreparationV1([REDACTED])")
     }
 }
 
@@ -1292,6 +1459,282 @@ impl PlannedRotationMetadataV1 {
             || self.source_at_micros.get() < self.expected_lifecycle_updated_at_micros.get()
             || self.staged_keyring_length as usize != super::keyring::WITH_VERIFY_ONLY_LENGTH
             || !is_positive_sqlite_integer(self.expected_lifecycle_revision)
+            || self.expected_lifecycle_revision > (i64::MAX as u64).saturating_sub(2)
+            || !is_positive_sqlite_integer(self.credential_version)
+            || !is_positive_sqlite_integer(self.account_revision)
+            || !is_positive_sqlite_integer(self.password_credential_revision)
+            || !is_positive_sqlite_integer(self.recovery_credential_revision)
+        {
+            return Err(TransitionContractError::InvalidMetadata);
+        }
+        Ok(())
+    }
+}
+
+impl RetireMetadataV1 {
+    fn from_keyrings(
+        input: RetireMetadataInput,
+        current_keyring: &Keyring,
+        staged_keyring: &Keyring,
+    ) -> Result<Self, TransitionContractError> {
+        let current_bytes = current_keyring.encode();
+        let staged_bytes = staged_keyring.encode();
+        if current_bytes.expose_secret().len() != WITH_VERIFY_ONLY_LENGTH
+            || staged_bytes.expose_secret().len() != ACTIVE_ONLY_LENGTH
+        {
+            return Err(TransitionContractError::InvalidRetirementKeyring);
+        }
+        let Some((
+            expected_verify_only_kid,
+            expected_verify_only_activated_at_micros,
+            expected_verify_until_micros,
+        )) = current_keyring.verify_only_facts()
+        else {
+            return Err(TransitionContractError::InvalidRetirementKeyring);
+        };
+        let expected_result_version = current_keyring
+            .version()
+            .get()
+            .checked_add(1)
+            .ok_or(TransitionContractError::InvalidRetirementKeyring)?;
+        if staged_keyring.version().get() != expected_result_version
+            || staged_keyring.active_kid() != current_keyring.active_kid()
+            || staged_keyring.active_activated_at() != current_keyring.active_activated_at()
+            || staged_keyring.verify_only_facts().is_some()
+            || input.source_at_micros.get() < expected_verify_until_micros.get()
+        {
+            return Err(TransitionContractError::InvalidRetirementKeyring);
+        }
+
+        let metadata = Self {
+            transition_id: input.transition_id,
+            owner_id: input.owner_id,
+            audit_id: input.audit_id,
+            expected_active_kid: current_keyring.active_kid(),
+            expected_verify_only_kid,
+            expected_keyring_version: current_keyring.version(),
+            expected_active_activated_at_micros: current_keyring.active_activated_at(),
+            expected_verify_only_activated_at_micros,
+            expected_verify_until_micros,
+            expected_lifecycle_revision: input.expected_lifecycle_revision,
+            expected_lifecycle_updated_at_micros: input.expected_lifecycle_updated_at_micros,
+            source_at_micros: input.source_at_micros,
+            result_keyring_version: staged_keyring.version(),
+            current_keyring_length: u32::try_from(current_bytes.expose_secret().len())
+                .map_err(|_| TransitionContractError::InvalidRetirementKeyring)?,
+            current_keyring_hash: Sha256::digest(current_bytes.expose_secret()).into(),
+            staged_keyring_length: u32::try_from(staged_bytes.expose_secret().len())
+                .map_err(|_| TransitionContractError::InvalidRetirementKeyring)?,
+            staged_keyring_hash: Sha256::digest(staged_bytes.expose_secret()).into(),
+            credential_version: input.credential_version,
+            account_revision: input.account_revision,
+            password_credential_revision: input.password_credential_revision,
+            recovery_credential_revision: input.recovery_credential_revision,
+        };
+        metadata.validate_semantics()?;
+        Ok(metadata)
+    }
+
+    pub(crate) fn decode(encoded: SecretBytes) -> Result<Self, TransitionContractError> {
+        let bytes = encoded.expose_secret();
+        if bytes.len() != RETIRE_METADATA_BYTES
+            || bytes.get(..METADATA_MAGIC.len()) != Some(METADATA_MAGIC.as_slice())
+        {
+            return Err(TransitionContractError::InvalidMetadata);
+        }
+        if read_u16(bytes, 8)? != METADATA_FORMAT_VERSION {
+            return Err(TransitionContractError::UnsupportedMetadataVersion);
+        }
+        if usize::try_from(read_u32(bytes, 10)?).ok() != Some(bytes.len()) {
+            return Err(TransitionContractError::InvalidMetadata);
+        }
+        if bytes[14] != RETIRE_METADATA_TAG {
+            return Err(TransitionContractError::UnsupportedMetadataKind);
+        }
+        if Sha256::digest(&bytes[..RETIRE_CHECKSUM_OFFSET]).as_slice()
+            != &bytes[RETIRE_CHECKSUM_OFFSET..]
+        {
+            return Err(TransitionContractError::InvalidMetadata);
+        }
+
+        let metadata = Self {
+            transition_id: TransitionId::from_bytes(read_slice(bytes, 15, 16)?)?,
+            owner_id: AuthOwnerId::from_bytes(read_slice(bytes, 31, 16)?)?,
+            audit_id: AuditId::from_bytes(read_slice(bytes, 47, 16)?)?,
+            expected_active_kid: KeyId::from_stored_bytes(read_slice(bytes, 63, KID_BYTES)?)
+                .map_err(|_| TransitionContractError::InvalidMetadata)?,
+            expected_verify_only_kid: KeyId::from_stored_bytes(read_slice(bytes, 106, KID_BYTES)?)
+                .map_err(|_| TransitionContractError::InvalidMetadata)?,
+            expected_keyring_version: KeyringVersion::new(read_u64(bytes, 149)?)
+                .map_err(|_| TransitionContractError::InvalidMetadata)?,
+            expected_active_activated_at_micros: AuthTimestampMicros::new(read_u64(bytes, 157)?)
+                .map_err(|_| TransitionContractError::InvalidMetadata)?,
+            expected_verify_only_activated_at_micros: AuthTimestampMicros::new(read_u64(
+                bytes, 165,
+            )?)
+            .map_err(|_| TransitionContractError::InvalidMetadata)?,
+            expected_verify_until_micros: AuthTimestampMicros::new(read_u64(bytes, 173)?)
+                .map_err(|_| TransitionContractError::InvalidMetadata)?,
+            expected_lifecycle_revision: read_u64(bytes, 181)?,
+            expected_lifecycle_updated_at_micros: SourceTimestampMicros::new(read_u64(
+                bytes, 189,
+            )?)?,
+            source_at_micros: SourceTimestampMicros::new(read_u64(bytes, 197)?)?,
+            result_keyring_version: KeyringVersion::new(read_u64(bytes, 205)?)
+                .map_err(|_| TransitionContractError::InvalidMetadata)?,
+            current_keyring_length: read_u32(bytes, 213)?,
+            current_keyring_hash: read_slice(bytes, 217, STAGED_HASH_BYTES)?
+                .try_into()
+                .map_err(|_| TransitionContractError::InvalidMetadata)?,
+            staged_keyring_length: read_u32(bytes, 249)?,
+            staged_keyring_hash: read_slice(bytes, 253, STAGED_HASH_BYTES)?
+                .try_into()
+                .map_err(|_| TransitionContractError::InvalidMetadata)?,
+            credential_version: read_u64(bytes, 285)?,
+            account_revision: read_u64(bytes, 293)?,
+            password_credential_revision: read_u64(bytes, 301)?,
+            recovery_credential_revision: read_u64(bytes, 309)?,
+        };
+        metadata.validate_semantics()?;
+        let canonical = metadata.encode()?;
+        if canonical.expose_secret() != bytes {
+            return Err(TransitionContractError::InvalidMetadata);
+        }
+        Ok(metadata)
+    }
+
+    pub(crate) fn encode(&self) -> Result<SecretBytes, TransitionContractError> {
+        self.validate_semantics()?;
+        let mut bytes = Zeroizing::new(Vec::with_capacity(RETIRE_METADATA_BYTES));
+        bytes.extend_from_slice(METADATA_MAGIC);
+        bytes.extend_from_slice(&METADATA_FORMAT_VERSION.to_be_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(RETIRE_METADATA_BYTES)
+                .expect("retire metadata length fits u32")
+                .to_be_bytes(),
+        );
+        bytes.push(RETIRE_METADATA_TAG);
+        bytes.extend_from_slice(self.transition_id.as_bytes());
+        bytes.extend_from_slice(self.owner_id.as_bytes());
+        bytes.extend_from_slice(self.audit_id.as_bytes());
+        bytes.extend_from_slice(self.expected_active_kid.as_bytes());
+        bytes.extend_from_slice(self.expected_verify_only_kid.as_bytes());
+        bytes.extend_from_slice(&self.expected_keyring_version.get().to_be_bytes());
+        bytes.extend_from_slice(&self.expected_active_activated_at_micros.get().to_be_bytes());
+        bytes.extend_from_slice(
+            &self
+                .expected_verify_only_activated_at_micros
+                .get()
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(&self.expected_verify_until_micros.get().to_be_bytes());
+        bytes.extend_from_slice(&self.expected_lifecycle_revision.to_be_bytes());
+        bytes.extend_from_slice(
+            &self
+                .expected_lifecycle_updated_at_micros
+                .get()
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(&self.source_at_micros.get().to_be_bytes());
+        bytes.extend_from_slice(&self.result_keyring_version.get().to_be_bytes());
+        bytes.extend_from_slice(&self.current_keyring_length.to_be_bytes());
+        bytes.extend_from_slice(&self.current_keyring_hash);
+        bytes.extend_from_slice(&self.staged_keyring_length.to_be_bytes());
+        bytes.extend_from_slice(&self.staged_keyring_hash);
+        bytes.extend_from_slice(&self.credential_version.to_be_bytes());
+        bytes.extend_from_slice(&self.account_revision.to_be_bytes());
+        bytes.extend_from_slice(&self.password_credential_revision.to_be_bytes());
+        bytes.extend_from_slice(&self.recovery_credential_revision.to_be_bytes());
+        if bytes.len() != RETIRE_CHECKSUM_OFFSET {
+            return Err(TransitionContractError::InvalidMetadata);
+        }
+        let checksum = Sha256::digest(bytes.as_slice());
+        bytes.extend_from_slice(&checksum);
+        Ok(SecretBytes::from_zeroizing(bytes))
+    }
+
+    pub(crate) fn validate_current_keyring(
+        &self,
+        current_keyring: SecretBytes,
+    ) -> Result<Keyring, TransitionContractError> {
+        let bytes = current_keyring.expose_secret();
+        if bytes.len() != self.current_keyring_length as usize
+            || Sha256::digest(bytes).as_slice() != self.current_keyring_hash
+        {
+            return Err(TransitionContractError::InvalidRetirementKeyring);
+        }
+        let keyring = Keyring::decode(current_keyring)
+            .map_err(|_| TransitionContractError::InvalidRetirementKeyring)?;
+        let Some((verify_kid, verify_activated_at, verify_until)) = keyring.verify_only_facts()
+        else {
+            return Err(TransitionContractError::InvalidRetirementKeyring);
+        };
+        if keyring.encode().expose_secret().len() != WITH_VERIFY_ONLY_LENGTH
+            || keyring.version() != self.expected_keyring_version
+            || keyring.active_kid() != self.expected_active_kid
+            || keyring.active_activated_at() != self.expected_active_activated_at_micros
+            || verify_kid != self.expected_verify_only_kid
+            || verify_activated_at != self.expected_verify_only_activated_at_micros
+            || verify_until != self.expected_verify_until_micros
+        {
+            return Err(TransitionContractError::InvalidRetirementKeyring);
+        }
+        Ok(keyring)
+    }
+
+    pub(crate) fn validate_staged_keyring(
+        &self,
+        staged_keyring: SecretBytes,
+    ) -> Result<Keyring, TransitionContractError> {
+        let bytes = staged_keyring.expose_secret();
+        if bytes.len() != self.staged_keyring_length as usize
+            || Sha256::digest(bytes).as_slice() != self.staged_keyring_hash
+        {
+            return Err(TransitionContractError::InvalidRetirementKeyring);
+        }
+        let keyring = Keyring::decode(staged_keyring)
+            .map_err(|_| TransitionContractError::InvalidRetirementKeyring)?;
+        if keyring.encode().expose_secret().len() != ACTIVE_ONLY_LENGTH
+            || keyring.version() != self.result_keyring_version
+            || keyring.active_kid() != self.expected_active_kid
+            || keyring.active_activated_at() != self.expected_active_activated_at_micros
+            || keyring.verify_only_facts().is_some()
+        {
+            return Err(TransitionContractError::InvalidRetirementKeyring);
+        }
+        Ok(keyring)
+    }
+
+    pub(crate) const fn source_expectation(&self) -> RetireSourceExpectation<'_> {
+        RetireSourceExpectation { metadata: self }
+    }
+
+    pub(super) fn matches_reservation_artifact(&self, artifact: TopLevelArtifactName) -> bool {
+        artifact
+            == (TopLevelArtifactName::Transition {
+                kind: TransitionKind::Retire,
+                id: self.transition_id,
+            })
+            || artifact
+                == (TopLevelArtifactName::Cleanup {
+                    kind: TransitionKind::Retire,
+                    id: self.transition_id,
+                })
+    }
+
+    fn validate_semantics(&self) -> Result<(), TransitionContractError> {
+        if self.expected_active_kid == self.expected_verify_only_kid
+            || self.expected_keyring_version.get().checked_add(1)
+                != Some(self.result_keyring_version.get())
+            || self.expected_verify_only_activated_at_micros
+                > self.expected_active_activated_at_micros
+            || self.expected_verify_until_micros < self.expected_active_activated_at_micros
+            || self.source_at_micros.get() < self.expected_verify_until_micros.get()
+            || self.source_at_micros.get() < self.expected_lifecycle_updated_at_micros.get()
+            || self.current_keyring_length as usize != WITH_VERIFY_ONLY_LENGTH
+            || self.staged_keyring_length as usize != ACTIVE_ONLY_LENGTH
+            || !is_positive_sqlite_integer(self.expected_lifecycle_revision)
+            || self.expected_lifecycle_revision > (i64::MAX as u64).saturating_sub(2)
             || !is_positive_sqlite_integer(self.credential_version)
             || !is_positive_sqlite_integer(self.account_revision)
             || !is_positive_sqlite_integer(self.password_credential_revision)
@@ -1371,6 +1814,58 @@ impl<'a> PlannedRotationSourceExpectation<'a> {
             .expect("validated source timestamp fits SQLite")
     }
 
+    pub(crate) fn transitioning_lifecycle_revision(self) -> i64 {
+        self.expected_lifecycle_revision()
+            .checked_add(1)
+            .expect("validated lifecycle revision can advance once")
+    }
+
+    pub(crate) fn final_lifecycle_revision(self) -> i64 {
+        self.expected_lifecycle_revision()
+            .checked_add(2)
+            .expect("validated lifecycle revision can advance twice")
+    }
+
+    pub(crate) fn matches_transitioning_lifecycle(
+        self,
+        state_revision: u64,
+        kind: TransitionKind,
+        transition_id: PersistedLifecycleTransitionId,
+        expected_kid: PersistedLifecycleKeyId,
+        keyring_version: PersistedLifecycleKeyringVersion,
+        updated_at_micros: PersistedLifecycleTimestamp,
+    ) -> bool {
+        state_revision
+            == self
+                .metadata
+                .expected_lifecycle_revision
+                .checked_add(1)
+                .unwrap_or(u64::MAX)
+            && kind == TransitionKind::Planned
+            && transition_id.0 == self.metadata.transition_id
+            && expected_kid.0 == self.metadata.result_kid
+            && keyring_version.0 == self.metadata.result_keyring_version
+            && updated_at_micros.0 == self.metadata.source_at_micros
+    }
+
+    pub(crate) fn matches_final_active_lifecycle(
+        self,
+        state_revision: u64,
+        expected_kid: PersistedLifecycleKeyId,
+        keyring_version: PersistedLifecycleKeyringVersion,
+        updated_at_micros: PersistedLifecycleTimestamp,
+    ) -> bool {
+        state_revision
+            == self
+                .metadata
+                .expected_lifecycle_revision
+                .checked_add(2)
+                .unwrap_or(u64::MAX)
+            && expected_kid.0 == self.metadata.result_kid
+            && keyring_version.0 == self.metadata.result_keyring_version
+            && updated_at_micros.0 == self.metadata.source_at_micros
+    }
+
     pub(crate) fn credential_version(self) -> i64 {
         i64::try_from(self.metadata.credential_version)
             .expect("validated credential version fits SQLite")
@@ -1392,9 +1887,311 @@ impl<'a> PlannedRotationSourceExpectation<'a> {
     }
 }
 
+impl<'a> RetireSourceExpectation<'a> {
+    pub(crate) fn transition_id(self) -> &'a [u8; 16] {
+        self.metadata.transition_id.as_bytes()
+    }
+
+    pub(crate) fn owner_id(self) -> &'a [u8; 16] {
+        self.metadata.owner_id.as_bytes()
+    }
+
+    pub(crate) fn audit_id(self) -> &'a [u8; 16] {
+        self.metadata.audit_id.as_bytes()
+    }
+
+    pub(crate) fn expected_active_kid(self) -> &'a str {
+        self.metadata.expected_active_kid.as_str()
+    }
+
+    pub(crate) fn expected_keyring_version(self) -> i64 {
+        i64::try_from(self.metadata.expected_keyring_version.get())
+            .expect("validated keyring version fits SQLite")
+    }
+
+    pub(crate) fn expected_key_activated_at_micros(self) -> i64 {
+        i64::try_from(self.metadata.expected_active_activated_at_micros.get())
+            .expect("validated key activation fits SQLite")
+    }
+
+    pub(crate) fn expected_lifecycle_revision(self) -> i64 {
+        i64::try_from(self.metadata.expected_lifecycle_revision)
+            .expect("validated lifecycle revision fits SQLite")
+    }
+
+    pub(crate) fn expected_lifecycle_updated_at_micros(self) -> i64 {
+        i64::try_from(self.metadata.expected_lifecycle_updated_at_micros.get())
+            .expect("validated lifecycle timestamp fits SQLite")
+    }
+
+    pub(crate) fn matches_active_lifecycle(
+        self,
+        state_revision: u64,
+        expected_kid: PersistedLifecycleKeyId,
+        keyring_version: PersistedLifecycleKeyringVersion,
+        updated_at_micros: PersistedLifecycleTimestamp,
+    ) -> bool {
+        state_revision == self.metadata.expected_lifecycle_revision
+            && expected_kid.0 == self.metadata.expected_active_kid
+            && keyring_version.0 == self.metadata.expected_keyring_version
+            && updated_at_micros.0 == self.metadata.expected_lifecycle_updated_at_micros
+    }
+
+    pub(crate) fn matches_owner_id(self, raw: &[u8]) -> bool {
+        raw == self.metadata.owner_id.as_bytes()
+    }
+
+    pub(crate) fn result_kid(self) -> &'a str {
+        self.metadata.expected_active_kid.as_str()
+    }
+
+    pub(crate) fn result_keyring_version(self) -> i64 {
+        i64::try_from(self.metadata.result_keyring_version.get())
+            .expect("validated keyring version fits SQLite")
+    }
+
+    pub(crate) fn source_at_micros(self) -> i64 {
+        i64::try_from(self.metadata.source_at_micros.get())
+            .expect("validated source timestamp fits SQLite")
+    }
+
+    pub(crate) fn transitioning_lifecycle_revision(self) -> i64 {
+        self.expected_lifecycle_revision()
+            .checked_add(1)
+            .expect("validated lifecycle revision can advance once")
+    }
+
+    pub(crate) fn final_lifecycle_revision(self) -> i64 {
+        self.expected_lifecycle_revision()
+            .checked_add(2)
+            .expect("validated lifecycle revision can advance twice")
+    }
+
+    pub(crate) fn matches_transitioning_lifecycle(
+        self,
+        state_revision: u64,
+        kind: TransitionKind,
+        transition_id: PersistedLifecycleTransitionId,
+        expected_kid: PersistedLifecycleKeyId,
+        keyring_version: PersistedLifecycleKeyringVersion,
+        updated_at_micros: PersistedLifecycleTimestamp,
+    ) -> bool {
+        state_revision
+            == self
+                .metadata
+                .expected_lifecycle_revision
+                .checked_add(1)
+                .unwrap_or(u64::MAX)
+            && kind == TransitionKind::Retire
+            && transition_id.0 == self.metadata.transition_id
+            && expected_kid.0 == self.metadata.expected_active_kid
+            && keyring_version.0 == self.metadata.result_keyring_version
+            && updated_at_micros.0 == self.metadata.source_at_micros
+    }
+
+    pub(crate) fn matches_final_active_lifecycle(
+        self,
+        state_revision: u64,
+        expected_kid: PersistedLifecycleKeyId,
+        keyring_version: PersistedLifecycleKeyringVersion,
+        updated_at_micros: PersistedLifecycleTimestamp,
+    ) -> bool {
+        state_revision
+            == self
+                .metadata
+                .expected_lifecycle_revision
+                .checked_add(2)
+                .unwrap_or(u64::MAX)
+            && expected_kid.0 == self.metadata.expected_active_kid
+            && keyring_version.0 == self.metadata.result_keyring_version
+            && updated_at_micros.0 == self.metadata.source_at_micros
+    }
+
+    pub(crate) fn credential_version(self) -> i64 {
+        i64::try_from(self.metadata.credential_version)
+            .expect("validated credential version fits SQLite")
+    }
+
+    pub(crate) fn account_revision(self) -> i64 {
+        i64::try_from(self.metadata.account_revision)
+            .expect("validated account revision fits SQLite")
+    }
+
+    pub(crate) fn password_credential_revision(self) -> i64 {
+        i64::try_from(self.metadata.password_credential_revision)
+            .expect("validated password revision fits SQLite")
+    }
+
+    pub(crate) fn recovery_credential_revision(self) -> i64 {
+        i64::try_from(self.metadata.recovery_credential_revision)
+            .expect("validated recovery revision fits SQLite")
+    }
+}
+
+macro_rules! impl_key_transition_source_expectation {
+    ($type:ident, $kind:expr, $audit_action:literal) => {
+        impl KeyTransitionSourceExpectation for $type<'_> {
+            fn transition_kind(self) -> TransitionKind {
+                $kind
+            }
+
+            fn audit_action(self) -> &'static str {
+                $audit_action
+            }
+
+            fn transition_id(&self) -> &[u8; 16] {
+                $type::transition_id(*self)
+            }
+
+            fn owner_id(&self) -> &[u8; 16] {
+                $type::owner_id(*self)
+            }
+
+            fn audit_id(&self) -> &[u8; 16] {
+                $type::audit_id(*self)
+            }
+
+            fn expected_active_kid(&self) -> &str {
+                $type::expected_active_kid(*self)
+            }
+
+            fn expected_keyring_version(self) -> i64 {
+                $type::expected_keyring_version(self)
+            }
+
+            fn expected_key_activated_at_micros(self) -> i64 {
+                $type::expected_key_activated_at_micros(self)
+            }
+
+            fn expected_lifecycle_revision(self) -> i64 {
+                $type::expected_lifecycle_revision(self)
+            }
+
+            fn expected_lifecycle_updated_at_micros(self) -> i64 {
+                $type::expected_lifecycle_updated_at_micros(self)
+            }
+
+            fn matches_active_lifecycle(
+                self,
+                state_revision: u64,
+                expected_kid: PersistedLifecycleKeyId,
+                keyring_version: PersistedLifecycleKeyringVersion,
+                updated_at_micros: PersistedLifecycleTimestamp,
+            ) -> bool {
+                $type::matches_active_lifecycle(
+                    self,
+                    state_revision,
+                    expected_kid,
+                    keyring_version,
+                    updated_at_micros,
+                )
+            }
+
+            fn matches_owner_id(self, raw: &[u8]) -> bool {
+                $type::matches_owner_id(self, raw)
+            }
+
+            fn result_kid(&self) -> &str {
+                $type::result_kid(*self)
+            }
+
+            fn result_keyring_version(self) -> i64 {
+                $type::result_keyring_version(self)
+            }
+
+            fn source_at_micros(self) -> i64 {
+                $type::source_at_micros(self)
+            }
+
+            fn transitioning_lifecycle_revision(self) -> i64 {
+                $type::transitioning_lifecycle_revision(self)
+            }
+
+            fn final_lifecycle_revision(self) -> i64 {
+                $type::final_lifecycle_revision(self)
+            }
+
+            fn matches_transitioning_lifecycle(
+                self,
+                state_revision: u64,
+                kind: TransitionKind,
+                transition_id: PersistedLifecycleTransitionId,
+                expected_kid: PersistedLifecycleKeyId,
+                keyring_version: PersistedLifecycleKeyringVersion,
+                updated_at_micros: PersistedLifecycleTimestamp,
+            ) -> bool {
+                $type::matches_transitioning_lifecycle(
+                    self,
+                    state_revision,
+                    kind,
+                    transition_id,
+                    expected_kid,
+                    keyring_version,
+                    updated_at_micros,
+                )
+            }
+
+            fn matches_final_active_lifecycle(
+                self,
+                state_revision: u64,
+                expected_kid: PersistedLifecycleKeyId,
+                keyring_version: PersistedLifecycleKeyringVersion,
+                updated_at_micros: PersistedLifecycleTimestamp,
+            ) -> bool {
+                $type::matches_final_active_lifecycle(
+                    self,
+                    state_revision,
+                    expected_kid,
+                    keyring_version,
+                    updated_at_micros,
+                )
+            }
+
+            fn credential_version(self) -> i64 {
+                $type::credential_version(self)
+            }
+
+            fn account_revision(self) -> i64 {
+                $type::account_revision(self)
+            }
+
+            fn password_credential_revision(self) -> i64 {
+                $type::password_credential_revision(self)
+            }
+
+            fn recovery_credential_revision(self) -> i64 {
+                $type::recovery_credential_revision(self)
+            }
+        }
+    };
+}
+
+impl_key_transition_source_expectation!(
+    PlannedRotationSourceExpectation,
+    TransitionKind::Planned,
+    "key_planned"
+);
+impl_key_transition_source_expectation!(
+    RetireSourceExpectation,
+    TransitionKind::Retire,
+    "key_retired"
+);
+
 impl fmt::Debug for PlannedRotationMetadataV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("PlannedRotationMetadataV1([REDACTED])")
+    }
+}
+
+impl fmt::Debug for RetireMetadataV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RetireMetadataV1([REDACTED])")
+    }
+}
+
+impl fmt::Debug for RetireSourceExpectation<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RetireSourceExpectation([REDACTED])")
     }
 }
 
@@ -1416,6 +2213,23 @@ fn validate_planned_rotation_input(
         || input.source_at_micros.get() < input.key_activated_at_micros.get()
         || input.source_at_micros.get() < input.expected_lifecycle_updated_at_micros.get()
         || !is_positive_sqlite_integer(input.expected_lifecycle_revision)
+        || input.expected_lifecycle_revision > (i64::MAX as u64).saturating_sub(2)
+        || !is_positive_sqlite_integer(input.credential_version)
+        || !is_positive_sqlite_integer(input.account_revision)
+        || !is_positive_sqlite_integer(input.password_credential_revision)
+        || !is_positive_sqlite_integer(input.recovery_credential_revision)
+    {
+        return Err(TransitionContractError::InvalidMetadata);
+    }
+    Ok(())
+}
+
+fn validate_retire_input(input: &RetireMetadataInput) -> Result<(), TransitionContractError> {
+    if input.source_at_micros.get() == 0
+        || input.expected_lifecycle_updated_at_micros.get() == 0
+        || input.source_at_micros.get() < input.expected_lifecycle_updated_at_micros.get()
+        || !is_positive_sqlite_integer(input.expected_lifecycle_revision)
+        || input.expected_lifecycle_revision > (i64::MAX as u64).saturating_sub(2)
         || !is_positive_sqlite_integer(input.credential_version)
         || !is_positive_sqlite_integer(input.account_revision)
         || !is_positive_sqlite_integer(input.password_credential_revision)
@@ -1562,6 +2376,7 @@ pub(crate) enum TransitionContractError {
     InvalidLegacyPolicyProvenance,
     InvalidInitializationKeyring,
     InvalidPlannedRotationKeyring,
+    InvalidRetirementKeyring,
     InvalidMetadata,
     UnsupportedMetadataVersion,
     UnsupportedMetadataKind,
@@ -1582,6 +2397,7 @@ impl fmt::Display for TransitionContractError {
             Self::InvalidPlannedRotationKeyring => {
                 "authentication planned rotation keyring is invalid"
             }
+            Self::InvalidRetirementKeyring => "authentication retirement keyring is invalid",
             Self::InvalidMetadata => "authentication transition metadata is invalid",
             Self::UnsupportedMetadataVersion => {
                 "authentication transition metadata version is unsupported"
@@ -1606,11 +2422,12 @@ mod tests {
         INITIALIZE_METADATA_TAG, InitializationMetadataInput, InitializationMetadataV1,
         LegacyPolicyProvenance, LoginId, MAX_INITIALIZATION_METADATA_BYTES,
         METADATA_CHECKSUM_BYTES, METADATA_FIXED_HEADER_BYTES, METADATA_FORMAT_VERSION,
-        METADATA_MAGIC, NO_BLOCKLIST_CHECK_SENTINEL, PLANNED_ROTATION_METADATA_BYTES,
-        PREPARED_SENTINEL_NAME, PlannedRotationMetadataInput, PlannedRotationMetadataV1,
-        PlannedRotationPreparationV1, ReservationEntryName, STAGED_KEYRING_NAME,
-        SourceTimestampMicros, TRANSITION_METADATA_NAME, TopLevelArtifactName,
-        TransitionContractError, TransitionId, TransitionKind,
+        METADATA_MAGIC, NO_BLOCKLIST_CHECK_SENTINEL, PLANNED_METADATA_TAG,
+        PLANNED_ROTATION_METADATA_BYTES, PREPARED_SENTINEL_NAME, PlannedRotationMetadataInput,
+        PlannedRotationMetadataV1, PlannedRotationPreparationV1, RETIRE_METADATA_BYTES,
+        RETIRE_METADATA_TAG, ReservationEntryName, RetireMetadataInput, RetireMetadataV1,
+        RetirePreparationV1, STAGED_KEYRING_NAME, SourceTimestampMicros, TRANSITION_METADATA_NAME,
+        TopLevelArtifactName, TransitionContractError, TransitionId, TransitionKind,
     };
     use crate::auth::{
         SecretBytes, ValidatedVerifier,
@@ -1624,6 +2441,7 @@ mod tests {
     const OTHER_UUID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
     const ACTIVE_AT: u64 = 1_700_000_000_000_000;
     const ROTATED_AT: u64 = ACTIVE_AT + 90 * 24 * 60 * 60 * 1_000_000;
+    const RETIRE_AT: u64 = ROTATED_AT + 11 * 60 * 1_000_000;
     const RFC8032_SEED_ONE: [u8; 32] = [
         0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
         0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
@@ -1709,6 +2527,38 @@ mod tests {
             .expect("fixed planned rotation");
         PlannedRotationPreparationV1::from_keyrings(planned_input(), &current, rotated)
             .expect("planned preparation")
+    }
+
+    fn retire_current_keyring() -> Keyring {
+        Keyring::from_test_seeds(
+            2,
+            ROTATED_AT,
+            RFC8032_SEED_TWO,
+            Some((ACTIVE_AT, RFC8032_SEED_ONE)),
+        )
+        .expect("fixed overlap keyring")
+    }
+
+    fn retire_input() -> RetireMetadataInput {
+        RetireMetadataInput {
+            transition_id: transition_id(),
+            owner_id: owner_id(),
+            audit_id: audit_id(),
+            source_at_micros: SourceTimestampMicros::new(RETIRE_AT)
+                .expect("retire source timestamp"),
+            expected_lifecycle_revision: 4,
+            expected_lifecycle_updated_at_micros: SourceTimestampMicros::new(ROTATED_AT + 1)
+                .expect("lifecycle timestamp"),
+            credential_version: 1,
+            account_revision: 1,
+            password_credential_revision: 1,
+            recovery_credential_revision: 1,
+        }
+    }
+
+    fn retire_preparation() -> RetirePreparationV1 {
+        RetirePreparationV1::from_current_keyring(retire_input(), &retire_current_keyring())
+            .expect("retire preparation")
     }
 
     #[test]
@@ -2067,6 +2917,167 @@ mod tests {
              PlannedRotationSourceExpectation([REDACTED])"
         );
         assert!(!debug.contains(keyring().active_kid().as_str()));
+        assert!(!debug.contains(TRANSITION_UUID));
+    }
+
+    #[test]
+    fn retire_metadata_round_trips_and_binds_current_and_staged_keyrings() {
+        let preparation = retire_preparation();
+        assert_eq!(
+            preparation.transition_artifact(),
+            TopLevelArtifactName::Transition {
+                kind: TransitionKind::Retire,
+                id: transition_id()
+            }
+        );
+        let encoded = preparation
+            .encoded_metadata()
+            .expect("encode retire metadata");
+        let staged = preparation.staged_keyring_bytes().to_vec();
+        assert_eq!(encoded.expose_secret().len(), RETIRE_METADATA_BYTES);
+        assert_eq!(encoded.expose_secret()[14], RETIRE_METADATA_TAG);
+        assert_eq!(staged.len(), ACTIVE_ONLY_LENGTH);
+        drop(preparation);
+
+        let metadata = RetireMetadataV1::decode(SecretBytes::new(encoded.expose_secret().to_vec()))
+            .expect("recover retire metadata");
+        let current = retire_current_keyring();
+        let current_bytes = current.encode().expose_secret().to_vec();
+        let recovered_current = metadata
+            .validate_current_keyring(SecretBytes::new(current_bytes))
+            .expect("recover exact current keyring");
+        let recovered_staged = metadata
+            .validate_staged_keyring(SecretBytes::new(staged))
+            .expect("recover exact staged keyring");
+        let expectation = metadata.source_expectation();
+
+        assert_eq!(recovered_current.version().get(), 2);
+        assert!(recovered_current.verify_only_facts().is_some());
+        assert_eq!(recovered_staged.version().get(), 3);
+        assert!(recovered_staged.verify_only_facts().is_none());
+        assert_eq!(
+            recovered_staged.active_kid(),
+            recovered_current.active_kid()
+        );
+        assert_eq!(
+            recovered_staged.active_activated_at(),
+            recovered_current.active_activated_at()
+        );
+        assert_eq!(expectation.transition_id(), transition_id().as_bytes());
+        assert_eq!(expectation.owner_id(), owner_id().as_bytes());
+        assert_eq!(expectation.audit_id(), audit_id().as_bytes());
+        assert_eq!(
+            expectation.expected_active_kid(),
+            current.active_kid().as_str()
+        );
+        assert_eq!(expectation.expected_keyring_version(), 2);
+        assert_eq!(expectation.expected_lifecycle_revision(), 4);
+        assert_eq!(expectation.result_kid(), current.active_kid().as_str());
+        assert_eq!(expectation.result_keyring_version(), 3);
+        assert_eq!(expectation.source_at_micros(), RETIRE_AT as i64);
+        assert_eq!(
+            metadata.encode().unwrap().expose_secret(),
+            encoded.expose_secret()
+        );
+    }
+
+    #[test]
+    fn retire_metadata_rejects_early_corrupt_unrelated_and_replayed_state() {
+        let preparation = retire_preparation();
+        let canonical = preparation
+            .encoded_metadata()
+            .expect("retire metadata")
+            .expose_secret()
+            .to_vec();
+        let staged = preparation.staged_keyring_bytes().to_vec();
+        let current = retire_current_keyring().encode().expose_secret().to_vec();
+
+        for length in 0..canonical.len() {
+            assert!(
+                RetireMetadataV1::decode(SecretBytes::new(canonical[..length].to_vec())).is_err(),
+                "truncation {length} must fail"
+            );
+        }
+        let mut appended = canonical.clone();
+        appended.push(0);
+        assert!(RetireMetadataV1::decode(SecretBytes::new(appended)).is_err());
+
+        let mut wrong_kind = canonical.clone();
+        wrong_kind[14] = PLANNED_METADATA_TAG;
+        refresh_metadata_checksum(&mut wrong_kind);
+        assert_eq!(
+            RetireMetadataV1::decode(SecretBytes::new(wrong_kind)).unwrap_err(),
+            TransitionContractError::UnsupportedMetadataKind
+        );
+
+        for (offset, value) in [
+            (181_usize, 0_u64),
+            (205, 2),
+            (285, 0),
+            (293, 0),
+            (301, 0),
+            (309, 0),
+        ] {
+            let mut invalid = canonical.clone();
+            invalid[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
+            refresh_metadata_checksum(&mut invalid);
+            assert!(
+                RetireMetadataV1::decode(SecretBytes::new(invalid)).is_err(),
+                "semantic corruption at {offset} must fail"
+            );
+        }
+
+        let metadata =
+            RetireMetadataV1::decode(SecretBytes::new(canonical)).expect("retire metadata");
+        let mut changed_current = current;
+        changed_current[30] ^= 1;
+        assert_eq!(
+            metadata
+                .validate_current_keyring(SecretBytes::new(changed_current))
+                .unwrap_err(),
+            TransitionContractError::InvalidRetirementKeyring
+        );
+        let mut changed_staged = staged;
+        changed_staged[30] ^= 1;
+        assert_eq!(
+            metadata
+                .validate_staged_keyring(SecretBytes::new(changed_staged))
+                .unwrap_err(),
+            TransitionContractError::InvalidRetirementKeyring
+        );
+
+        let active_only = keyring();
+        assert_eq!(
+            RetirePreparationV1::from_current_keyring(retire_input(), &active_only).unwrap_err(),
+            TransitionContractError::InvalidRetirementKeyring
+        );
+        let mut early = retire_input();
+        early.source_at_micros =
+            SourceTimestampMicros::new(RETIRE_AT - 1).expect("early timestamp");
+        assert_eq!(
+            RetirePreparationV1::from_current_keyring(early, &retire_current_keyring())
+                .unwrap_err(),
+            TransitionContractError::InvalidRetirementKeyring
+        );
+    }
+
+    #[test]
+    fn retire_metadata_and_expectation_debug_are_redacted() {
+        let preparation = retire_preparation();
+        let metadata =
+            RetireMetadataV1::decode(preparation.encoded_metadata().expect("metadata bytes"))
+                .expect("metadata");
+        let debug = format!(
+            "{preparation:?} {metadata:?} {:?}",
+            metadata.source_expectation()
+        );
+        assert_eq!(
+            debug,
+            "RetirePreparationV1([REDACTED]) \
+             RetireMetadataV1([REDACTED]) \
+             RetireSourceExpectation([REDACTED])"
+        );
+        assert!(!debug.contains(retire_current_keyring().active_kid().as_str()));
         assert!(!debug.contains(TRANSITION_UUID));
     }
 

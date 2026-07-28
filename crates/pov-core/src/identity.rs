@@ -51,6 +51,10 @@ public_id!(CorrelationId);
 pub struct OwnerId(Uuid);
 
 impl OwnerId {
+    pub(crate) const fn from_verified_uuid(value: Uuid) -> Self {
+        Self(value)
+    }
+
     #[cfg(test)]
     pub(crate) const fn synthetic(value: u128) -> Self {
         Self(Uuid::from_u128(value))
@@ -79,7 +83,6 @@ pub struct VerifiedAuthContext {
 }
 
 impl VerifiedAuthContext {
-    #[cfg(test)]
     pub(crate) const fn from_verified_owner(owner_id: OwnerId) -> Self {
         Self { owner_id }
     }

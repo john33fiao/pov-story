@@ -36,12 +36,14 @@ use crate::storage::{
     AuthActiveLifecycleFacts, AuthConversationStoreBinding, AuthDatabaseLifecycleObservation,
     AuthDatabaseReconciliationObservation, AuthInitializationFinalLifecycleMutationOutcome,
     AuthInitializationSourceMatch, AuthInitializationSourceMutationOutcome,
-    AuthPlannedRotationDatabaseObservation, AuthPlannedRotationSourceMatch, AuthStorePoisonHandle,
-    ConversationStore, SqliteStore, StoreDirectoryIdentity,
+    AuthPlannedRotationDatabaseObservation, AuthPlannedRotationFinalLifecycleMutationOutcome,
+    AuthPlannedRotationSourceMatch, AuthPlannedRotationSourceMutationOutcome,
+    AuthStorePoisonHandle, ConversationStore, SqliteStore, StoreDirectoryIdentity,
 };
 #[cfg(test)]
 use crate::storage::{
     AuthInitializationFinalLifecycleMutationTestFault, AuthInitializationSourceMutationTestFault,
+    AuthPlannedRotationFinalLifecycleMutationTestFault, AuthPlannedRotationSourceMutationTestFault,
 };
 
 use super::{
@@ -51,7 +53,8 @@ use super::{
         ACTIVE_KEYRING_NAME, AUTH_MAINTENANCE_LOCK_NAME as AUTH_LOCK_FILE_NAME,
         InitializationMetadataV1, InitializationPreparationV1, MAX_INITIALIZATION_METADATA_BYTES,
         PlannedRotationMetadataV1, PlannedRotationPreparationV1, PlannedRotationSourceExpectation,
-        ReservationEntryName, TopLevelArtifactName, TransitionId, TransitionKind,
+        ReservationEntryName, RetireMetadataV1, RetirePreparationV1, TopLevelArtifactName,
+        TransitionId, TransitionKind,
     },
 };
 
@@ -586,6 +589,125 @@ impl LockedAuthInstance {
         self.revalidate()?;
         Ok(AuthPlannedRotationPersistenceOutcome::Persisted)
     }
+
+    fn persist_retire_preparation(
+        &self,
+        preparation: &RetirePreparationV1,
+        #[cfg(test)] fault: Option<AuthRetirePrepareTestFault>,
+    ) -> Result<AuthRetirePersistenceOutcome, SecretFsError> {
+        let artifact = preparation.transition_artifact();
+        let reservation_name = artifact.format();
+        if TopLevelArtifactName::parse(reservation_name.as_bytes()) != Ok(artifact) {
+            return Err(SecretFsError::UnsafeAuthArtifact);
+        }
+
+        let immediate_namespace = self.capture_secret_artifacts()?;
+        immediate_namespace.revalidate(&self.layout.secret_fd)?;
+        self.revalidate()?;
+        let ready = immediate_namespace.is_terminal_active_namespace()
+            && immediate_namespace
+                .active_file()
+                .is_some_and(|active| active.content.expose().len() == WITH_VERIFY_ONLY_LENGTH);
+        if !ready {
+            return Ok(AuthRetirePersistenceOutcome::PreconditionNotReady);
+        }
+
+        mkdirat(
+            &self.layout.secret_fd,
+            reservation_name.as_str(),
+            Mode::RWXU,
+        )
+        .map_err(map_creation_errno)?;
+        let reservation_fd = openat(
+            &self.layout.secret_fd,
+            reservation_name.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(map_artifact_errno)?;
+        ensure_cloexec(&reservation_fd)?;
+        let reservation_stat = validate_reservation_directory_fd(&reservation_fd)?;
+        let reservation_path_stat = validate_reservation_directory_stat(
+            &statat(
+                &self.layout.secret_fd,
+                reservation_name.as_str(),
+                AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(map_artifact_errno)?,
+        )?;
+        if reservation_stat != reservation_path_stat {
+            return Err(SecretFsError::ArtifactChanged);
+        }
+        fsync(&reservation_fd).map_err(SecretFsError::errno)?;
+        fsync(&self.layout.secret_fd).map_err(SecretFsError::errno)?;
+        self.revalidate()?;
+        revalidate_created_reservation(
+            &self.layout.secret_fd,
+            &reservation_fd,
+            reservation_name.as_str(),
+            reservation_stat.identity,
+        )?;
+        #[cfg(test)]
+        if fault == Some(AuthRetirePrepareTestFault::Reservation) {
+            return Err(SecretFsError::Io(io::ErrorKind::Other));
+        }
+
+        let encoded_metadata = preparation
+            .encoded_metadata()
+            .map_err(|_| SecretFsError::UnsafeAuthArtifact)?;
+        persist_new_known_file(
+            &reservation_fd,
+            ReservationEntryName::Metadata.as_str(),
+            KnownFilePurpose::Metadata,
+            encoded_metadata.expose_secret(),
+        )?;
+        revalidate_created_reservation(
+            &self.layout.secret_fd,
+            &reservation_fd,
+            reservation_name.as_str(),
+            reservation_stat.identity,
+        )?;
+        #[cfg(test)]
+        if fault == Some(AuthRetirePrepareTestFault::Metadata) {
+            return Err(SecretFsError::Io(io::ErrorKind::Other));
+        }
+
+        persist_new_known_file(
+            &reservation_fd,
+            ReservationEntryName::StagedKeyring.as_str(),
+            KnownFilePurpose::StagedKeyring,
+            preparation.staged_keyring_bytes(),
+        )?;
+        revalidate_created_reservation(
+            &self.layout.secret_fd,
+            &reservation_fd,
+            reservation_name.as_str(),
+            reservation_stat.identity,
+        )?;
+        #[cfg(test)]
+        if fault == Some(AuthRetirePrepareTestFault::Staged) {
+            return Err(SecretFsError::Io(io::ErrorKind::Other));
+        }
+
+        persist_new_known_file(
+            &reservation_fd,
+            ReservationEntryName::Prepared.as_str(),
+            KnownFilePurpose::Prepared,
+            &[],
+        )?;
+        revalidate_created_reservation(
+            &self.layout.secret_fd,
+            &reservation_fd,
+            reservation_name.as_str(),
+            reservation_stat.identity,
+        )?;
+        #[cfg(test)]
+        if fault == Some(AuthRetirePrepareTestFault::Prepared) {
+            return Err(SecretFsError::Io(io::ErrorKind::Other));
+        }
+        self.revalidate()?;
+        Ok(AuthRetirePersistenceOutcome::Persisted)
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -598,6 +720,12 @@ enum AuthInitializationPersistenceOutcome {
 enum AuthPlannedRotationPersistenceOutcome {
     Persisted,
     PreconditionNotClean,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AuthRetirePersistenceOutcome {
+    Persisted,
+    PreconditionNotReady,
 }
 
 struct PinnedAuthArtifactSnapshot {
@@ -767,6 +895,38 @@ impl PinnedAuthArtifactSnapshot {
         PlannedRotationMetadataV1::decode(SecretBytes::from_zeroizing(copy)).ok()
     }
 
+    fn decode_retire_metadata(&self) -> Option<RetireMetadataV1> {
+        let reservation = self.observations.iter().find_map(|entry| match entry {
+            PinnedTopLevelArtifact::Transition { directory, .. }
+            | PinnedTopLevelArtifact::Cleanup { directory, .. }
+                if matches!(
+                    directory.artifact,
+                    TopLevelArtifactName::Transition {
+                        kind: TransitionKind::Retire,
+                        ..
+                    } | TopLevelArtifactName::Cleanup {
+                        kind: TransitionKind::Retire,
+                        ..
+                    }
+                ) =>
+            {
+                Some(directory)
+            }
+            _ => None,
+        })?;
+        let file = reservation.entries.iter().find_map(|entry| match entry {
+            PinnedReservationEntry::Metadata {
+                file,
+                codec: CodecObservation::Valid,
+                ..
+            } => Some(file),
+            _ => None,
+        })?;
+        let mut copy = Zeroizing::new(Vec::with_capacity(file.content.expose().len()));
+        copy.extend_from_slice(file.content.expose());
+        RetireMetadataV1::decode(SecretBytes::from_zeroizing(copy)).ok()
+    }
+
     fn reconcile_planned_rotation(
         &self,
         database: AuthPlannedRotationDatabaseObservation,
@@ -782,20 +942,35 @@ impl PinnedAuthArtifactSnapshot {
                 AuthPlannedRotationBlocker::InconsistentDbFilesystem,
             );
         }
-        let AuthDatabaseLifecycleObservation::Active(lifecycle) = database.lifecycle else {
-            return AuthPlannedRotationReconciliation::Blocked(
-                AuthPlannedRotationBlocker::UnsupportedLifecycleState,
-            );
+        let _lifecycle = match database.lifecycle {
+            AuthDatabaseLifecycleObservation::Active(lifecycle)
+                if self.active_matches_current_lifecycle(lifecycle)
+                    && self.install_file().is_none()
+                    && self.cleanup_directory().is_none() =>
+            {
+                lifecycle
+            }
+            AuthDatabaseLifecycleObservation::Active(lifecycle) => {
+                return self.reconcile_planned_rotation_final_active(
+                    database.source,
+                    lifecycle,
+                    metadata,
+                );
+            }
+            AuthDatabaseLifecycleObservation::Transitioning(lifecycle) => {
+                return self.reconcile_planned_rotation_transitioning(
+                    database.source,
+                    lifecycle,
+                    metadata,
+                );
+            }
+            AuthDatabaseLifecycleObservation::CleanUninitialized
+            | AuthDatabaseLifecycleObservation::Initializing(_) => {
+                return AuthPlannedRotationReconciliation::Blocked(
+                    AuthPlannedRotationBlocker::UnsupportedLifecycleState,
+                );
+            }
         };
-        if !self.active_matches_current_lifecycle(lifecycle)
-            || self.install_file().is_some()
-            || self.cleanup_directory().is_some()
-        {
-            return AuthPlannedRotationReconciliation::Blocked(
-                AuthPlannedRotationBlocker::InconsistentDbFilesystem,
-            );
-        }
-
         let Some(reservation) = self.transition_directory() else {
             if database.source == AuthPlannedRotationSourceMatch::Canonical
                 && metadata.is_none()
@@ -882,6 +1057,597 @@ impl PinnedAuthArtifactSnapshot {
             AuthPlannedRotationRecovery::RollbackOnlyCandidate
         };
         AuthPlannedRotationReconciliation::PlannedPreSource { phase, recovery }
+    }
+
+    fn reconcile_retire(
+        &self,
+        database: AuthPlannedRotationDatabaseObservation,
+        metadata: Option<&RetireMetadataV1>,
+    ) -> AuthRetireReconciliation {
+        if self.has_unrecognized_artifacts() {
+            return AuthRetireReconciliation::Blocked(AuthRetireBlocker::UnrecognizedArtifacts);
+        }
+        if !self.namespace.is_valid {
+            return AuthRetireReconciliation::Blocked(AuthRetireBlocker::InconsistentDbFilesystem);
+        }
+        let lifecycle = match database.lifecycle {
+            AuthDatabaseLifecycleObservation::Active(lifecycle)
+                if self.active_matches_any_lifecycle(lifecycle)
+                    && self.active_file().is_some_and(|active| {
+                        active.content.expose().len() == WITH_VERIFY_ONLY_LENGTH
+                    })
+                    && self.install_file().is_none()
+                    && self.cleanup_directory().is_none() =>
+            {
+                lifecycle
+            }
+            AuthDatabaseLifecycleObservation::Active(lifecycle) => {
+                return self.reconcile_retire_final_active(database.source, lifecycle, metadata);
+            }
+            AuthDatabaseLifecycleObservation::Transitioning(lifecycle) => {
+                return self.reconcile_retire_transitioning(database.source, lifecycle, metadata);
+            }
+            AuthDatabaseLifecycleObservation::CleanUninitialized
+            | AuthDatabaseLifecycleObservation::Initializing(_) => {
+                return AuthRetireReconciliation::Blocked(
+                    AuthRetireBlocker::UnsupportedLifecycleState,
+                );
+            }
+        };
+
+        let Some(reservation) = self.transition_directory() else {
+            if database.source != AuthPlannedRotationSourceMatch::Canonical
+                || metadata.is_some()
+                || !self.is_terminal_active_namespace()
+            {
+                return AuthRetireReconciliation::Blocked(
+                    AuthRetireBlocker::InconsistentDbFilesystem,
+                );
+            }
+            let Some(active) = self.active_file() else {
+                return AuthRetireReconciliation::Blocked(
+                    AuthRetireBlocker::InconsistentDbFilesystem,
+                );
+            };
+            return match active.content.expose().len() {
+                ACTIVE_ONLY_LENGTH => AuthRetireReconciliation::CleanActiveOnly,
+                WITH_VERIFY_ONLY_LENGTH if self.active_matches_any_lifecycle(lifecycle) => {
+                    AuthRetireReconciliation::ReadyToRetire
+                }
+                _ => AuthRetireReconciliation::Blocked(AuthRetireBlocker::InconsistentDbFilesystem),
+            };
+        };
+        if !matches!(
+            reservation.artifact,
+            TopLevelArtifactName::Transition {
+                kind: TransitionKind::Retire,
+                ..
+            }
+        ) {
+            return AuthRetireReconciliation::Blocked(AuthRetireBlocker::UnsupportedLifecycleState);
+        }
+        let parts = RetainedReservationParts::from_directory(reservation);
+        let phase = match (
+            parts.metadata.map(|(_, codec)| codec),
+            parts.staged.map(|(_, codec)| codec),
+            parts.prepared,
+        ) {
+            (None, None, None) => AuthRetirePreSourcePhase::ReservationOnly,
+            (Some(CodecObservation::Incomplete), None, None) => {
+                AuthRetirePreSourcePhase::MetadataIncomplete
+            }
+            (Some(CodecObservation::Valid), None, None) => {
+                AuthRetirePreSourcePhase::MetadataComplete
+            }
+            (Some(CodecObservation::Valid), Some(CodecObservation::Incomplete), None) => {
+                AuthRetirePreSourcePhase::StagedIncomplete
+            }
+            (Some(CodecObservation::Valid), Some(CodecObservation::Valid), None)
+                if reservation.linkage == SemanticLinkageObservation::Consistent =>
+            {
+                AuthRetirePreSourcePhase::StagedComplete
+            }
+            (Some(CodecObservation::Valid), Some(CodecObservation::Valid), Some(_))
+                if reservation.linkage == SemanticLinkageObservation::Consistent =>
+            {
+                AuthRetirePreSourcePhase::Prepared
+            }
+            _ => {
+                return AuthRetireReconciliation::Blocked(
+                    AuthRetireBlocker::InconsistentDbFilesystem,
+                );
+            }
+        };
+
+        let metadata_complete = !matches!(
+            phase,
+            AuthRetirePreSourcePhase::ReservationOnly
+                | AuthRetirePreSourcePhase::MetadataIncomplete
+        );
+        if metadata_complete {
+            if database.source != AuthPlannedRotationSourceMatch::Exact
+                || metadata.is_none()
+                || !metadata.is_some_and(|metadata| self.active_matches_retire_metadata(metadata))
+            {
+                return AuthRetireReconciliation::Blocked(
+                    AuthRetireBlocker::InconsistentDbFilesystem,
+                );
+            }
+        } else if database.source != AuthPlannedRotationSourceMatch::Canonical || metadata.is_some()
+        {
+            return AuthRetireReconciliation::Blocked(AuthRetireBlocker::InconsistentDbFilesystem);
+        }
+
+        let recovery = if matches!(
+            phase,
+            AuthRetirePreSourcePhase::StagedComplete | AuthRetirePreSourcePhase::Prepared
+        ) {
+            AuthRetireRecovery::ResumeOrRollbackCandidate
+        } else {
+            AuthRetireRecovery::RollbackOnlyCandidate
+        };
+        AuthRetireReconciliation::RetirePreSource { phase, recovery }
+    }
+
+    fn reconcile_retire_transitioning(
+        &self,
+        source: AuthPlannedRotationSourceMatch,
+        lifecycle: crate::storage::AuthTransitioningLifecycleFacts,
+        metadata: Option<&RetireMetadataV1>,
+    ) -> AuthRetireReconciliation {
+        let Some(metadata) = metadata else {
+            return AuthRetireReconciliation::Blocked(AuthRetireBlocker::InconsistentDbFilesystem);
+        };
+        let expectation = metadata.source_expectation();
+        if source != AuthPlannedRotationSourceMatch::Exact
+            || !expectation.matches_transitioning_lifecycle(
+                lifecycle.state_revision,
+                lifecycle.kind,
+                lifecycle.transition_id,
+                lifecycle.expected_kid,
+                lifecycle.keyring_version,
+                lifecycle.updated_at_micros,
+            )
+            || self.cleanup_directory().is_some()
+        {
+            return AuthRetireReconciliation::Blocked(AuthRetireBlocker::InconsistentDbFilesystem);
+        }
+        let Some(reservation) = self.transition_directory() else {
+            return AuthRetireReconciliation::Blocked(AuthRetireBlocker::InconsistentDbFilesystem);
+        };
+        if !metadata.matches_reservation_artifact(reservation.artifact) {
+            return AuthRetireReconciliation::Blocked(AuthRetireBlocker::InconsistentDbFilesystem);
+        }
+        let parts = RetainedReservationParts::from_directory(reservation);
+        let Some((staged, CodecObservation::Valid)) = parts.staged else {
+            return AuthRetireReconciliation::Blocked(AuthRetireBlocker::InconsistentDbFilesystem);
+        };
+        if !matches!(parts.metadata, Some((_, CodecObservation::Valid)))
+            || parts.prepared.is_none()
+            || reservation.linkage != SemanticLinkageObservation::Consistent
+        {
+            return AuthRetireReconciliation::Blocked(AuthRetireBlocker::InconsistentDbFilesystem);
+        }
+
+        let Some(active) = self.active_file() else {
+            return AuthRetireReconciliation::Blocked(AuthRetireBlocker::InconsistentDbFilesystem);
+        };
+        let active_is_old = metadata
+            .validate_current_keyring(SecretBytes::new(active.content.expose().to_vec()))
+            .is_ok();
+        let active_is_new = active.content.expose() == staged.content.expose()
+            && metadata
+                .validate_staged_keyring(SecretBytes::new(active.content.expose().to_vec()))
+                .is_ok();
+        match (active_is_old, active_is_new, self.install_file()) {
+            (true, false, None) => AuthRetireReconciliation::RetireForwardOnly(
+                AuthRetireForwardPhase::AwaitingInstallTemp,
+            ),
+            (true, false, Some(install)) => {
+                let install_bytes = install.content.expose();
+                let staged_bytes = staged.content.expose();
+                if install_bytes == staged_bytes {
+                    AuthRetireReconciliation::RetireForwardOnly(
+                        AuthRetireForwardPhase::InstallTempExact,
+                    )
+                } else if install_bytes.len() < staged_bytes.len()
+                    && staged_bytes.starts_with(install_bytes)
+                {
+                    AuthRetireReconciliation::RetireForwardOnly(
+                        AuthRetireForwardPhase::InstallTempPrefix,
+                    )
+                } else {
+                    AuthRetireReconciliation::Blocked(AuthRetireBlocker::InconsistentDbFilesystem)
+                }
+            }
+            (false, true, Some(install))
+                if metadata
+                    .validate_current_keyring(SecretBytes::new(install.content.expose().to_vec()))
+                    .is_ok() =>
+            {
+                AuthRetireReconciliation::RetireForwardOnly(
+                    AuthRetireForwardPhase::AwaitingOldActiveTempRemoval,
+                )
+            }
+            (false, true, None) => AuthRetireReconciliation::RetireForwardOnly(
+                AuthRetireForwardPhase::AwaitingFinalDbCas,
+            ),
+            _ => AuthRetireReconciliation::Blocked(AuthRetireBlocker::InconsistentDbFilesystem),
+        }
+    }
+
+    fn reconcile_retire_final_active(
+        &self,
+        source: AuthPlannedRotationSourceMatch,
+        lifecycle: AuthActiveLifecycleFacts,
+        metadata: Option<&RetireMetadataV1>,
+    ) -> AuthRetireReconciliation {
+        if self.install_file().is_some() {
+            return AuthRetireReconciliation::Blocked(AuthRetireBlocker::InconsistentDbFilesystem);
+        }
+
+        match (self.transition_directory(), self.cleanup_directory()) {
+            (Some(reservation), None) => {
+                let Some(metadata) = metadata else {
+                    return AuthRetireReconciliation::Blocked(
+                        AuthRetireBlocker::InconsistentDbFilesystem,
+                    );
+                };
+                let expectation = metadata.source_expectation();
+                let parts = RetainedReservationParts::from_directory(reservation);
+                if source == AuthPlannedRotationSourceMatch::Exact
+                    && expectation.matches_final_active_lifecycle(
+                        lifecycle.state_revision,
+                        lifecycle.expected_kid,
+                        lifecycle.keyring_version,
+                        lifecycle.updated_at_micros,
+                    )
+                    && metadata.matches_reservation_artifact(reservation.artifact)
+                    && matches!(parts.metadata, Some((_, CodecObservation::Valid)))
+                    && matches!(parts.staged, Some((_, CodecObservation::Valid)))
+                    && parts.prepared.is_some()
+                    && reservation.linkage == SemanticLinkageObservation::Consistent
+                    && self.active_matches_retire_result_metadata(metadata)
+                {
+                    AuthRetireReconciliation::RetireForwardOnly(
+                        AuthRetireForwardPhase::AwaitingCleanupRename,
+                    )
+                } else {
+                    AuthRetireReconciliation::Blocked(AuthRetireBlocker::InconsistentDbFilesystem)
+                }
+            }
+            (None, Some(cleanup)) => {
+                self.reconcile_retire_cleanup(source, lifecycle, metadata, cleanup)
+            }
+            (None, None)
+                if source == AuthPlannedRotationSourceMatch::Canonical
+                    && metadata.is_none()
+                    && self.is_terminal_active_namespace()
+                    && self.active_matches_retire_lifecycle(lifecycle) =>
+            {
+                AuthRetireReconciliation::CleanActiveOnly
+            }
+            _ => AuthRetireReconciliation::Blocked(AuthRetireBlocker::InconsistentDbFilesystem),
+        }
+    }
+
+    fn reconcile_retire_cleanup(
+        &self,
+        source: AuthPlannedRotationSourceMatch,
+        lifecycle: AuthActiveLifecycleFacts,
+        metadata: Option<&RetireMetadataV1>,
+        cleanup: &PinnedReservationDirectory,
+    ) -> AuthRetireReconciliation {
+        let TopLevelArtifactName::Cleanup {
+            kind: TransitionKind::Retire,
+            ..
+        } = cleanup.artifact
+        else {
+            return AuthRetireReconciliation::Blocked(AuthRetireBlocker::UnsupportedLifecycleState);
+        };
+        let parts = RetainedReservationParts::from_directory(cleanup);
+        let exact_final = |metadata: &RetireMetadataV1| {
+            metadata.matches_reservation_artifact(cleanup.artifact)
+                && metadata
+                    .source_expectation()
+                    .matches_final_active_lifecycle(
+                        lifecycle.state_revision,
+                        lifecycle.expected_kid,
+                        lifecycle.keyring_version,
+                        lifecycle.updated_at_micros,
+                    )
+                && self.active_matches_retire_result_metadata(metadata)
+        };
+        match (parts.metadata, parts.staged, parts.prepared) {
+            (Some((_, CodecObservation::Valid)), Some((_, CodecObservation::Valid)), Some(_))
+                if source == AuthPlannedRotationSourceMatch::Exact
+                    && metadata.is_some_and(exact_final)
+                    && cleanup.linkage == SemanticLinkageObservation::Consistent =>
+            {
+                AuthRetireReconciliation::RetireForwardOnly(
+                    AuthRetireForwardPhase::AwaitingCleanupStagedRemoval,
+                )
+            }
+            (Some((_, CodecObservation::Valid)), None, Some(_))
+                if source == AuthPlannedRotationSourceMatch::Exact
+                    && metadata.is_some_and(exact_final) =>
+            {
+                AuthRetireReconciliation::RetireForwardOnly(
+                    AuthRetireForwardPhase::AwaitingCleanupPreparedRemoval,
+                )
+            }
+            (Some((_, CodecObservation::Valid)), None, None)
+                if source == AuthPlannedRotationSourceMatch::Exact
+                    && metadata.is_some_and(exact_final) =>
+            {
+                AuthRetireReconciliation::RetireForwardOnly(
+                    AuthRetireForwardPhase::AwaitingCleanupMetadataRemoval,
+                )
+            }
+            (None, None, None)
+                if source == AuthPlannedRotationSourceMatch::Canonical
+                    && metadata.is_none()
+                    && self.active_matches_retire_lifecycle(lifecycle) =>
+            {
+                AuthRetireReconciliation::RetireForwardOnly(
+                    AuthRetireForwardPhase::AwaitingCleanupDirectoryRemoval,
+                )
+            }
+            _ => AuthRetireReconciliation::Blocked(AuthRetireBlocker::InconsistentDbFilesystem),
+        }
+    }
+
+    fn reconcile_planned_rotation_transitioning(
+        &self,
+        source: AuthPlannedRotationSourceMatch,
+        lifecycle: crate::storage::AuthTransitioningLifecycleFacts,
+        metadata: Option<&PlannedRotationMetadataV1>,
+    ) -> AuthPlannedRotationReconciliation {
+        let Some(metadata) = metadata else {
+            return AuthPlannedRotationReconciliation::Blocked(
+                AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+            );
+        };
+        let expectation = metadata.source_expectation();
+        if source != AuthPlannedRotationSourceMatch::Exact
+            || !expectation.matches_transitioning_lifecycle(
+                lifecycle.state_revision,
+                lifecycle.kind,
+                lifecycle.transition_id,
+                lifecycle.expected_kid,
+                lifecycle.keyring_version,
+                lifecycle.updated_at_micros,
+            )
+            || self.cleanup_directory().is_some()
+        {
+            return AuthPlannedRotationReconciliation::Blocked(
+                AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+            );
+        }
+        let Some(reservation) = self.transition_directory() else {
+            return AuthPlannedRotationReconciliation::Blocked(
+                AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+            );
+        };
+        if !metadata.matches_reservation_artifact(reservation.artifact) {
+            return AuthPlannedRotationReconciliation::Blocked(
+                AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+            );
+        }
+        let parts = RetainedReservationParts::from_directory(reservation);
+        let Some((staged, CodecObservation::Valid)) = parts.staged else {
+            return AuthPlannedRotationReconciliation::Blocked(
+                AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+            );
+        };
+        if !matches!(parts.metadata, Some((_, CodecObservation::Valid)))
+            || parts.prepared.is_none()
+            || reservation.linkage != SemanticLinkageObservation::Consistent
+        {
+            return AuthPlannedRotationReconciliation::Blocked(
+                AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+            );
+        }
+
+        let Some(active) = self.active_file() else {
+            return AuthPlannedRotationReconciliation::Blocked(
+                AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+            );
+        };
+        let active_is_old = self.active_matches_planned_expectation(expectation);
+        let active_is_new = active.content.expose() == staged.content.expose()
+            && metadata
+                .validate_staged_keyring(SecretBytes::new(active.content.expose().to_vec()))
+                .is_ok();
+        match (active_is_old, active_is_new, self.install_file()) {
+            (true, false, None) => AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                AuthPlannedRotationForwardPhase::AwaitingInstallTemp,
+            ),
+            (true, false, Some(install)) => {
+                let install_bytes = install.content.expose();
+                let staged_bytes = staged.content.expose();
+                if install_bytes == staged_bytes {
+                    AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                        AuthPlannedRotationForwardPhase::InstallTempExact,
+                    )
+                } else if install_bytes.len() < staged_bytes.len()
+                    && staged_bytes.starts_with(install_bytes)
+                {
+                    AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                        AuthPlannedRotationForwardPhase::InstallTempPrefix,
+                    )
+                } else {
+                    AuthPlannedRotationReconciliation::Blocked(
+                        AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+                    )
+                }
+            }
+            (false, true, Some(install))
+                if known_file_matches_planned_expected_active(install, expectation) =>
+            {
+                AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                    AuthPlannedRotationForwardPhase::AwaitingOldActiveTempRemoval,
+                )
+            }
+            (false, true, None) => AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                AuthPlannedRotationForwardPhase::AwaitingFinalDbCas,
+            ),
+            _ => AuthPlannedRotationReconciliation::Blocked(
+                AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+            ),
+        }
+    }
+
+    fn reconcile_planned_rotation_final_active(
+        &self,
+        source: AuthPlannedRotationSourceMatch,
+        lifecycle: AuthActiveLifecycleFacts,
+        metadata: Option<&PlannedRotationMetadataV1>,
+    ) -> AuthPlannedRotationReconciliation {
+        if self.install_file().is_some() {
+            return AuthPlannedRotationReconciliation::Blocked(
+                AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+            );
+        }
+
+        match (self.transition_directory(), self.cleanup_directory()) {
+            (Some(reservation), None) => {
+                let Some(metadata) = metadata else {
+                    return AuthPlannedRotationReconciliation::Blocked(
+                        AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+                    );
+                };
+                let expectation = metadata.source_expectation();
+                let parts = RetainedReservationParts::from_directory(reservation);
+                if source == AuthPlannedRotationSourceMatch::Exact
+                    && expectation.matches_final_active_lifecycle(
+                        lifecycle.state_revision,
+                        lifecycle.expected_kid,
+                        lifecycle.keyring_version,
+                        lifecycle.updated_at_micros,
+                    )
+                    && metadata.matches_reservation_artifact(reservation.artifact)
+                    && matches!(parts.metadata, Some((_, CodecObservation::Valid)))
+                    && matches!(parts.staged, Some((_, CodecObservation::Valid)))
+                    && parts.prepared.is_some()
+                    && reservation.linkage == SemanticLinkageObservation::Consistent
+                    && self.active_matches_planned_result_metadata(metadata)
+                {
+                    AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                        AuthPlannedRotationForwardPhase::AwaitingCleanupRename,
+                    )
+                } else {
+                    AuthPlannedRotationReconciliation::Blocked(
+                        AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+                    )
+                }
+            }
+            (None, Some(cleanup)) => {
+                self.reconcile_planned_rotation_cleanup(source, lifecycle, metadata, cleanup)
+            }
+            (None, None)
+                if source == AuthPlannedRotationSourceMatch::Canonical
+                    && metadata.is_none()
+                    && self.is_terminal_initialization_namespace()
+                    && self.active_matches_planned_lifecycle(lifecycle) =>
+            {
+                AuthPlannedRotationReconciliation::PlannedRotationComplete
+            }
+            _ => AuthPlannedRotationReconciliation::Blocked(
+                AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+            ),
+        }
+    }
+
+    fn reconcile_planned_rotation_cleanup(
+        &self,
+        source: AuthPlannedRotationSourceMatch,
+        lifecycle: AuthActiveLifecycleFacts,
+        metadata: Option<&PlannedRotationMetadataV1>,
+        cleanup: &PinnedReservationDirectory,
+    ) -> AuthPlannedRotationReconciliation {
+        let TopLevelArtifactName::Cleanup {
+            kind: TransitionKind::Planned,
+            ..
+        } = cleanup.artifact
+        else {
+            return AuthPlannedRotationReconciliation::Blocked(
+                AuthPlannedRotationBlocker::UnsupportedLifecycleState,
+            );
+        };
+        let parts = RetainedReservationParts::from_directory(cleanup);
+        match (parts.metadata, parts.staged, parts.prepared) {
+            (Some((_, CodecObservation::Valid)), Some((_, CodecObservation::Valid)), Some(_))
+                if source == AuthPlannedRotationSourceMatch::Exact
+                    && metadata.is_some_and(|metadata| {
+                        metadata.matches_reservation_artifact(cleanup.artifact)
+                            && metadata
+                                .source_expectation()
+                                .matches_final_active_lifecycle(
+                                    lifecycle.state_revision,
+                                    lifecycle.expected_kid,
+                                    lifecycle.keyring_version,
+                                    lifecycle.updated_at_micros,
+                                )
+                            && self.active_matches_planned_result_metadata(metadata)
+                    })
+                    && cleanup.linkage == SemanticLinkageObservation::Consistent =>
+            {
+                AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                    AuthPlannedRotationForwardPhase::AwaitingCleanupStagedRemoval,
+                )
+            }
+            (Some((_, CodecObservation::Valid)), None, Some(_))
+                if source == AuthPlannedRotationSourceMatch::Exact
+                    && metadata.is_some_and(|metadata| {
+                        metadata.matches_reservation_artifact(cleanup.artifact)
+                            && metadata
+                                .source_expectation()
+                                .matches_final_active_lifecycle(
+                                    lifecycle.state_revision,
+                                    lifecycle.expected_kid,
+                                    lifecycle.keyring_version,
+                                    lifecycle.updated_at_micros,
+                                )
+                            && self.active_matches_planned_result_metadata(metadata)
+                    }) =>
+            {
+                AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                    AuthPlannedRotationForwardPhase::AwaitingCleanupPreparedRemoval,
+                )
+            }
+            (Some((_, CodecObservation::Valid)), None, None)
+                if source == AuthPlannedRotationSourceMatch::Exact
+                    && metadata.is_some_and(|metadata| {
+                        metadata.matches_reservation_artifact(cleanup.artifact)
+                            && metadata
+                                .source_expectation()
+                                .matches_final_active_lifecycle(
+                                    lifecycle.state_revision,
+                                    lifecycle.expected_kid,
+                                    lifecycle.keyring_version,
+                                    lifecycle.updated_at_micros,
+                                )
+                            && self.active_matches_planned_result_metadata(metadata)
+                    }) =>
+            {
+                AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                    AuthPlannedRotationForwardPhase::AwaitingCleanupMetadataRemoval,
+                )
+            }
+            (None, None, None)
+                if source == AuthPlannedRotationSourceMatch::Canonical
+                    && metadata.is_none()
+                    && self.active_matches_planned_lifecycle(lifecycle) =>
+            {
+                AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                    AuthPlannedRotationForwardPhase::AwaitingCleanupDirectoryRemoval,
+                )
+            }
+            _ => AuthPlannedRotationReconciliation::Blocked(
+                AuthPlannedRotationBlocker::InconsistentDbFilesystem,
+            ),
+        }
     }
 
     fn reconcile_initialization(
@@ -1291,6 +2057,85 @@ impl PinnedAuthArtifactSnapshot {
                 == Some(expectation.expected_key_activated_at_micros())
     }
 
+    fn active_matches_planned_result_metadata(&self, metadata: &PlannedRotationMetadataV1) -> bool {
+        let Some(active) = self.active_file() else {
+            return false;
+        };
+        active.content.expose().len() == WITH_VERIFY_ONLY_LENGTH
+            && metadata
+                .validate_staged_keyring(SecretBytes::new(active.content.expose().to_vec()))
+                .is_ok()
+    }
+
+    fn active_matches_planned_lifecycle(&self, lifecycle: AuthActiveLifecycleFacts) -> bool {
+        let Some(active) = self.active_file() else {
+            return false;
+        };
+        if active.content.expose().len() != WITH_VERIFY_ONLY_LENGTH {
+            return false;
+        }
+        let Ok(keyring) = Keyring::decode(SecretBytes::new(active.content.expose().to_vec()))
+        else {
+            return false;
+        };
+        lifecycle.expected_kid.matches_key(keyring.active_kid())
+            && lifecycle.keyring_version.matches_version(keyring.version())
+            && lifecycle
+                .updated_at_micros
+                .is_at_or_after(keyring.active_activated_at())
+    }
+
+    fn active_matches_any_lifecycle(&self, lifecycle: AuthActiveLifecycleFacts) -> bool {
+        let Some(active) = self.active_file() else {
+            return false;
+        };
+        let Ok(keyring) = Keyring::decode(SecretBytes::new(active.content.expose().to_vec()))
+        else {
+            return false;
+        };
+        lifecycle.expected_kid.matches_key(keyring.active_kid())
+            && lifecycle.keyring_version.matches_version(keyring.version())
+            && lifecycle
+                .updated_at_micros
+                .is_at_or_after(keyring.active_activated_at())
+    }
+
+    fn active_matches_retire_metadata(&self, metadata: &RetireMetadataV1) -> bool {
+        let Some(active) = self.active_file() else {
+            return false;
+        };
+        metadata
+            .validate_current_keyring(SecretBytes::new(active.content.expose().to_vec()))
+            .is_ok()
+    }
+
+    fn active_matches_retire_result_metadata(&self, metadata: &RetireMetadataV1) -> bool {
+        let Some(active) = self.active_file() else {
+            return false;
+        };
+        metadata
+            .validate_staged_keyring(SecretBytes::new(active.content.expose().to_vec()))
+            .is_ok()
+    }
+
+    fn active_matches_retire_lifecycle(&self, lifecycle: AuthActiveLifecycleFacts) -> bool {
+        let Some(active) = self.active_file() else {
+            return false;
+        };
+        if active.content.expose().len() != ACTIVE_ONLY_LENGTH {
+            return false;
+        }
+        let Ok(keyring) = Keyring::decode(SecretBytes::new(active.content.expose().to_vec()))
+        else {
+            return false;
+        };
+        lifecycle.expected_kid.matches_key(keyring.active_kid())
+            && lifecycle.keyring_version.matches_version(keyring.version())
+            && lifecycle
+                .updated_at_micros
+                .is_at_or_after(keyring.active_activated_at())
+    }
+
     fn is_terminal_initialization_namespace(&self) -> bool {
         self.namespace.is_valid
             && self.observations.len() == 2
@@ -1334,9 +2179,62 @@ impl PinnedAuthArtifactSnapshot {
                 == 1
     }
 
+    fn is_terminal_active_namespace(&self) -> bool {
+        self.namespace.is_valid
+            && self.observations.len() == 2
+            && self
+                .observations
+                .iter()
+                .filter(|entry| matches!(entry, PinnedTopLevelArtifact::MaintenanceLock { .. }))
+                .count()
+                == 1
+            && self
+                .observations
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry,
+                        PinnedTopLevelArtifact::ActiveKeyring {
+                            codec: CodecObservation::Valid,
+                            ..
+                        }
+                    )
+                })
+                .count()
+                == 1
+    }
+
     fn matches_planned_preparation(
         &self,
         preparation: &PlannedRotationPreparationV1,
+    ) -> Result<bool, SecretFsError> {
+        let Some(reservation) = self.transition_directory() else {
+            return Ok(false);
+        };
+        if reservation.artifact != preparation.transition_artifact() {
+            return Ok(false);
+        }
+        let parts = RetainedReservationParts::from_directory(reservation);
+        let Some((metadata, CodecObservation::Valid)) = parts.metadata else {
+            return Ok(false);
+        };
+        let Some((staged, CodecObservation::Valid)) = parts.staged else {
+            return Ok(false);
+        };
+        if parts.prepared.is_none() || reservation.linkage != SemanticLinkageObservation::Consistent
+        {
+            return Ok(false);
+        }
+        let encoded = preparation
+            .encoded_metadata()
+            .map_err(|_| SecretFsError::UnsafeAuthArtifact)?;
+        Ok(metadata.content.expose() == encoded.expose_secret()
+            && staged.content.expose() == preparation.staged_keyring_bytes())
+    }
+
+    fn matches_retire_preparation(
+        &self,
+        preparation: &RetirePreparationV1,
     ) -> Result<bool, SecretFsError> {
         let Some(reservation) = self.transition_directory() else {
             return Ok(false);
@@ -1476,9 +2374,64 @@ impl PinnedAuthArtifactSnapshot {
             staged,
         })
     }
+
+    fn planned_rotation_active_key_evidence(&self) -> Option<PlannedRotationActiveKeyEvidence<'_>> {
+        let reservation = self.transition_directory()?;
+        let transition_id = match reservation.artifact {
+            TopLevelArtifactName::Transition {
+                kind: TransitionKind::Planned,
+                id,
+            } => id,
+            _ => return None,
+        };
+        let parts = RetainedReservationParts::from_directory(reservation);
+        let (staged, CodecObservation::Valid) = parts.staged? else {
+            return None;
+        };
+        if !matches!(parts.metadata, Some((_, CodecObservation::Valid)))
+            || parts.prepared.is_none()
+            || reservation.linkage != SemanticLinkageObservation::Consistent
+        {
+            return None;
+        }
+        Some(PlannedRotationActiveKeyEvidence {
+            transition_id,
+            staged,
+        })
+    }
+
+    fn retire_active_key_evidence(&self) -> Option<PlannedRotationActiveKeyEvidence<'_>> {
+        let reservation = self.transition_directory()?;
+        let transition_id = match reservation.artifact {
+            TopLevelArtifactName::Transition {
+                kind: TransitionKind::Retire,
+                id,
+            } => id,
+            _ => return None,
+        };
+        let parts = RetainedReservationParts::from_directory(reservation);
+        let (staged, CodecObservation::Valid) = parts.staged? else {
+            return None;
+        };
+        if !matches!(parts.metadata, Some((_, CodecObservation::Valid)))
+            || parts.prepared.is_none()
+            || reservation.linkage != SemanticLinkageObservation::Consistent
+        {
+            return None;
+        }
+        Some(PlannedRotationActiveKeyEvidence {
+            transition_id,
+            staged,
+        })
+    }
 }
 
 struct InitializationActiveKeyEvidence<'a> {
+    transition_id: TransitionId,
+    staged: &'a PinnedKnownFile,
+}
+
+struct PlannedRotationActiveKeyEvidence<'a> {
     transition_id: TransitionId,
     staged: &'a PinnedKnownFile,
 }
@@ -2725,6 +3678,23 @@ fn keyring_codec_observation(bytes: &[u8], partial_is_incomplete: bool) -> Codec
     }
 }
 
+fn known_file_matches_planned_expected_active(
+    file: &PinnedKnownFile,
+    expectation: PlannedRotationSourceExpectation<'_>,
+) -> bool {
+    if file.content.expose().len() != ACTIVE_ONLY_LENGTH {
+        return false;
+    }
+    let Ok(keyring) = Keyring::decode(SecretBytes::new(file.content.expose().to_vec())) else {
+        return false;
+    };
+    keyring.active_kid().as_str() == expectation.expected_active_kid()
+        && i64::try_from(keyring.version().get()).ok()
+            == Some(expectation.expected_keyring_version())
+        && i64::try_from(keyring.active_activated_at().get()).ok()
+            == Some(expectation.expected_key_activated_at_micros())
+}
+
 fn metadata_codec_observation(bytes: &[u8], artifact: TopLevelArtifactName) -> CodecObservation {
     let valid = match artifact {
         TopLevelArtifactName::Transition {
@@ -2744,6 +3714,15 @@ fn metadata_codec_observation(bytes: &[u8], artifact: TopLevelArtifactName) -> C
             kind: TransitionKind::Planned,
             ..
         } => PlannedRotationMetadataV1::decode(SecretBytes::new(bytes.to_vec()))
+            .is_ok_and(|metadata| metadata.matches_reservation_artifact(artifact)),
+        TopLevelArtifactName::Transition {
+            kind: TransitionKind::Retire,
+            ..
+        }
+        | TopLevelArtifactName::Cleanup {
+            kind: TransitionKind::Retire,
+            ..
+        } => RetireMetadataV1::decode(SecretBytes::new(bytes.to_vec()))
             .is_ok_and(|metadata| metadata.matches_reservation_artifact(artifact)),
         _ => false,
     };
@@ -2831,6 +3810,22 @@ fn observe_reservation_linkage(
                     ))
                     .is_ok()
         }),
+        TopLevelArtifactName::Transition {
+            kind: TransitionKind::Retire,
+            ..
+        }
+        | TopLevelArtifactName::Cleanup {
+            kind: TransitionKind::Retire,
+            ..
+        } => RetireMetadataV1::decode(SecretBytes::new(metadata_file.content.expose().to_vec()))
+            .is_ok_and(|metadata| {
+                metadata.matches_reservation_artifact(artifact)
+                    && metadata
+                        .validate_staged_keyring(SecretBytes::new(
+                            staged_file.content.expose().to_vec(),
+                        ))
+                        .is_ok()
+            }),
         _ => false,
     };
     if linked {
@@ -3192,12 +4187,121 @@ fn publish_install_temp_no_replace(
     Ok(())
 }
 
+fn exchange_install_temp_with_active(
+    parent_fd: &OwnedFd,
+    install_name: &str,
+    install_stat: ArtifactStat,
+    staged_bytes: &[u8],
+    active_stat: ArtifactStat,
+    active_bytes: &[u8],
+    before_exchange: impl FnOnce(),
+) -> Result<(), SecretFsError> {
+    let install = open_existing_known_file_for_update(
+        parent_fd,
+        install_name,
+        KnownFilePurpose::InstallTemp,
+        install_stat,
+        staged_bytes,
+    )?;
+    let active = open_existing_known_file_for_update(
+        parent_fd,
+        ACTIVE_KEYRING_NAME,
+        KnownFilePurpose::ActiveKeyring,
+        active_stat,
+        active_bytes,
+    )?;
+    fsync(&install).map_err(SecretFsError::errno)?;
+    fsync(&active).map_err(SecretFsError::errno)?;
+    fsync(parent_fd).map_err(SecretFsError::errno)?;
+
+    let install_descriptor = validate_known_file_fd(&install, KnownFilePurpose::InstallTemp)?;
+    let active_descriptor = validate_known_file_fd(&active, KnownFilePurpose::ActiveKeyring)?;
+    let install_path = validate_known_file_stat(
+        &statat(parent_fd, install_name, AtFlags::SYMLINK_NOFOLLOW).map_err(map_artifact_errno)?,
+        KnownFilePurpose::InstallTemp,
+    )?;
+    let active_path = validate_known_file_stat(
+        &statat(parent_fd, ACTIVE_KEYRING_NAME, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(map_artifact_errno)?,
+        KnownFilePurpose::ActiveKeyring,
+    )?;
+    let install_readback =
+        read_file_positionally(&install, KnownFilePurpose::InstallTemp.maximum_size())?;
+    let active_readback =
+        read_file_positionally(&active, KnownFilePurpose::ActiveKeyring.maximum_size())?;
+    if install_descriptor != install_stat
+        || install_path != install_stat
+        || active_descriptor != active_stat
+        || active_path != active_stat
+        || install_readback.expose() != staged_bytes
+        || active_readback.expose() != active_bytes
+    {
+        return Err(SecretFsError::ArtifactChanged);
+    }
+
+    before_exchange();
+    exchange_paths(parent_fd, install_name, parent_fd, ACTIVE_KEYRING_NAME)?;
+    fsync(parent_fd).map_err(SecretFsError::errno)?;
+
+    let new_active_path = validate_known_file_stat(
+        &statat(parent_fd, ACTIVE_KEYRING_NAME, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(map_artifact_errno)?,
+        KnownFilePurpose::ActiveKeyring,
+    )?;
+    let old_active_path = validate_known_file_stat(
+        &statat(parent_fd, install_name, AtFlags::SYMLINK_NOFOLLOW).map_err(map_artifact_errno)?,
+        KnownFilePurpose::InstallTemp,
+    )?;
+    let new_active_descriptor = validate_known_file_fd(&install, KnownFilePurpose::ActiveKeyring)?;
+    let old_active_descriptor = validate_known_file_fd(&active, KnownFilePurpose::InstallTemp)?;
+    if new_active_descriptor != new_active_path
+        || old_active_descriptor != old_active_path
+        || !same_file_node(new_active_descriptor.identity, install_stat.identity)
+        || !same_file_node(old_active_descriptor.identity, active_stat.identity)
+        || read_file_positionally(&install, KnownFilePurpose::ActiveKeyring.maximum_size())?
+            .expose()
+            != staged_bytes
+        || read_file_positionally(&active, KnownFilePurpose::InstallTemp.maximum_size())?.expose()
+            != active_bytes
+    {
+        return Err(SecretFsError::ArtifactChanged);
+    }
+    Ok(())
+}
+
 fn ensure_path_absent(parent_fd: &OwnedFd, name: &str) -> Result<(), SecretFsError> {
     match statat(parent_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
         Err(Errno::NOENT) => Ok(()),
         Err(error) => Err(map_artifact_errno(error)),
         Ok(_) => Err(SecretFsError::ArtifactChanged),
     }
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn exchange_paths(
+    old_parent: &OwnedFd,
+    old_name: &str,
+    new_parent: &OwnedFd,
+    new_name: &str,
+) -> Result<(), SecretFsError> {
+    renameat_with(
+        old_parent,
+        old_name,
+        new_parent,
+        new_name,
+        RenameFlags::EXCHANGE,
+    )
+    .map_err(map_creation_errno)
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+fn exchange_paths(
+    _old_parent: &OwnedFd,
+    _old_name: &str,
+    _new_parent: &OwnedFd,
+    _new_name: &str,
+) -> Result<(), SecretFsError> {
+    Err(SecretFsError::Io(io::ErrorKind::Unsupported))
 }
 
 #[cfg(any(
@@ -3366,12 +4470,28 @@ pub(crate) enum AuthPlannedRotationBlocker {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthPlannedRotationForwardPhase {
+    AwaitingInstallTemp,
+    InstallTempPrefix,
+    InstallTempExact,
+    AwaitingOldActiveTempRemoval,
+    AwaitingFinalDbCas,
+    AwaitingCleanupRename,
+    AwaitingCleanupStagedRemoval,
+    AwaitingCleanupPreparedRemoval,
+    AwaitingCleanupMetadataRemoval,
+    AwaitingCleanupDirectoryRemoval,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AuthPlannedRotationReconciliation {
     CleanActive,
     PlannedPreSource {
         phase: AuthPlannedRotationPreSourcePhase,
         recovery: AuthPlannedRotationRecovery,
     },
+    PlannedForwardOnly(AuthPlannedRotationForwardPhase),
+    PlannedRotationComplete,
     Blocked(AuthPlannedRotationBlocker),
 }
 
@@ -3387,6 +4507,99 @@ pub(crate) enum AuthPlannedRotationRollbackOutcome {
     RolledBack,
     AlreadyClean,
     NotRollbackable(AuthPlannedRotationReconciliation),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum AuthPlannedRotationSourceOutcome {
+    Committed,
+    AlreadyCommitted,
+    ConfirmedNotCommitted,
+    NotPrepared(AuthPlannedRotationReconciliation),
+    PreconditionChanged,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum AuthPlannedRotationActiveKeyInstallOutcome {
+    InstalledAwaitingFinalDbCas,
+    AlreadyAwaitingFinalDbCas,
+    NotInstallable(AuthPlannedRotationReconciliation),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum AuthPlannedRotationFinalLifecycleOutcome {
+    ActivatedAwaitingCleanup,
+    AlreadyActivatedAwaitingCleanup,
+    ConfirmedNotActivated,
+    NotActivatable(AuthPlannedRotationReconciliation),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum AuthPlannedRotationCleanupOutcome {
+    Completed,
+    AlreadyCompleted,
+    NotCleanable(AuthPlannedRotationReconciliation),
+}
+
+pub(crate) type AuthRetirePreSourcePhase = AuthPlannedRotationPreSourcePhase;
+pub(crate) type AuthRetireRecovery = AuthPlannedRotationRecovery;
+pub(crate) type AuthRetireBlocker = AuthPlannedRotationBlocker;
+pub(crate) type AuthRetireForwardPhase = AuthPlannedRotationForwardPhase;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthRetireReconciliation {
+    CleanActiveOnly,
+    ReadyToRetire,
+    RetirePreSource {
+        phase: AuthRetirePreSourcePhase,
+        recovery: AuthRetireRecovery,
+    },
+    RetireForwardOnly(AuthRetireForwardPhase),
+    Blocked(AuthRetireBlocker),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum AuthRetirePrepareOutcome {
+    Prepared,
+    AlreadyPrepared,
+    PreconditionNotReady(AuthRetireReconciliation),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum AuthRetireRollbackOutcome {
+    RolledBack,
+    AlreadyReady,
+    NotRollbackable(AuthRetireReconciliation),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum AuthRetireSourceOutcome {
+    Committed,
+    AlreadyCommitted,
+    ConfirmedNotCommitted,
+    NotPrepared(AuthRetireReconciliation),
+    PreconditionChanged,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum AuthRetireActiveKeyInstallOutcome {
+    InstalledAwaitingFinalDbCas,
+    AlreadyAwaitingFinalDbCas,
+    NotInstallable(AuthRetireReconciliation),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum AuthRetireFinalLifecycleOutcome {
+    ActivatedAwaitingCleanup,
+    AlreadyActivatedAwaitingCleanup,
+    ConfirmedNotActivated,
+    NotActivatable(AuthRetireReconciliation),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum AuthRetireCleanupOutcome {
+    Completed,
+    AlreadyCompleted,
+    NotCleanable(AuthRetireReconciliation),
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -3461,7 +4674,25 @@ pub(super) enum AuthPlannedRotationPrepareTestFault {
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AuthRetirePrepareTestFault {
+    Reservation,
+    Metadata,
+    Staged,
+    Prepared,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AuthPlannedRotationRollbackTestFault {
+    Prepared,
+    Staged,
+    Metadata,
+    Directory,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AuthRetireRollbackTestFault {
     Prepared,
     Staged,
     Metadata,
@@ -3491,6 +4722,33 @@ pub(super) enum AuthInitializationSourceDurabilityTestFault {
     Metadata,
     Staged,
     Prepared,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AuthPlannedRotationSourceDurabilityTestFault {
+    Metadata,
+    Staged,
+    Prepared,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AuthPlannedRotationActiveKeyInstallTestFault {
+    PrefixRemoved,
+    InstallTempDurable,
+    ExchangeDurable,
+    OldActiveTempRemoved,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AuthPlannedRotationCleanupTestFault {
+    Rename,
+    Staged,
+    Prepared,
+    Metadata,
+    Directory,
 }
 
 #[cfg(test)]
@@ -3541,6 +4799,142 @@ impl fmt::Debug for AuthPlannedRotationRollbackOutcome {
             Self::NotRollbackable(_) => {
                 "AuthPlannedRotationRollbackOutcome::NotRollbackable([REDACTED])"
             }
+        })
+    }
+}
+
+impl fmt::Debug for AuthRetirePrepareOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Prepared => "AuthRetirePrepareOutcome::Prepared",
+            Self::AlreadyPrepared => "AuthRetirePrepareOutcome::AlreadyPrepared",
+            Self::PreconditionNotReady(_) => {
+                "AuthRetirePrepareOutcome::PreconditionNotReady([REDACTED])"
+            }
+        })
+    }
+}
+
+impl fmt::Debug for AuthRetireRollbackOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::RolledBack => "AuthRetireRollbackOutcome::RolledBack",
+            Self::AlreadyReady => "AuthRetireRollbackOutcome::AlreadyReady",
+            Self::NotRollbackable(_) => "AuthRetireRollbackOutcome::NotRollbackable([REDACTED])",
+        })
+    }
+}
+
+impl fmt::Debug for AuthRetireSourceOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Committed => "AuthRetireSourceOutcome::Committed",
+            Self::AlreadyCommitted => "AuthRetireSourceOutcome::AlreadyCommitted",
+            Self::ConfirmedNotCommitted => "AuthRetireSourceOutcome::ConfirmedNotCommitted",
+            Self::NotPrepared(_) => "AuthRetireSourceOutcome::NotPrepared([REDACTED])",
+            Self::PreconditionChanged => "AuthRetireSourceOutcome::PreconditionChanged",
+        })
+    }
+}
+
+impl fmt::Debug for AuthRetireActiveKeyInstallOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InstalledAwaitingFinalDbCas => {
+                "AuthRetireActiveKeyInstallOutcome::InstalledAwaitingFinalDbCas"
+            }
+            Self::AlreadyAwaitingFinalDbCas => {
+                "AuthRetireActiveKeyInstallOutcome::AlreadyAwaitingFinalDbCas"
+            }
+            Self::NotInstallable(_) => {
+                "AuthRetireActiveKeyInstallOutcome::NotInstallable([REDACTED])"
+            }
+        })
+    }
+}
+
+impl fmt::Debug for AuthRetireFinalLifecycleOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ActivatedAwaitingCleanup => {
+                "AuthRetireFinalLifecycleOutcome::ActivatedAwaitingCleanup"
+            }
+            Self::AlreadyActivatedAwaitingCleanup => {
+                "AuthRetireFinalLifecycleOutcome::AlreadyActivatedAwaitingCleanup"
+            }
+            Self::ConfirmedNotActivated => "AuthRetireFinalLifecycleOutcome::ConfirmedNotActivated",
+            Self::NotActivatable(_) => {
+                "AuthRetireFinalLifecycleOutcome::NotActivatable([REDACTED])"
+            }
+        })
+    }
+}
+
+impl fmt::Debug for AuthRetireCleanupOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Completed => "AuthRetireCleanupOutcome::Completed",
+            Self::AlreadyCompleted => "AuthRetireCleanupOutcome::AlreadyCompleted",
+            Self::NotCleanable(_) => "AuthRetireCleanupOutcome::NotCleanable([REDACTED])",
+        })
+    }
+}
+
+impl fmt::Debug for AuthPlannedRotationSourceOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Committed => "AuthPlannedRotationSourceOutcome::Committed",
+            Self::AlreadyCommitted => "AuthPlannedRotationSourceOutcome::AlreadyCommitted",
+            Self::ConfirmedNotCommitted => {
+                "AuthPlannedRotationSourceOutcome::ConfirmedNotCommitted"
+            }
+            Self::NotPrepared(_) => "AuthPlannedRotationSourceOutcome::NotPrepared([REDACTED])",
+            Self::PreconditionChanged => "AuthPlannedRotationSourceOutcome::PreconditionChanged",
+        })
+    }
+}
+
+impl fmt::Debug for AuthPlannedRotationActiveKeyInstallOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InstalledAwaitingFinalDbCas => {
+                "AuthPlannedRotationActiveKeyInstallOutcome::InstalledAwaitingFinalDbCas"
+            }
+            Self::AlreadyAwaitingFinalDbCas => {
+                "AuthPlannedRotationActiveKeyInstallOutcome::AlreadyAwaitingFinalDbCas"
+            }
+            Self::NotInstallable(_) => {
+                "AuthPlannedRotationActiveKeyInstallOutcome::NotInstallable([REDACTED])"
+            }
+        })
+    }
+}
+
+impl fmt::Debug for AuthPlannedRotationFinalLifecycleOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ActivatedAwaitingCleanup => {
+                "AuthPlannedRotationFinalLifecycleOutcome::ActivatedAwaitingCleanup"
+            }
+            Self::AlreadyActivatedAwaitingCleanup => {
+                "AuthPlannedRotationFinalLifecycleOutcome::AlreadyActivatedAwaitingCleanup"
+            }
+            Self::ConfirmedNotActivated => {
+                "AuthPlannedRotationFinalLifecycleOutcome::ConfirmedNotActivated"
+            }
+            Self::NotActivatable(_) => {
+                "AuthPlannedRotationFinalLifecycleOutcome::NotActivatable([REDACTED])"
+            }
+        })
+    }
+}
+
+impl fmt::Debug for AuthPlannedRotationCleanupOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Completed => "AuthPlannedRotationCleanupOutcome::Completed",
+            Self::AlreadyCompleted => "AuthPlannedRotationCleanupOutcome::AlreadyCompleted",
+            Self::NotCleanable(_) => "AuthPlannedRotationCleanupOutcome::NotCleanable([REDACTED])",
         })
     }
 }
@@ -3747,6 +5141,56 @@ fn retain_initialization_cleanup_evidence(
     Ok(())
 }
 
+fn retain_planned_rotation_cleanup_evidence(
+    retained_artifacts: &mut Option<PinnedAuthArtifactSnapshot>,
+    retained_metadata: &mut Option<PlannedRotationMetadataV1>,
+    retained_database: &mut Option<AuthPlannedRotationDatabaseObservation>,
+    artifacts: PinnedAuthArtifactSnapshot,
+    metadata: Option<PlannedRotationMetadataV1>,
+    database: AuthPlannedRotationDatabaseObservation,
+) -> Result<(), AuthStoreBindingError> {
+    if retained_artifacts.is_some() {
+        return Ok(());
+    }
+    let metadata = metadata.ok_or(AuthStoreBindingError::Filesystem(
+        SecretFsError::UnsafeAuthArtifact,
+    ))?;
+    if database.source != AuthPlannedRotationSourceMatch::Exact
+        || database.source_fingerprint.is_none()
+    {
+        return Err(AuthStoreBindingError::ConversationStoreChanged);
+    }
+    *retained_artifacts = Some(artifacts);
+    *retained_metadata = Some(metadata);
+    *retained_database = Some(database);
+    Ok(())
+}
+
+fn retain_retire_cleanup_evidence(
+    retained_artifacts: &mut Option<PinnedAuthArtifactSnapshot>,
+    retained_metadata: &mut Option<RetireMetadataV1>,
+    retained_database: &mut Option<AuthPlannedRotationDatabaseObservation>,
+    artifacts: PinnedAuthArtifactSnapshot,
+    metadata: Option<RetireMetadataV1>,
+    database: AuthPlannedRotationDatabaseObservation,
+) -> Result<(), AuthStoreBindingError> {
+    if retained_artifacts.is_some() {
+        return Ok(());
+    }
+    let metadata = metadata.ok_or(AuthStoreBindingError::Filesystem(
+        SecretFsError::UnsafeAuthArtifact,
+    ))?;
+    if database.source != AuthPlannedRotationSourceMatch::Exact
+        || database.source_fingerprint.is_none()
+    {
+        return Err(AuthStoreBindingError::ConversationStoreChanged);
+    }
+    *retained_artifacts = Some(artifacts);
+    *retained_metadata = Some(metadata);
+    *retained_database = Some(database);
+    Ok(())
+}
+
 pub(super) struct OwnedAuthMaintenanceContext {
     locked: LockedAuthInstance,
     conversation: AuthConversationStoreBinding,
@@ -3781,6 +5225,59 @@ impl OwnedAuthMaintenanceContext {
         })
     }
 
+    pub(super) fn into_listener_lease(self) -> Result<AuthListenerLease, AuthStoreBindingError> {
+        let reconciliation = self.inspect_retire_reconciliation()?;
+        if !matches!(
+            reconciliation,
+            AuthRetireReconciliation::ReadyToRetire | AuthRetireReconciliation::CleanActiveOnly
+        ) {
+            return Err(AuthStoreBindingError::Filesystem(
+                SecretFsError::UnsafeAuthArtifact,
+            ));
+        }
+
+        let artifacts = self.locked.capture_secret_artifacts()?;
+        if artifacts.has_unrecognized_artifacts()
+            || !artifacts.namespace.is_valid
+            || !artifacts.is_terminal_active_namespace()
+        {
+            return Err(AuthStoreBindingError::Filesystem(
+                SecretFsError::UnsafeAuthArtifact,
+            ));
+        }
+        let active = artifacts
+            .active_file()
+            .ok_or(AuthStoreBindingError::Filesystem(
+                SecretFsError::UnsafeAuthArtifact,
+            ))?;
+        let keyring = Keyring::decode(SecretBytes::new(active.content.expose().to_vec()))
+            .map_err(|_| AuthStoreBindingError::Filesystem(SecretFsError::UnsafeAuthArtifact))?;
+        let database = self
+            .conversation
+            .inspect_auth_retire(None)
+            .map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        let AuthDatabaseLifecycleObservation::Active(lifecycle) = database.lifecycle else {
+            return Err(AuthStoreBindingError::ConversationStoreChanged);
+        };
+        if database.source != AuthPlannedRotationSourceMatch::Canonical
+            || !lifecycle.expected_kid.matches_key(keyring.active_kid())
+            || !lifecycle.keyring_version.matches_version(keyring.version())
+            || !lifecycle
+                .updated_at_micros
+                .is_at_or_after(keyring.active_activated_at())
+        {
+            return Err(AuthStoreBindingError::ConversationStoreChanged);
+        }
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()?;
+        Ok(AuthListenerLease {
+            locked: self.locked,
+            conversation: self.conversation,
+            store_identity: self.store_identity,
+            keyring,
+        })
+    }
+
     pub(super) fn inspect_initialization_reconciliation(
         &self,
     ) -> Result<AuthInitializationReconciliation, AuthStoreBindingError> {
@@ -3791,6 +5288,12 @@ impl OwnedAuthMaintenanceContext {
         &self,
     ) -> Result<AuthPlannedRotationReconciliation, AuthStoreBindingError> {
         self.inspect_planned_rotation_reconciliation_inner(|| {}, || {})
+    }
+
+    pub(super) fn inspect_retire_reconciliation(
+        &self,
+    ) -> Result<AuthRetireReconciliation, AuthStoreBindingError> {
+        self.inspect_retire_reconciliation_inner(|| {}, || {})
     }
 
     pub(super) fn prepare_planned_rotation(
@@ -3805,10 +5308,34 @@ impl OwnedAuthMaintenanceContext {
         )
     }
 
+    pub(super) fn prepare_retire(
+        &self,
+        preparation: &RetirePreparationV1,
+    ) -> Result<AuthRetirePrepareOutcome, AuthStoreBindingError> {
+        self.prepare_retire_inner(
+            preparation,
+            #[cfg(test)]
+            None,
+            || {},
+        )
+    }
+
     pub(super) fn rollback_planned_rotation_pre_source(
         &self,
     ) -> Result<AuthPlannedRotationRollbackOutcome, AuthStoreBindingError> {
         self.rollback_planned_rotation_pre_source_inner(
+            #[cfg(test)]
+            None,
+            || {},
+            || {},
+            || {},
+        )
+    }
+
+    pub(super) fn rollback_retire_pre_source(
+        &self,
+    ) -> Result<AuthRetireRollbackOutcome, AuthStoreBindingError> {
+        self.rollback_retire_pre_source_inner(
             #[cfg(test)]
             None,
             || {},
@@ -4153,6 +5680,206 @@ impl OwnedAuthMaintenanceContext {
                     KnownFilePurpose::StagedKeyring
                 ) | (
                     Some(AuthInitializationSourceDurabilityTestFault::Prepared),
+                    KnownFilePurpose::Prepared
+                )
+            ) {
+                return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                    io::ErrorKind::Other,
+                )));
+            }
+        }
+        revalidate_created_reservation(
+            &self.locked.layout.secret_fd,
+            &reservation.directory_fd,
+            transition_name.as_str(),
+            reservation.stat.identity,
+        )?;
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()
+    }
+
+    fn durabilize_prepared_planned_rotation_evidence(
+        &self,
+        artifacts: &PinnedAuthArtifactSnapshot,
+        #[cfg(test)] fault: Option<AuthPlannedRotationSourceDurabilityTestFault>,
+    ) -> Result<(), AuthStoreBindingError> {
+        let reservation =
+            artifacts
+                .transition_directory()
+                .ok_or(AuthStoreBindingError::Filesystem(
+                    SecretFsError::ArtifactChanged,
+                ))?;
+        let transition_name = reservation.artifact.format();
+        if !matches!(
+            reservation.artifact,
+            TopLevelArtifactName::Transition {
+                kind: TransitionKind::Planned,
+                ..
+            }
+        ) || TopLevelArtifactName::parse(transition_name.as_bytes()) != Ok(reservation.artifact)
+        {
+            return Err(AuthStoreBindingError::Filesystem(
+                SecretFsError::UnsafeAuthArtifact,
+            ));
+        }
+        let parts = RetainedReservationParts::from_directory(reservation);
+        let (metadata, CodecObservation::Valid) = parts.metadata.ok_or(
+            AuthStoreBindingError::Filesystem(SecretFsError::ArtifactChanged),
+        )?
+        else {
+            return Err(AuthStoreBindingError::Filesystem(
+                SecretFsError::ArtifactChanged,
+            ));
+        };
+        let (staged, CodecObservation::Valid) = parts.staged.ok_or(
+            AuthStoreBindingError::Filesystem(SecretFsError::ArtifactChanged),
+        )?
+        else {
+            return Err(AuthStoreBindingError::Filesystem(
+                SecretFsError::ArtifactChanged,
+            ));
+        };
+        let prepared = parts.prepared.ok_or(AuthStoreBindingError::Filesystem(
+            SecretFsError::ArtifactChanged,
+        ))?;
+
+        for (name, purpose, file) in [
+            (
+                ReservationEntryName::Metadata.as_str(),
+                KnownFilePurpose::Metadata,
+                metadata,
+            ),
+            (
+                ReservationEntryName::StagedKeyring.as_str(),
+                KnownFilePurpose::StagedKeyring,
+                staged,
+            ),
+            (
+                ReservationEntryName::Prepared.as_str(),
+                KnownFilePurpose::Prepared,
+                prepared,
+            ),
+        ] {
+            durabilize_existing_known_file(
+                &reservation.directory_fd,
+                name,
+                purpose,
+                file.stat,
+                file.content.expose(),
+            )?;
+            artifacts.revalidate(&self.locked.layout.secret_fd)?;
+            self.revalidate()?;
+            #[cfg(test)]
+            if matches!(
+                (fault, purpose),
+                (
+                    Some(AuthPlannedRotationSourceDurabilityTestFault::Metadata),
+                    KnownFilePurpose::Metadata
+                ) | (
+                    Some(AuthPlannedRotationSourceDurabilityTestFault::Staged),
+                    KnownFilePurpose::StagedKeyring
+                ) | (
+                    Some(AuthPlannedRotationSourceDurabilityTestFault::Prepared),
+                    KnownFilePurpose::Prepared
+                )
+            ) {
+                return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                    io::ErrorKind::Other,
+                )));
+            }
+        }
+        revalidate_created_reservation(
+            &self.locked.layout.secret_fd,
+            &reservation.directory_fd,
+            transition_name.as_str(),
+            reservation.stat.identity,
+        )?;
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()
+    }
+
+    fn durabilize_prepared_retire_evidence(
+        &self,
+        artifacts: &PinnedAuthArtifactSnapshot,
+        #[cfg(test)] fault: Option<AuthPlannedRotationSourceDurabilityTestFault>,
+    ) -> Result<(), AuthStoreBindingError> {
+        let reservation =
+            artifacts
+                .transition_directory()
+                .ok_or(AuthStoreBindingError::Filesystem(
+                    SecretFsError::ArtifactChanged,
+                ))?;
+        let transition_name = reservation.artifact.format();
+        if !matches!(
+            reservation.artifact,
+            TopLevelArtifactName::Transition {
+                kind: TransitionKind::Retire,
+                ..
+            }
+        ) || TopLevelArtifactName::parse(transition_name.as_bytes()) != Ok(reservation.artifact)
+        {
+            return Err(AuthStoreBindingError::Filesystem(
+                SecretFsError::UnsafeAuthArtifact,
+            ));
+        }
+        let parts = RetainedReservationParts::from_directory(reservation);
+        let (metadata, CodecObservation::Valid) = parts.metadata.ok_or(
+            AuthStoreBindingError::Filesystem(SecretFsError::ArtifactChanged),
+        )?
+        else {
+            return Err(AuthStoreBindingError::Filesystem(
+                SecretFsError::ArtifactChanged,
+            ));
+        };
+        let (staged, CodecObservation::Valid) = parts.staged.ok_or(
+            AuthStoreBindingError::Filesystem(SecretFsError::ArtifactChanged),
+        )?
+        else {
+            return Err(AuthStoreBindingError::Filesystem(
+                SecretFsError::ArtifactChanged,
+            ));
+        };
+        let prepared = parts.prepared.ok_or(AuthStoreBindingError::Filesystem(
+            SecretFsError::ArtifactChanged,
+        ))?;
+
+        for (name, purpose, file) in [
+            (
+                ReservationEntryName::Metadata.as_str(),
+                KnownFilePurpose::Metadata,
+                metadata,
+            ),
+            (
+                ReservationEntryName::StagedKeyring.as_str(),
+                KnownFilePurpose::StagedKeyring,
+                staged,
+            ),
+            (
+                ReservationEntryName::Prepared.as_str(),
+                KnownFilePurpose::Prepared,
+                prepared,
+            ),
+        ] {
+            durabilize_existing_known_file(
+                &reservation.directory_fd,
+                name,
+                purpose,
+                file.stat,
+                file.content.expose(),
+            )?;
+            artifacts.revalidate(&self.locked.layout.secret_fd)?;
+            self.revalidate()?;
+            #[cfg(test)]
+            if matches!(
+                (fault, purpose),
+                (
+                    Some(AuthPlannedRotationSourceDurabilityTestFault::Metadata),
+                    KnownFilePurpose::Metadata
+                ) | (
+                    Some(AuthPlannedRotationSourceDurabilityTestFault::Staged),
+                    KnownFilePurpose::StagedKeyring
+                ) | (
+                    Some(AuthPlannedRotationSourceDurabilityTestFault::Prepared),
                     KnownFilePurpose::Prepared
                 )
             ) {
@@ -5399,6 +7126,38 @@ impl OwnedAuthMaintenanceContext {
         Ok((artifacts, reconciliation, database_a))
     }
 
+    fn capture_stable_retire_reconciliation(
+        &self,
+    ) -> Result<
+        (
+            PinnedAuthArtifactSnapshot,
+            AuthRetireReconciliation,
+            AuthPlannedRotationDatabaseObservation,
+        ),
+        AuthStoreBindingError,
+    > {
+        self.revalidate()?;
+        let artifacts = self.locked.capture_secret_artifacts()?;
+        let metadata = artifacts.decode_retire_metadata();
+        let expectation = metadata.as_ref().map(RetireMetadataV1::source_expectation);
+        let database_a = self
+            .conversation
+            .inspect_auth_retire(expectation)
+            .map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        let database_b = self
+            .conversation
+            .inspect_auth_retire(expectation)
+            .map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        if database_a != database_b {
+            return Err(AuthStoreBindingError::ConversationStoreChanged);
+        }
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()?;
+        let reconciliation = artifacts.reconcile_retire(database_a, metadata.as_ref());
+        Ok((artifacts, reconciliation, database_a))
+    }
+
     fn capture_planned_rotation_preparation_precondition(
         &self,
         preparation: &PlannedRotationPreparationV1,
@@ -5428,6 +7187,40 @@ impl OwnedAuthMaintenanceContext {
             && database_a.source_fingerprint.is_some()
             && artifacts.is_clean_active_namespace()
             && artifacts.active_matches_planned_expectation(expectation);
+        Ok((artifacts, exact))
+    }
+
+    fn capture_retire_preparation_precondition(
+        &self,
+        preparation: &RetirePreparationV1,
+    ) -> Result<(PinnedAuthArtifactSnapshot, bool), AuthStoreBindingError> {
+        self.revalidate()?;
+        let artifacts = self.locked.capture_secret_artifacts()?;
+        let expectation = preparation.source_expectation();
+        let database_a = self
+            .conversation
+            .inspect_auth_retire(Some(expectation))
+            .map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        let database_b = self
+            .conversation
+            .inspect_auth_retire(Some(expectation))
+            .map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        if database_a != database_b {
+            return Err(AuthStoreBindingError::ConversationStoreChanged);
+        }
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()?;
+        let active = artifacts.active_file();
+        let exact = matches!(
+            database_a.lifecycle,
+            AuthDatabaseLifecycleObservation::Active(lifecycle)
+                if artifacts.active_matches_any_lifecycle(lifecycle)
+        ) && database_a.source == AuthPlannedRotationSourceMatch::Exact
+            && database_a.source_fingerprint.is_some()
+            && artifacts.is_terminal_active_namespace()
+            && active
+                .is_some_and(|active| preparation.matches_current_keyring(active.content.expose()));
         Ok((artifacts, exact))
     }
 
@@ -5533,6 +7326,89 @@ impl OwnedAuthMaintenanceContext {
         }
         self.revalidate()?;
         Ok(AuthPlannedRotationPrepareOutcome::Prepared)
+    }
+
+    #[cfg(test)]
+    pub(super) fn prepare_retire_with_test_control(
+        &self,
+        preparation: &RetirePreparationV1,
+        fault: Option<AuthRetirePrepareTestFault>,
+        after_outer_precondition: impl FnOnce(),
+    ) -> Result<AuthRetirePrepareOutcome, AuthStoreBindingError> {
+        self.prepare_retire_inner(preparation, fault, after_outer_precondition)
+    }
+
+    fn prepare_retire_inner<AfterOuterPrecondition>(
+        &self,
+        preparation: &RetirePreparationV1,
+        #[cfg(test)] fault: Option<AuthRetirePrepareTestFault>,
+        after_outer_precondition: AfterOuterPrecondition,
+    ) -> Result<AuthRetirePrepareOutcome, AuthStoreBindingError>
+    where
+        AfterOuterPrecondition: FnOnce(),
+    {
+        let (existing, reconciliation, _) = self.capture_stable_retire_reconciliation()?;
+        if reconciliation
+            == (AuthRetireReconciliation::RetirePreSource {
+                phase: AuthRetirePreSourcePhase::Prepared,
+                recovery: AuthRetireRecovery::ResumeOrRollbackCandidate,
+            })
+            && existing.matches_retire_preparation(preparation)?
+        {
+            return Ok(AuthRetirePrepareOutcome::AlreadyPrepared);
+        }
+        if reconciliation != AuthRetireReconciliation::ReadyToRetire {
+            return Ok(AuthRetirePrepareOutcome::PreconditionNotReady(
+                reconciliation,
+            ));
+        }
+
+        let (outer_artifacts, exact_outer) =
+            self.capture_retire_preparation_precondition(preparation)?;
+        if !exact_outer {
+            return Ok(AuthRetirePrepareOutcome::PreconditionNotReady(
+                AuthRetireReconciliation::Blocked(AuthRetireBlocker::InconsistentDbFilesystem),
+            ));
+        }
+        after_outer_precondition();
+
+        let (verified_artifacts, exact_verified) =
+            self.capture_retire_preparation_precondition(preparation)?;
+        if !exact_verified {
+            return Ok(AuthRetirePrepareOutcome::PreconditionNotReady(
+                AuthRetireReconciliation::Blocked(AuthRetireBlocker::InconsistentDbFilesystem),
+            ));
+        }
+        outer_artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        verified_artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()?;
+
+        let persistence = self.locked.persist_retire_preparation(
+            preparation,
+            #[cfg(test)]
+            fault,
+        )?;
+        if persistence == AuthRetirePersistenceOutcome::PreconditionNotReady {
+            let (_, observed, _) = self.capture_stable_retire_reconciliation()?;
+            if observed == AuthRetireReconciliation::ReadyToRetire {
+                return Err(AuthStoreBindingError::Filesystem(
+                    SecretFsError::ArtifactChanged,
+                ));
+            }
+            return Ok(AuthRetirePrepareOutcome::PreconditionNotReady(observed));
+        }
+        let (readback_artifacts, readback, _) = self.capture_stable_retire_reconciliation()?;
+        let expected = AuthRetireReconciliation::RetirePreSource {
+            phase: AuthRetirePreSourcePhase::Prepared,
+            recovery: AuthRetireRecovery::ResumeOrRollbackCandidate,
+        };
+        if readback != expected || !readback_artifacts.matches_retire_preparation(preparation)? {
+            return Err(AuthStoreBindingError::Filesystem(
+                SecretFsError::ArtifactChanged,
+            ));
+        }
+        self.revalidate()?;
+        Ok(AuthRetirePrepareOutcome::Prepared)
     }
 
     #[cfg(test)]
@@ -5846,6 +7722,2287 @@ impl OwnedAuthMaintenanceContext {
         ))
     }
 
+    #[cfg(test)]
+    pub(super) fn rollback_retire_pre_source_with_test_control(
+        &self,
+        fault: Option<AuthRetireRollbackTestFault>,
+        before_mutation: impl FnOnce(),
+        after_first_mutation: impl FnOnce(),
+        after_rollback: impl FnOnce(),
+    ) -> Result<AuthRetireRollbackOutcome, AuthStoreBindingError> {
+        self.rollback_retire_pre_source_inner(
+            fault,
+            before_mutation,
+            after_first_mutation,
+            after_rollback,
+        )
+    }
+
+    fn rollback_retire_pre_source_inner<BeforeMutation, AfterFirstMutation, AfterRollback>(
+        &self,
+        #[cfg(test)] fault: Option<AuthRetireRollbackTestFault>,
+        before_mutation: BeforeMutation,
+        after_first_mutation: AfterFirstMutation,
+        after_rollback: AfterRollback,
+    ) -> Result<AuthRetireRollbackOutcome, AuthStoreBindingError>
+    where
+        BeforeMutation: FnOnce(),
+        AfterFirstMutation: FnOnce(),
+        AfterRollback: FnOnce(),
+    {
+        let mut before_mutation = Some(before_mutation);
+        let mut after_first_mutation = Some(after_first_mutation);
+        let mut after_rollback = Some(after_rollback);
+        let mut filesystem_mutated = false;
+        let mut rollback_evidence: Option<PinnedAuthArtifactSnapshot> = None;
+        let mut database_evidence: Option<AuthPlannedRotationDatabaseObservation> = None;
+        let mut expected_reconciliation = None;
+
+        for _ in 0..5 {
+            let (artifacts, reconciliation, database) =
+                self.capture_stable_retire_reconciliation()?;
+            if expected_reconciliation
+                .take()
+                .is_some_and(|expected| expected != reconciliation)
+            {
+                return Err(AuthStoreBindingError::Filesystem(
+                    SecretFsError::ArtifactChanged,
+                ));
+            }
+            if let Some(expected_database) = database_evidence
+                && !Self::planned_rotation_database_unchanged(expected_database, database)
+            {
+                if filesystem_mutated {
+                    return Err(AuthStoreBindingError::ConversationStoreChanged);
+                }
+                return Ok(AuthRetireRollbackOutcome::NotRollbackable(reconciliation));
+            }
+
+            let (phase, recovery) = match reconciliation {
+                AuthRetireReconciliation::ReadyToRetire => {
+                    if !filesystem_mutated {
+                        return Ok(AuthRetireRollbackOutcome::AlreadyReady);
+                    }
+                    after_rollback
+                        .take()
+                        .ok_or(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ))?();
+                    let rollback_evidence =
+                        rollback_evidence
+                            .as_ref()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    rollback_evidence
+                        .revalidate_completed_cleanup_evidence(&self.locked.layout.secret_fd)?;
+                    let (terminal_artifacts, terminal, terminal_database) =
+                        self.capture_stable_retire_reconciliation()?;
+                    if terminal != AuthRetireReconciliation::ReadyToRetire
+                        || !Self::planned_rotation_database_unchanged(
+                            database_evidence
+                                .ok_or(AuthStoreBindingError::ConversationStoreChanged)?,
+                            terminal_database,
+                        )
+                    {
+                        return Err(AuthStoreBindingError::ConversationStoreChanged);
+                    }
+                    terminal_artifacts.revalidate(&self.locked.layout.secret_fd)?;
+                    rollback_evidence
+                        .revalidate_completed_cleanup_evidence(&self.locked.layout.secret_fd)?;
+                    self.revalidate()?;
+                    return Ok(AuthRetireRollbackOutcome::RolledBack);
+                }
+                AuthRetireReconciliation::RetirePreSource { phase, recovery } => (phase, recovery),
+                _ => {
+                    if filesystem_mutated {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    }
+                    return Ok(AuthRetireRollbackOutcome::NotRollbackable(reconciliation));
+                }
+            };
+
+            let artifacts = if !filesystem_mutated {
+                database_evidence = Some(database);
+                rollback_evidence = Some(artifacts);
+                before_mutation
+                    .take()
+                    .ok_or(AuthStoreBindingError::Filesystem(
+                        SecretFsError::ArtifactChanged,
+                    ))?();
+                let (verified_artifacts, verified, verified_database) =
+                    self.capture_stable_retire_reconciliation()?;
+                if verified != reconciliation
+                    || !Self::planned_rotation_database_unchanged(database, verified_database)
+                {
+                    return Ok(AuthRetireRollbackOutcome::NotRollbackable(verified));
+                }
+                rollback_evidence
+                    .as_ref()
+                    .ok_or(AuthStoreBindingError::Filesystem(
+                        SecretFsError::ArtifactChanged,
+                    ))?
+                    .revalidate_planned_rotation_rollback_progress(
+                        &self.locked.layout.secret_fd,
+                        &verified_artifacts,
+                    )?;
+                verified_artifacts
+            } else {
+                rollback_evidence
+                    .as_ref()
+                    .ok_or(AuthStoreBindingError::Filesystem(
+                        SecretFsError::ArtifactChanged,
+                    ))?
+                    .revalidate_planned_rotation_rollback_progress(
+                        &self.locked.layout.secret_fd,
+                        &artifacts,
+                    )?;
+                artifacts
+            };
+
+            let reservation =
+                artifacts
+                    .transition_directory()
+                    .ok_or(AuthStoreBindingError::Filesystem(
+                        SecretFsError::ArtifactChanged,
+                    ))?;
+            let transition_artifact = match reservation.artifact {
+                TopLevelArtifactName::Transition {
+                    kind: TransitionKind::Retire,
+                    id,
+                } => TopLevelArtifactName::Transition {
+                    kind: TransitionKind::Retire,
+                    id,
+                },
+                _ => {
+                    return Err(AuthStoreBindingError::Filesystem(
+                        SecretFsError::ArtifactChanged,
+                    ));
+                }
+            };
+            let transition_name = transition_artifact.format();
+            if TopLevelArtifactName::parse(transition_name.as_bytes()) != Ok(transition_artifact) {
+                return Err(AuthStoreBindingError::Filesystem(
+                    SecretFsError::UnsafeAuthArtifact,
+                ));
+            }
+            let parts = RetainedReservationParts::from_directory(reservation);
+            artifacts.revalidate(&self.locked.layout.secret_fd)?;
+            self.revalidate()?;
+
+            match phase {
+                AuthRetirePreSourcePhase::Prepared => {
+                    let prepared = parts.prepared.ok_or(AuthStoreBindingError::Filesystem(
+                        SecretFsError::ArtifactChanged,
+                    ))?;
+                    remove_exact_known_file(
+                        &reservation.directory_fd,
+                        ReservationEntryName::Prepared.as_str(),
+                        KnownFilePurpose::Prepared,
+                        prepared.stat,
+                        prepared.content.expose(),
+                        || {},
+                    )?;
+                    if !filesystem_mutated {
+                        filesystem_mutated = true;
+                        after_first_mutation
+                            .take()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?();
+                    }
+                    #[cfg(test)]
+                    if fault == Some(AuthRetireRollbackTestFault::Prepared) {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                    expected_reconciliation = Some(AuthRetireReconciliation::RetirePreSource {
+                        phase: AuthRetirePreSourcePhase::StagedComplete,
+                        recovery,
+                    });
+                }
+                AuthRetirePreSourcePhase::StagedIncomplete
+                | AuthRetirePreSourcePhase::StagedComplete => {
+                    let staged = parts.staged.map(|(file, _)| file).ok_or(
+                        AuthStoreBindingError::Filesystem(SecretFsError::ArtifactChanged),
+                    )?;
+                    remove_exact_known_file(
+                        &reservation.directory_fd,
+                        ReservationEntryName::StagedKeyring.as_str(),
+                        KnownFilePurpose::StagedKeyring,
+                        staged.stat,
+                        staged.content.expose(),
+                        || {},
+                    )?;
+                    if !filesystem_mutated {
+                        filesystem_mutated = true;
+                        after_first_mutation
+                            .take()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?();
+                    }
+                    #[cfg(test)]
+                    if fault == Some(AuthRetireRollbackTestFault::Staged) {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                    expected_reconciliation = Some(AuthRetireReconciliation::RetirePreSource {
+                        phase: AuthRetirePreSourcePhase::MetadataComplete,
+                        recovery: AuthRetireRecovery::RollbackOnlyCandidate,
+                    });
+                }
+                AuthRetirePreSourcePhase::MetadataIncomplete
+                | AuthRetirePreSourcePhase::MetadataComplete => {
+                    let metadata = parts.metadata.map(|(file, _)| file).ok_or(
+                        AuthStoreBindingError::Filesystem(SecretFsError::ArtifactChanged),
+                    )?;
+                    remove_exact_known_file(
+                        &reservation.directory_fd,
+                        ReservationEntryName::Metadata.as_str(),
+                        KnownFilePurpose::Metadata,
+                        metadata.stat,
+                        metadata.content.expose(),
+                        || {},
+                    )?;
+                    if !filesystem_mutated {
+                        filesystem_mutated = true;
+                        after_first_mutation
+                            .take()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?();
+                    }
+                    #[cfg(test)]
+                    if fault == Some(AuthRetireRollbackTestFault::Metadata) {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                    expected_reconciliation = Some(AuthRetireReconciliation::RetirePreSource {
+                        phase: AuthRetirePreSourcePhase::ReservationOnly,
+                        recovery: AuthRetireRecovery::RollbackOnlyCandidate,
+                    });
+                }
+                AuthRetirePreSourcePhase::ReservationOnly => {
+                    remove_exact_empty_reservation_directory(
+                        &self.locked.layout.secret_fd,
+                        transition_name.as_str(),
+                        reservation,
+                    )?;
+                    if !filesystem_mutated {
+                        filesystem_mutated = true;
+                        after_first_mutation
+                            .take()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?();
+                    }
+                    #[cfg(test)]
+                    if fault == Some(AuthRetireRollbackTestFault::Directory) {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                    expected_reconciliation = Some(AuthRetireReconciliation::ReadyToRetire);
+                }
+            }
+        }
+
+        Err(AuthStoreBindingError::Filesystem(
+            SecretFsError::ArtifactChanged,
+        ))
+    }
+
+    pub(super) fn commit_planned_rotation_source(
+        &self,
+    ) -> Result<AuthPlannedRotationSourceOutcome, AuthStoreBindingError> {
+        self.commit_planned_rotation_source_inner(
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            None,
+            || {},
+            || {},
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn commit_planned_rotation_source_with_test_control(
+        &self,
+        mutation_fault: Option<AuthPlannedRotationSourceMutationTestFault>,
+        durability_fault: Option<AuthPlannedRotationSourceDurabilityTestFault>,
+        before_source_mutation: impl FnOnce(),
+        after_source_mutation: impl FnOnce(),
+    ) -> Result<AuthPlannedRotationSourceOutcome, AuthStoreBindingError> {
+        self.commit_planned_rotation_source_inner(
+            mutation_fault,
+            durability_fault,
+            before_source_mutation,
+            after_source_mutation,
+        )
+    }
+
+    fn commit_planned_rotation_source_inner<BeforeSourceMutation, AfterSourceMutation>(
+        &self,
+        #[cfg(test)] mutation_fault: Option<AuthPlannedRotationSourceMutationTestFault>,
+        #[cfg(test)] durability_fault: Option<AuthPlannedRotationSourceDurabilityTestFault>,
+        before_source_mutation: BeforeSourceMutation,
+        after_source_mutation: AfterSourceMutation,
+    ) -> Result<AuthPlannedRotationSourceOutcome, AuthStoreBindingError>
+    where
+        BeforeSourceMutation: FnOnce(),
+        AfterSourceMutation: FnOnce(),
+    {
+        let (artifacts, reconciliation, _) =
+            self.capture_stable_planned_rotation_reconciliation()?;
+        match reconciliation {
+            AuthPlannedRotationReconciliation::PlannedPreSource {
+                phase: AuthPlannedRotationPreSourcePhase::Prepared,
+                recovery: AuthPlannedRotationRecovery::ResumeOrRollbackCandidate,
+            } => {}
+            AuthPlannedRotationReconciliation::PlannedForwardOnly(_) => {
+                return Ok(AuthPlannedRotationSourceOutcome::AlreadyCommitted);
+            }
+            _ => {
+                return Ok(AuthPlannedRotationSourceOutcome::NotPrepared(
+                    reconciliation,
+                ));
+            }
+        }
+
+        let metadata = artifacts.decode_planned_rotation_metadata().ok_or(
+            AuthStoreBindingError::Filesystem(SecretFsError::UnsafeAuthArtifact),
+        )?;
+        let expectation = metadata.source_expectation();
+        self.durabilize_prepared_planned_rotation_evidence(
+            &artifacts,
+            #[cfg(test)]
+            durability_fault,
+        )?;
+        let (durable_artifacts, durable_reconciliation, _) =
+            self.capture_stable_planned_rotation_reconciliation()?;
+        if durable_reconciliation != reconciliation {
+            return Err(AuthStoreBindingError::Filesystem(
+                SecretFsError::ArtifactChanged,
+            ));
+        }
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        durable_artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()?;
+        before_source_mutation();
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()?;
+
+        #[cfg(test)]
+        let mutation = match mutation_fault {
+            Some(fault) => self
+                .conversation
+                .commit_planned_rotation_source_with_test_fault(expectation, fault),
+            None => self
+                .conversation
+                .commit_planned_rotation_source(expectation),
+        };
+        #[cfg(not(test))]
+        let mutation = self
+            .conversation
+            .commit_planned_rotation_source(expectation);
+        let mutation = mutation.map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        after_source_mutation();
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()?;
+
+        Ok(match mutation {
+            AuthPlannedRotationSourceMutationOutcome::Committed => {
+                AuthPlannedRotationSourceOutcome::Committed
+            }
+            AuthPlannedRotationSourceMutationOutcome::AlreadyCommitted => {
+                AuthPlannedRotationSourceOutcome::AlreadyCommitted
+            }
+            AuthPlannedRotationSourceMutationOutcome::ConfirmedNotCommitted => {
+                AuthPlannedRotationSourceOutcome::ConfirmedNotCommitted
+            }
+            AuthPlannedRotationSourceMutationOutcome::PreconditionChanged => {
+                AuthPlannedRotationSourceOutcome::PreconditionChanged
+            }
+        })
+    }
+
+    pub(super) fn commit_retire_source(
+        &self,
+    ) -> Result<AuthRetireSourceOutcome, AuthStoreBindingError> {
+        self.commit_retire_source_inner(
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            None,
+            || {},
+            || {},
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn commit_retire_source_with_test_control(
+        &self,
+        mutation_fault: Option<AuthPlannedRotationSourceMutationTestFault>,
+        durability_fault: Option<AuthPlannedRotationSourceDurabilityTestFault>,
+        before_source_mutation: impl FnOnce(),
+        after_source_mutation: impl FnOnce(),
+    ) -> Result<AuthRetireSourceOutcome, AuthStoreBindingError> {
+        self.commit_retire_source_inner(
+            mutation_fault,
+            durability_fault,
+            before_source_mutation,
+            after_source_mutation,
+        )
+    }
+
+    fn commit_retire_source_inner<BeforeSourceMutation, AfterSourceMutation>(
+        &self,
+        #[cfg(test)] mutation_fault: Option<AuthPlannedRotationSourceMutationTestFault>,
+        #[cfg(test)] durability_fault: Option<AuthPlannedRotationSourceDurabilityTestFault>,
+        before_source_mutation: BeforeSourceMutation,
+        after_source_mutation: AfterSourceMutation,
+    ) -> Result<AuthRetireSourceOutcome, AuthStoreBindingError>
+    where
+        BeforeSourceMutation: FnOnce(),
+        AfterSourceMutation: FnOnce(),
+    {
+        let (artifacts, reconciliation, _) = self.capture_stable_retire_reconciliation()?;
+        match reconciliation {
+            AuthRetireReconciliation::RetirePreSource {
+                phase: AuthRetirePreSourcePhase::Prepared,
+                recovery: AuthRetireRecovery::ResumeOrRollbackCandidate,
+            } => {}
+            AuthRetireReconciliation::RetireForwardOnly(_) => {
+                return Ok(AuthRetireSourceOutcome::AlreadyCommitted);
+            }
+            _ => return Ok(AuthRetireSourceOutcome::NotPrepared(reconciliation)),
+        }
+
+        let metadata =
+            artifacts
+                .decode_retire_metadata()
+                .ok_or(AuthStoreBindingError::Filesystem(
+                    SecretFsError::UnsafeAuthArtifact,
+                ))?;
+        let expectation = metadata.source_expectation();
+        self.durabilize_prepared_retire_evidence(
+            &artifacts,
+            #[cfg(test)]
+            durability_fault,
+        )?;
+        let (durable_artifacts, durable_reconciliation, _) =
+            self.capture_stable_retire_reconciliation()?;
+        if durable_reconciliation != reconciliation {
+            return Err(AuthStoreBindingError::Filesystem(
+                SecretFsError::ArtifactChanged,
+            ));
+        }
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        durable_artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()?;
+        before_source_mutation();
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()?;
+
+        #[cfg(test)]
+        let mutation = match mutation_fault {
+            Some(fault) => self
+                .conversation
+                .commit_retire_source_with_test_fault(expectation, fault),
+            None => self.conversation.commit_retire_source(expectation),
+        };
+        #[cfg(not(test))]
+        let mutation = self.conversation.commit_retire_source(expectation);
+        let mutation = mutation.map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        after_source_mutation();
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()?;
+
+        Ok(match mutation {
+            AuthPlannedRotationSourceMutationOutcome::Committed => {
+                AuthRetireSourceOutcome::Committed
+            }
+            AuthPlannedRotationSourceMutationOutcome::AlreadyCommitted => {
+                AuthRetireSourceOutcome::AlreadyCommitted
+            }
+            AuthPlannedRotationSourceMutationOutcome::ConfirmedNotCommitted => {
+                AuthRetireSourceOutcome::ConfirmedNotCommitted
+            }
+            AuthPlannedRotationSourceMutationOutcome::PreconditionChanged => {
+                AuthRetireSourceOutcome::PreconditionChanged
+            }
+        })
+    }
+
+    pub(super) fn install_planned_rotation_active_key(
+        &self,
+    ) -> Result<AuthPlannedRotationActiveKeyInstallOutcome, AuthStoreBindingError> {
+        self.install_planned_rotation_active_key_inner(
+            #[cfg(test)]
+            None,
+            || {},
+            || {},
+            || {},
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_planned_rotation_active_key_with_test_control(
+        &self,
+        fault: Option<AuthPlannedRotationActiveKeyInstallTestFault>,
+        before_exchange: impl FnOnce(),
+        after_exchange: impl FnOnce(),
+        after_old_active_removal: impl FnOnce(),
+    ) -> Result<AuthPlannedRotationActiveKeyInstallOutcome, AuthStoreBindingError> {
+        self.install_planned_rotation_active_key_inner(
+            fault,
+            before_exchange,
+            after_exchange,
+            after_old_active_removal,
+        )
+    }
+
+    fn install_planned_rotation_active_key_inner<
+        BeforeExchange,
+        AfterExchange,
+        AfterOldActiveRemoval,
+    >(
+        &self,
+        #[cfg(test)] fault: Option<AuthPlannedRotationActiveKeyInstallTestFault>,
+        before_exchange: BeforeExchange,
+        after_exchange: AfterExchange,
+        after_old_active_removal: AfterOldActiveRemoval,
+    ) -> Result<AuthPlannedRotationActiveKeyInstallOutcome, AuthStoreBindingError>
+    where
+        BeforeExchange: FnOnce(),
+        AfterExchange: FnOnce(),
+        AfterOldActiveRemoval: FnOnce(),
+    {
+        let mut before_exchange = Some(before_exchange);
+        let mut after_exchange = Some(after_exchange);
+        let mut after_old_active_removal = Some(after_old_active_removal);
+        let mut filesystem_mutated = false;
+
+        for _ in 0..6 {
+            let (artifacts, reconciliation, _) =
+                self.capture_stable_planned_rotation_reconciliation()?;
+            let phase = match reconciliation {
+                AuthPlannedRotationReconciliation::PlannedForwardOnly(phase) => phase,
+                _ => {
+                    if filesystem_mutated {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    }
+                    return Ok(AuthPlannedRotationActiveKeyInstallOutcome::NotInstallable(
+                        reconciliation,
+                    ));
+                }
+            };
+            if matches!(
+                phase,
+                AuthPlannedRotationForwardPhase::AwaitingCleanupRename
+                    | AuthPlannedRotationForwardPhase::AwaitingCleanupStagedRemoval
+                    | AuthPlannedRotationForwardPhase::AwaitingCleanupPreparedRemoval
+                    | AuthPlannedRotationForwardPhase::AwaitingCleanupMetadataRemoval
+                    | AuthPlannedRotationForwardPhase::AwaitingCleanupDirectoryRemoval
+            ) {
+                if filesystem_mutated {
+                    return Err(AuthStoreBindingError::Filesystem(
+                        SecretFsError::ArtifactChanged,
+                    ));
+                }
+                return Ok(AuthPlannedRotationActiveKeyInstallOutcome::NotInstallable(
+                    reconciliation,
+                ));
+            }
+            let evidence = artifacts.planned_rotation_active_key_evidence().ok_or(
+                AuthStoreBindingError::Filesystem(SecretFsError::UnsafeAuthArtifact),
+            )?;
+            let metadata = artifacts.decode_planned_rotation_metadata().ok_or(
+                AuthStoreBindingError::Filesystem(SecretFsError::UnsafeAuthArtifact),
+            )?;
+            let expectation = metadata.source_expectation();
+            let install_name = TopLevelArtifactName::InstallTemp {
+                id: evidence.transition_id,
+            }
+            .format();
+            if TopLevelArtifactName::parse(install_name.as_bytes())
+                != Ok(TopLevelArtifactName::InstallTemp {
+                    id: evidence.transition_id,
+                })
+            {
+                return Err(AuthStoreBindingError::Filesystem(
+                    SecretFsError::UnsafeAuthArtifact,
+                ));
+            }
+            artifacts.revalidate(&self.locked.layout.secret_fd)?;
+            self.revalidate()?;
+
+            match phase {
+                AuthPlannedRotationForwardPhase::AwaitingInstallTemp => {
+                    persist_new_known_file(
+                        &self.locked.layout.secret_fd,
+                        install_name.as_str(),
+                        KnownFilePurpose::InstallTemp,
+                        evidence.staged.content.expose(),
+                    )?;
+                    filesystem_mutated = true;
+                    #[cfg(test)]
+                    if fault
+                        == Some(AuthPlannedRotationActiveKeyInstallTestFault::InstallTempDurable)
+                    {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                }
+                AuthPlannedRotationForwardPhase::InstallTempPrefix => {
+                    let install =
+                        artifacts
+                            .install_file()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    let install_bytes = install.content.expose();
+                    let staged_bytes = evidence.staged.content.expose();
+                    if install_bytes.len() >= staged_bytes.len()
+                        || !staged_bytes.starts_with(install_bytes)
+                    {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    }
+                    remove_exact_known_file(
+                        &self.locked.layout.secret_fd,
+                        install_name.as_str(),
+                        KnownFilePurpose::InstallTemp,
+                        install.stat,
+                        install_bytes,
+                        || {},
+                    )?;
+                    filesystem_mutated = true;
+                    #[cfg(test)]
+                    if fault == Some(AuthPlannedRotationActiveKeyInstallTestFault::PrefixRemoved) {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                }
+                AuthPlannedRotationForwardPhase::InstallTempExact => {
+                    let install =
+                        artifacts
+                            .install_file()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    let active =
+                        artifacts
+                            .active_file()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    if !known_file_matches_planned_expected_active(active, expectation) {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    }
+                    durabilize_existing_known_file(
+                        &self.locked.layout.secret_fd,
+                        install_name.as_str(),
+                        KnownFilePurpose::InstallTemp,
+                        install.stat,
+                        evidence.staged.content.expose(),
+                    )?;
+                    durabilize_existing_known_file(
+                        &self.locked.layout.secret_fd,
+                        ACTIVE_KEYRING_NAME,
+                        KnownFilePurpose::ActiveKeyring,
+                        active.stat,
+                        active.content.expose(),
+                    )?;
+
+                    let (exchange_artifacts, exchange_reconciliation, _) =
+                        self.capture_stable_planned_rotation_reconciliation()?;
+                    if exchange_reconciliation
+                        != AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                            AuthPlannedRotationForwardPhase::InstallTempExact,
+                        )
+                    {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    }
+                    let exchange_evidence = exchange_artifacts
+                        .planned_rotation_active_key_evidence()
+                        .ok_or(AuthStoreBindingError::Filesystem(
+                            SecretFsError::UnsafeAuthArtifact,
+                        ))?;
+                    let exchange_install = exchange_artifacts.install_file().ok_or(
+                        AuthStoreBindingError::Filesystem(SecretFsError::ArtifactChanged),
+                    )?;
+                    let exchange_active = exchange_artifacts.active_file().ok_or(
+                        AuthStoreBindingError::Filesystem(SecretFsError::ArtifactChanged),
+                    )?;
+                    exchange_artifacts.revalidate(&self.locked.layout.secret_fd)?;
+                    self.revalidate()?;
+                    exchange_install_temp_with_active(
+                        &self.locked.layout.secret_fd,
+                        install_name.as_str(),
+                        exchange_install.stat,
+                        exchange_evidence.staged.content.expose(),
+                        exchange_active.stat,
+                        exchange_active.content.expose(),
+                        before_exchange
+                            .take()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?,
+                    )?;
+                    filesystem_mutated = true;
+                    #[cfg(test)]
+                    if fault == Some(AuthPlannedRotationActiveKeyInstallTestFault::ExchangeDurable)
+                    {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                    after_exchange
+                        .take()
+                        .ok_or(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ))?();
+                }
+                AuthPlannedRotationForwardPhase::AwaitingOldActiveTempRemoval => {
+                    let install =
+                        artifacts
+                            .install_file()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    if !known_file_matches_planned_expected_active(install, expectation) {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    }
+                    remove_exact_known_file(
+                        &self.locked.layout.secret_fd,
+                        install_name.as_str(),
+                        KnownFilePurpose::InstallTemp,
+                        install.stat,
+                        install.content.expose(),
+                        || {},
+                    )?;
+                    filesystem_mutated = true;
+                    #[cfg(test)]
+                    if fault
+                        == Some(AuthPlannedRotationActiveKeyInstallTestFault::OldActiveTempRemoved)
+                    {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                    after_old_active_removal
+                        .take()
+                        .ok_or(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ))?();
+                }
+                AuthPlannedRotationForwardPhase::AwaitingFinalDbCas => {
+                    let active =
+                        artifacts
+                            .active_file()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    durabilize_existing_known_file(
+                        &self.locked.layout.secret_fd,
+                        ACTIVE_KEYRING_NAME,
+                        KnownFilePurpose::ActiveKeyring,
+                        active.stat,
+                        evidence.staged.content.expose(),
+                    )?;
+                    let (_, postcondition, _) =
+                        self.capture_stable_planned_rotation_reconciliation()?;
+                    if postcondition
+                        != AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                            AuthPlannedRotationForwardPhase::AwaitingFinalDbCas,
+                        )
+                    {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    }
+                    return Ok(if filesystem_mutated {
+                        AuthPlannedRotationActiveKeyInstallOutcome::InstalledAwaitingFinalDbCas
+                    } else {
+                        AuthPlannedRotationActiveKeyInstallOutcome::AlreadyAwaitingFinalDbCas
+                    });
+                }
+                AuthPlannedRotationForwardPhase::AwaitingCleanupRename
+                | AuthPlannedRotationForwardPhase::AwaitingCleanupStagedRemoval
+                | AuthPlannedRotationForwardPhase::AwaitingCleanupPreparedRemoval
+                | AuthPlannedRotationForwardPhase::AwaitingCleanupMetadataRemoval
+                | AuthPlannedRotationForwardPhase::AwaitingCleanupDirectoryRemoval => {
+                    return Err(AuthStoreBindingError::Filesystem(
+                        SecretFsError::ArtifactChanged,
+                    ));
+                }
+            }
+        }
+        Err(AuthStoreBindingError::Filesystem(
+            SecretFsError::ArtifactChanged,
+        ))
+    }
+
+    pub(super) fn install_retire_active_key(
+        &self,
+    ) -> Result<AuthRetireActiveKeyInstallOutcome, AuthStoreBindingError> {
+        self.install_retire_active_key_inner(
+            #[cfg(test)]
+            None,
+            || {},
+            || {},
+            || {},
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_retire_active_key_with_test_control(
+        &self,
+        fault: Option<AuthPlannedRotationActiveKeyInstallTestFault>,
+        before_exchange: impl FnOnce(),
+        after_exchange: impl FnOnce(),
+        after_old_active_removal: impl FnOnce(),
+    ) -> Result<AuthRetireActiveKeyInstallOutcome, AuthStoreBindingError> {
+        self.install_retire_active_key_inner(
+            fault,
+            before_exchange,
+            after_exchange,
+            after_old_active_removal,
+        )
+    }
+
+    fn install_retire_active_key_inner<BeforeExchange, AfterExchange, AfterOldActiveRemoval>(
+        &self,
+        #[cfg(test)] fault: Option<AuthPlannedRotationActiveKeyInstallTestFault>,
+        before_exchange: BeforeExchange,
+        after_exchange: AfterExchange,
+        after_old_active_removal: AfterOldActiveRemoval,
+    ) -> Result<AuthRetireActiveKeyInstallOutcome, AuthStoreBindingError>
+    where
+        BeforeExchange: FnOnce(),
+        AfterExchange: FnOnce(),
+        AfterOldActiveRemoval: FnOnce(),
+    {
+        let mut before_exchange = Some(before_exchange);
+        let mut after_exchange = Some(after_exchange);
+        let mut after_old_active_removal = Some(after_old_active_removal);
+        let mut filesystem_mutated = false;
+
+        for _ in 0..6 {
+            let (artifacts, reconciliation, _) = self.capture_stable_retire_reconciliation()?;
+            let phase = match reconciliation {
+                AuthRetireReconciliation::RetireForwardOnly(phase) => phase,
+                _ => {
+                    if filesystem_mutated {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    }
+                    return Ok(AuthRetireActiveKeyInstallOutcome::NotInstallable(
+                        reconciliation,
+                    ));
+                }
+            };
+            if matches!(
+                phase,
+                AuthRetireForwardPhase::AwaitingCleanupRename
+                    | AuthRetireForwardPhase::AwaitingCleanupStagedRemoval
+                    | AuthRetireForwardPhase::AwaitingCleanupPreparedRemoval
+                    | AuthRetireForwardPhase::AwaitingCleanupMetadataRemoval
+                    | AuthRetireForwardPhase::AwaitingCleanupDirectoryRemoval
+            ) {
+                if filesystem_mutated {
+                    return Err(AuthStoreBindingError::Filesystem(
+                        SecretFsError::ArtifactChanged,
+                    ));
+                }
+                return Ok(AuthRetireActiveKeyInstallOutcome::NotInstallable(
+                    reconciliation,
+                ));
+            }
+            let evidence =
+                artifacts
+                    .retire_active_key_evidence()
+                    .ok_or(AuthStoreBindingError::Filesystem(
+                        SecretFsError::UnsafeAuthArtifact,
+                    ))?;
+            let metadata =
+                artifacts
+                    .decode_retire_metadata()
+                    .ok_or(AuthStoreBindingError::Filesystem(
+                        SecretFsError::UnsafeAuthArtifact,
+                    ))?;
+            let install_name = TopLevelArtifactName::InstallTemp {
+                id: evidence.transition_id,
+            }
+            .format();
+            if TopLevelArtifactName::parse(install_name.as_bytes())
+                != Ok(TopLevelArtifactName::InstallTemp {
+                    id: evidence.transition_id,
+                })
+            {
+                return Err(AuthStoreBindingError::Filesystem(
+                    SecretFsError::UnsafeAuthArtifact,
+                ));
+            }
+            artifacts.revalidate(&self.locked.layout.secret_fd)?;
+            self.revalidate()?;
+
+            match phase {
+                AuthRetireForwardPhase::AwaitingInstallTemp => {
+                    persist_new_known_file(
+                        &self.locked.layout.secret_fd,
+                        install_name.as_str(),
+                        KnownFilePurpose::InstallTemp,
+                        evidence.staged.content.expose(),
+                    )?;
+                    filesystem_mutated = true;
+                    #[cfg(test)]
+                    if fault
+                        == Some(AuthPlannedRotationActiveKeyInstallTestFault::InstallTempDurable)
+                    {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                }
+                AuthRetireForwardPhase::InstallTempPrefix => {
+                    let install =
+                        artifacts
+                            .install_file()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    let install_bytes = install.content.expose();
+                    let staged_bytes = evidence.staged.content.expose();
+                    if install_bytes.len() >= staged_bytes.len()
+                        || !staged_bytes.starts_with(install_bytes)
+                    {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    }
+                    remove_exact_known_file(
+                        &self.locked.layout.secret_fd,
+                        install_name.as_str(),
+                        KnownFilePurpose::InstallTemp,
+                        install.stat,
+                        install_bytes,
+                        || {},
+                    )?;
+                    filesystem_mutated = true;
+                    #[cfg(test)]
+                    if fault == Some(AuthPlannedRotationActiveKeyInstallTestFault::PrefixRemoved) {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                }
+                AuthRetireForwardPhase::InstallTempExact => {
+                    let install =
+                        artifacts
+                            .install_file()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    let active =
+                        artifacts
+                            .active_file()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    if metadata
+                        .validate_current_keyring(SecretBytes::new(
+                            active.content.expose().to_vec(),
+                        ))
+                        .is_err()
+                    {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    }
+                    durabilize_existing_known_file(
+                        &self.locked.layout.secret_fd,
+                        install_name.as_str(),
+                        KnownFilePurpose::InstallTemp,
+                        install.stat,
+                        evidence.staged.content.expose(),
+                    )?;
+                    durabilize_existing_known_file(
+                        &self.locked.layout.secret_fd,
+                        ACTIVE_KEYRING_NAME,
+                        KnownFilePurpose::ActiveKeyring,
+                        active.stat,
+                        active.content.expose(),
+                    )?;
+
+                    let (exchange_artifacts, exchange_reconciliation, _) =
+                        self.capture_stable_retire_reconciliation()?;
+                    if exchange_reconciliation
+                        != AuthRetireReconciliation::RetireForwardOnly(
+                            AuthRetireForwardPhase::InstallTempExact,
+                        )
+                    {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    }
+                    let exchange_evidence = exchange_artifacts.retire_active_key_evidence().ok_or(
+                        AuthStoreBindingError::Filesystem(SecretFsError::UnsafeAuthArtifact),
+                    )?;
+                    let exchange_install = exchange_artifacts.install_file().ok_or(
+                        AuthStoreBindingError::Filesystem(SecretFsError::ArtifactChanged),
+                    )?;
+                    let exchange_active = exchange_artifacts.active_file().ok_or(
+                        AuthStoreBindingError::Filesystem(SecretFsError::ArtifactChanged),
+                    )?;
+                    exchange_artifacts.revalidate(&self.locked.layout.secret_fd)?;
+                    self.revalidate()?;
+                    exchange_install_temp_with_active(
+                        &self.locked.layout.secret_fd,
+                        install_name.as_str(),
+                        exchange_install.stat,
+                        exchange_evidence.staged.content.expose(),
+                        exchange_active.stat,
+                        exchange_active.content.expose(),
+                        before_exchange
+                            .take()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?,
+                    )?;
+                    filesystem_mutated = true;
+                    #[cfg(test)]
+                    if fault == Some(AuthPlannedRotationActiveKeyInstallTestFault::ExchangeDurable)
+                    {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                    after_exchange
+                        .take()
+                        .ok_or(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ))?();
+                }
+                AuthRetireForwardPhase::AwaitingOldActiveTempRemoval => {
+                    let install =
+                        artifacts
+                            .install_file()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    if metadata
+                        .validate_current_keyring(SecretBytes::new(
+                            install.content.expose().to_vec(),
+                        ))
+                        .is_err()
+                    {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    }
+                    remove_exact_known_file(
+                        &self.locked.layout.secret_fd,
+                        install_name.as_str(),
+                        KnownFilePurpose::InstallTemp,
+                        install.stat,
+                        install.content.expose(),
+                        || {},
+                    )?;
+                    filesystem_mutated = true;
+                    #[cfg(test)]
+                    if fault
+                        == Some(AuthPlannedRotationActiveKeyInstallTestFault::OldActiveTempRemoved)
+                    {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                    after_old_active_removal
+                        .take()
+                        .ok_or(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ))?();
+                }
+                AuthRetireForwardPhase::AwaitingFinalDbCas => {
+                    let active =
+                        artifacts
+                            .active_file()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    durabilize_existing_known_file(
+                        &self.locked.layout.secret_fd,
+                        ACTIVE_KEYRING_NAME,
+                        KnownFilePurpose::ActiveKeyring,
+                        active.stat,
+                        evidence.staged.content.expose(),
+                    )?;
+                    let (_, postcondition, _) = self.capture_stable_retire_reconciliation()?;
+                    if postcondition
+                        != AuthRetireReconciliation::RetireForwardOnly(
+                            AuthRetireForwardPhase::AwaitingFinalDbCas,
+                        )
+                    {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    }
+                    return Ok(if filesystem_mutated {
+                        AuthRetireActiveKeyInstallOutcome::InstalledAwaitingFinalDbCas
+                    } else {
+                        AuthRetireActiveKeyInstallOutcome::AlreadyAwaitingFinalDbCas
+                    });
+                }
+                AuthRetireForwardPhase::AwaitingCleanupRename
+                | AuthRetireForwardPhase::AwaitingCleanupStagedRemoval
+                | AuthRetireForwardPhase::AwaitingCleanupPreparedRemoval
+                | AuthRetireForwardPhase::AwaitingCleanupMetadataRemoval
+                | AuthRetireForwardPhase::AwaitingCleanupDirectoryRemoval => {
+                    return Err(AuthStoreBindingError::Filesystem(
+                        SecretFsError::ArtifactChanged,
+                    ));
+                }
+            }
+        }
+        Err(AuthStoreBindingError::Filesystem(
+            SecretFsError::ArtifactChanged,
+        ))
+    }
+
+    pub(super) fn commit_planned_rotation_final_lifecycle(
+        &self,
+    ) -> Result<AuthPlannedRotationFinalLifecycleOutcome, AuthStoreBindingError> {
+        self.commit_planned_rotation_final_lifecycle_inner(
+            #[cfg(test)]
+            None,
+            || {},
+            || {},
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn commit_planned_rotation_final_lifecycle_with_test_control(
+        &self,
+        fault: Option<AuthPlannedRotationFinalLifecycleMutationTestFault>,
+        before_mutation: impl FnOnce(),
+        after_mutation: impl FnOnce(),
+    ) -> Result<AuthPlannedRotationFinalLifecycleOutcome, AuthStoreBindingError> {
+        self.commit_planned_rotation_final_lifecycle_inner(fault, before_mutation, after_mutation)
+    }
+
+    fn commit_planned_rotation_final_lifecycle_inner<BeforeMutation, AfterMutation>(
+        &self,
+        #[cfg(test)] fault: Option<AuthPlannedRotationFinalLifecycleMutationTestFault>,
+        before_mutation: BeforeMutation,
+        after_mutation: AfterMutation,
+    ) -> Result<AuthPlannedRotationFinalLifecycleOutcome, AuthStoreBindingError>
+    where
+        BeforeMutation: FnOnce(),
+        AfterMutation: FnOnce(),
+    {
+        let (artifacts, reconciliation, _) =
+            self.capture_stable_planned_rotation_reconciliation()?;
+        let expected_phase = match reconciliation {
+            AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                AuthPlannedRotationForwardPhase::AwaitingFinalDbCas,
+            ) => AuthPlannedRotationForwardPhase::AwaitingFinalDbCas,
+            AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                AuthPlannedRotationForwardPhase::AwaitingCleanupRename,
+            ) => AuthPlannedRotationForwardPhase::AwaitingCleanupRename,
+            _ => {
+                return Ok(AuthPlannedRotationFinalLifecycleOutcome::NotActivatable(
+                    reconciliation,
+                ));
+            }
+        };
+        let evidence = artifacts.planned_rotation_active_key_evidence().ok_or(
+            AuthStoreBindingError::Filesystem(SecretFsError::UnsafeAuthArtifact),
+        )?;
+        let active = artifacts
+            .active_file()
+            .ok_or(AuthStoreBindingError::Filesystem(
+                SecretFsError::ArtifactChanged,
+            ))?;
+        durabilize_existing_known_file(
+            &self.locked.layout.secret_fd,
+            ACTIVE_KEYRING_NAME,
+            KnownFilePurpose::ActiveKeyring,
+            active.stat,
+            evidence.staged.content.expose(),
+        )?;
+        self.durabilize_prepared_planned_rotation_evidence(
+            &artifacts,
+            #[cfg(test)]
+            None,
+        )?;
+
+        let (cas_artifacts, cas_reconciliation, _) =
+            self.capture_stable_planned_rotation_reconciliation()?;
+        if cas_reconciliation
+            != AuthPlannedRotationReconciliation::PlannedForwardOnly(expected_phase)
+        {
+            return Err(AuthStoreBindingError::Filesystem(
+                SecretFsError::ArtifactChanged,
+            ));
+        }
+        if expected_phase == AuthPlannedRotationForwardPhase::AwaitingCleanupRename {
+            return Ok(AuthPlannedRotationFinalLifecycleOutcome::AlreadyActivatedAwaitingCleanup);
+        }
+        let metadata = cas_artifacts.decode_planned_rotation_metadata().ok_or(
+            AuthStoreBindingError::Filesystem(SecretFsError::UnsafeAuthArtifact),
+        )?;
+        let expectation = metadata.source_expectation();
+
+        before_mutation();
+        cas_artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()?;
+        #[cfg(test)]
+        let mutation = match fault {
+            Some(fault) => self
+                .conversation
+                .commit_planned_rotation_final_lifecycle_with_test_fault(expectation, fault),
+            None => self
+                .conversation
+                .commit_planned_rotation_final_lifecycle(expectation),
+        };
+        #[cfg(not(test))]
+        let mutation = self
+            .conversation
+            .commit_planned_rotation_final_lifecycle(expectation);
+        let mutation = mutation.map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        after_mutation();
+        cas_artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()?;
+
+        let (_, postcondition, _) = self.capture_stable_planned_rotation_reconciliation()?;
+        match mutation {
+            AuthPlannedRotationFinalLifecycleMutationOutcome::Committed => {
+                if postcondition
+                    != AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                        AuthPlannedRotationForwardPhase::AwaitingCleanupRename,
+                    )
+                {
+                    return Err(AuthStoreBindingError::ConversationStoreChanged);
+                }
+                Ok(AuthPlannedRotationFinalLifecycleOutcome::ActivatedAwaitingCleanup)
+            }
+            AuthPlannedRotationFinalLifecycleMutationOutcome::AlreadyCommitted => {
+                if postcondition
+                    != AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                        AuthPlannedRotationForwardPhase::AwaitingCleanupRename,
+                    )
+                {
+                    return Err(AuthStoreBindingError::ConversationStoreChanged);
+                }
+                Ok(AuthPlannedRotationFinalLifecycleOutcome::AlreadyActivatedAwaitingCleanup)
+            }
+            AuthPlannedRotationFinalLifecycleMutationOutcome::ConfirmedNotCommitted => {
+                if postcondition
+                    != AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                        AuthPlannedRotationForwardPhase::AwaitingFinalDbCas,
+                    )
+                {
+                    return Err(AuthStoreBindingError::ConversationStoreChanged);
+                }
+                Ok(AuthPlannedRotationFinalLifecycleOutcome::ConfirmedNotActivated)
+            }
+            AuthPlannedRotationFinalLifecycleMutationOutcome::PreconditionChanged => {
+                Err(AuthStoreBindingError::ConversationStoreChanged)
+            }
+        }
+    }
+
+    pub(super) fn commit_retire_final_lifecycle(
+        &self,
+    ) -> Result<AuthRetireFinalLifecycleOutcome, AuthStoreBindingError> {
+        self.commit_retire_final_lifecycle_inner(
+            #[cfg(test)]
+            None,
+            || {},
+            || {},
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn commit_retire_final_lifecycle_with_test_control(
+        &self,
+        fault: Option<AuthPlannedRotationFinalLifecycleMutationTestFault>,
+        before_mutation: impl FnOnce(),
+        after_mutation: impl FnOnce(),
+    ) -> Result<AuthRetireFinalLifecycleOutcome, AuthStoreBindingError> {
+        self.commit_retire_final_lifecycle_inner(fault, before_mutation, after_mutation)
+    }
+
+    fn commit_retire_final_lifecycle_inner<BeforeMutation, AfterMutation>(
+        &self,
+        #[cfg(test)] fault: Option<AuthPlannedRotationFinalLifecycleMutationTestFault>,
+        before_mutation: BeforeMutation,
+        after_mutation: AfterMutation,
+    ) -> Result<AuthRetireFinalLifecycleOutcome, AuthStoreBindingError>
+    where
+        BeforeMutation: FnOnce(),
+        AfterMutation: FnOnce(),
+    {
+        let (artifacts, reconciliation, _) = self.capture_stable_retire_reconciliation()?;
+        let expected_phase = match reconciliation {
+            AuthRetireReconciliation::RetireForwardOnly(
+                AuthRetireForwardPhase::AwaitingFinalDbCas,
+            ) => AuthRetireForwardPhase::AwaitingFinalDbCas,
+            AuthRetireReconciliation::RetireForwardOnly(
+                AuthRetireForwardPhase::AwaitingCleanupRename,
+            ) => AuthRetireForwardPhase::AwaitingCleanupRename,
+            _ => {
+                return Ok(AuthRetireFinalLifecycleOutcome::NotActivatable(
+                    reconciliation,
+                ));
+            }
+        };
+        let evidence =
+            artifacts
+                .retire_active_key_evidence()
+                .ok_or(AuthStoreBindingError::Filesystem(
+                    SecretFsError::UnsafeAuthArtifact,
+                ))?;
+        let active = artifacts
+            .active_file()
+            .ok_or(AuthStoreBindingError::Filesystem(
+                SecretFsError::ArtifactChanged,
+            ))?;
+        durabilize_existing_known_file(
+            &self.locked.layout.secret_fd,
+            ACTIVE_KEYRING_NAME,
+            KnownFilePurpose::ActiveKeyring,
+            active.stat,
+            evidence.staged.content.expose(),
+        )?;
+        self.durabilize_prepared_retire_evidence(
+            &artifacts,
+            #[cfg(test)]
+            None,
+        )?;
+
+        let (cas_artifacts, cas_reconciliation, _) = self.capture_stable_retire_reconciliation()?;
+        if cas_reconciliation != AuthRetireReconciliation::RetireForwardOnly(expected_phase) {
+            return Err(AuthStoreBindingError::Filesystem(
+                SecretFsError::ArtifactChanged,
+            ));
+        }
+        if expected_phase == AuthRetireForwardPhase::AwaitingCleanupRename {
+            return Ok(AuthRetireFinalLifecycleOutcome::AlreadyActivatedAwaitingCleanup);
+        }
+        let metadata =
+            cas_artifacts
+                .decode_retire_metadata()
+                .ok_or(AuthStoreBindingError::Filesystem(
+                    SecretFsError::UnsafeAuthArtifact,
+                ))?;
+        let expectation = metadata.source_expectation();
+
+        before_mutation();
+        cas_artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()?;
+        #[cfg(test)]
+        let mutation = match fault {
+            Some(fault) => self
+                .conversation
+                .commit_retire_final_lifecycle_with_test_fault(expectation, fault),
+            None => self.conversation.commit_retire_final_lifecycle(expectation),
+        };
+        #[cfg(not(test))]
+        let mutation = self.conversation.commit_retire_final_lifecycle(expectation);
+        let mutation = mutation.map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        after_mutation();
+        cas_artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()?;
+
+        let (_, postcondition, _) = self.capture_stable_retire_reconciliation()?;
+        match mutation {
+            AuthPlannedRotationFinalLifecycleMutationOutcome::Committed => {
+                if postcondition
+                    != AuthRetireReconciliation::RetireForwardOnly(
+                        AuthRetireForwardPhase::AwaitingCleanupRename,
+                    )
+                {
+                    return Err(AuthStoreBindingError::ConversationStoreChanged);
+                }
+                Ok(AuthRetireFinalLifecycleOutcome::ActivatedAwaitingCleanup)
+            }
+            AuthPlannedRotationFinalLifecycleMutationOutcome::AlreadyCommitted => {
+                if postcondition
+                    != AuthRetireReconciliation::RetireForwardOnly(
+                        AuthRetireForwardPhase::AwaitingCleanupRename,
+                    )
+                {
+                    return Err(AuthStoreBindingError::ConversationStoreChanged);
+                }
+                Ok(AuthRetireFinalLifecycleOutcome::AlreadyActivatedAwaitingCleanup)
+            }
+            AuthPlannedRotationFinalLifecycleMutationOutcome::ConfirmedNotCommitted => {
+                if postcondition
+                    != AuthRetireReconciliation::RetireForwardOnly(
+                        AuthRetireForwardPhase::AwaitingFinalDbCas,
+                    )
+                {
+                    return Err(AuthStoreBindingError::ConversationStoreChanged);
+                }
+                Ok(AuthRetireFinalLifecycleOutcome::ConfirmedNotActivated)
+            }
+            AuthPlannedRotationFinalLifecycleMutationOutcome::PreconditionChanged => {
+                Err(AuthStoreBindingError::ConversationStoreChanged)
+            }
+        }
+    }
+
+    pub(super) fn cleanup_planned_rotation(
+        &self,
+    ) -> Result<AuthPlannedRotationCleanupOutcome, AuthStoreBindingError> {
+        self.cleanup_planned_rotation_inner(
+            #[cfg(test)]
+            None,
+            || {},
+            || {},
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn cleanup_planned_rotation_with_test_control(
+        &self,
+        fault: Option<AuthPlannedRotationCleanupTestFault>,
+        before_rename: impl FnOnce(),
+        after_cleanup: impl FnOnce(),
+    ) -> Result<AuthPlannedRotationCleanupOutcome, AuthStoreBindingError> {
+        self.cleanup_planned_rotation_inner(fault, before_rename, after_cleanup)
+    }
+
+    fn cleanup_planned_rotation_inner<BeforeRename, AfterCleanup>(
+        &self,
+        #[cfg(test)] fault: Option<AuthPlannedRotationCleanupTestFault>,
+        before_rename: BeforeRename,
+        after_cleanup: AfterCleanup,
+    ) -> Result<AuthPlannedRotationCleanupOutcome, AuthStoreBindingError>
+    where
+        BeforeRename: FnOnce(),
+        AfterCleanup: FnOnce(),
+    {
+        let mut before_rename = Some(before_rename);
+        let mut after_cleanup = Some(after_cleanup);
+        let mut retained_artifacts = None;
+        let mut retained_metadata = None;
+        let mut retained_database = None;
+        let mut filesystem_mutated = false;
+
+        for _ in 0..7 {
+            let (artifacts, reconciliation, database) =
+                self.capture_stable_planned_rotation_reconciliation()?;
+            if let (Some(metadata), Some(expected_database)) =
+                (retained_metadata.as_ref(), retained_database)
+            {
+                self.revalidate_retained_planned_rotation_source(
+                    &artifacts,
+                    metadata,
+                    expected_database,
+                )?;
+            }
+            let captured_metadata = artifacts.decode_planned_rotation_metadata();
+            if matches!(
+                reconciliation,
+                AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                    AuthPlannedRotationForwardPhase::AwaitingCleanupRename
+                        | AuthPlannedRotationForwardPhase::AwaitingCleanupStagedRemoval
+                        | AuthPlannedRotationForwardPhase::AwaitingCleanupPreparedRemoval
+                        | AuthPlannedRotationForwardPhase::AwaitingCleanupMetadataRemoval
+                )
+            ) && retained_metadata.is_none()
+            {
+                let metadata =
+                    captured_metadata
+                        .as_ref()
+                        .ok_or(AuthStoreBindingError::Filesystem(
+                            SecretFsError::UnsafeAuthArtifact,
+                        ))?;
+                self.revalidate_retained_planned_rotation_source(&artifacts, metadata, database)?;
+            }
+
+            match reconciliation {
+                AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                    AuthPlannedRotationForwardPhase::AwaitingCleanupRename,
+                ) => {
+                    let reservation = artifacts.transition_directory().ok_or(
+                        AuthStoreBindingError::Filesystem(SecretFsError::ArtifactChanged),
+                    )?;
+                    let (kind, id) = match reservation.artifact {
+                        TopLevelArtifactName::Transition {
+                            kind: TransitionKind::Planned,
+                            id,
+                        } => (TransitionKind::Planned, id),
+                        _ => {
+                            return Err(AuthStoreBindingError::Filesystem(
+                                SecretFsError::UnsafeAuthArtifact,
+                            ));
+                        }
+                    };
+                    let transition_artifact = TopLevelArtifactName::Transition { kind, id };
+                    let cleanup_artifact = TopLevelArtifactName::Cleanup { kind, id };
+                    let transition_name = transition_artifact.format();
+                    let cleanup_name = cleanup_artifact.format();
+                    if TopLevelArtifactName::parse(transition_name.as_bytes())
+                        != Ok(transition_artifact)
+                        || TopLevelArtifactName::parse(cleanup_name.as_bytes())
+                            != Ok(cleanup_artifact)
+                    {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::UnsafeAuthArtifact,
+                        ));
+                    }
+                    before_rename
+                        .take()
+                        .ok_or(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ))?();
+                    let metadata =
+                        captured_metadata
+                            .as_ref()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::UnsafeAuthArtifact,
+                            ))?;
+                    self.revalidate_retained_planned_rotation_source(
+                        &artifacts, metadata, database,
+                    )?;
+                    artifacts.revalidate(&self.locked.layout.secret_fd)?;
+                    self.revalidate()?;
+                    rename_exact_reservation_to_cleanup_no_replace(
+                        &self.locked.layout.secret_fd,
+                        transition_name.as_str(),
+                        cleanup_name.as_str(),
+                        reservation,
+                    )?;
+                    filesystem_mutated = true;
+                    retain_planned_rotation_cleanup_evidence(
+                        &mut retained_artifacts,
+                        &mut retained_metadata,
+                        &mut retained_database,
+                        artifacts,
+                        captured_metadata,
+                        database,
+                    )?;
+                    #[cfg(test)]
+                    if fault == Some(AuthPlannedRotationCleanupTestFault::Rename) {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                }
+                AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                    AuthPlannedRotationForwardPhase::AwaitingCleanupStagedRemoval,
+                ) => {
+                    let cleanup =
+                        artifacts
+                            .cleanup_directory()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    let (staged, CodecObservation::Valid) =
+                        RetainedReservationParts::from_directory(cleanup)
+                            .staged
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?
+                    else {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    };
+                    artifacts.revalidate(&self.locked.layout.secret_fd)?;
+                    self.revalidate()?;
+                    remove_exact_known_file(
+                        &cleanup.directory_fd,
+                        ReservationEntryName::StagedKeyring.as_str(),
+                        KnownFilePurpose::StagedKeyring,
+                        staged.stat,
+                        staged.content.expose(),
+                        || {},
+                    )?;
+                    filesystem_mutated = true;
+                    retain_planned_rotation_cleanup_evidence(
+                        &mut retained_artifacts,
+                        &mut retained_metadata,
+                        &mut retained_database,
+                        artifacts,
+                        captured_metadata,
+                        database,
+                    )?;
+                    #[cfg(test)]
+                    if fault == Some(AuthPlannedRotationCleanupTestFault::Staged) {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                }
+                AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                    AuthPlannedRotationForwardPhase::AwaitingCleanupPreparedRemoval,
+                ) => {
+                    let cleanup =
+                        artifacts
+                            .cleanup_directory()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    let prepared = RetainedReservationParts::from_directory(cleanup)
+                        .prepared
+                        .ok_or(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ))?;
+                    artifacts.revalidate(&self.locked.layout.secret_fd)?;
+                    self.revalidate()?;
+                    remove_exact_known_file(
+                        &cleanup.directory_fd,
+                        ReservationEntryName::Prepared.as_str(),
+                        KnownFilePurpose::Prepared,
+                        prepared.stat,
+                        prepared.content.expose(),
+                        || {},
+                    )?;
+                    filesystem_mutated = true;
+                    retain_planned_rotation_cleanup_evidence(
+                        &mut retained_artifacts,
+                        &mut retained_metadata,
+                        &mut retained_database,
+                        artifacts,
+                        captured_metadata,
+                        database,
+                    )?;
+                    #[cfg(test)]
+                    if fault == Some(AuthPlannedRotationCleanupTestFault::Prepared) {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                }
+                AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                    AuthPlannedRotationForwardPhase::AwaitingCleanupMetadataRemoval,
+                ) => {
+                    let cleanup =
+                        artifacts
+                            .cleanup_directory()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    let (metadata_file, CodecObservation::Valid) =
+                        RetainedReservationParts::from_directory(cleanup)
+                            .metadata
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?
+                    else {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    };
+                    artifacts.revalidate(&self.locked.layout.secret_fd)?;
+                    self.revalidate()?;
+                    remove_exact_known_file(
+                        &cleanup.directory_fd,
+                        ReservationEntryName::Metadata.as_str(),
+                        KnownFilePurpose::Metadata,
+                        metadata_file.stat,
+                        metadata_file.content.expose(),
+                        || {},
+                    )?;
+                    filesystem_mutated = true;
+                    retain_planned_rotation_cleanup_evidence(
+                        &mut retained_artifacts,
+                        &mut retained_metadata,
+                        &mut retained_database,
+                        artifacts,
+                        captured_metadata,
+                        database,
+                    )?;
+                    #[cfg(test)]
+                    if fault == Some(AuthPlannedRotationCleanupTestFault::Metadata) {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                }
+                AuthPlannedRotationReconciliation::PlannedForwardOnly(
+                    AuthPlannedRotationForwardPhase::AwaitingCleanupDirectoryRemoval,
+                ) => {
+                    let cleanup =
+                        artifacts
+                            .cleanup_directory()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    let (kind, id) = match cleanup.artifact {
+                        TopLevelArtifactName::Cleanup {
+                            kind: TransitionKind::Planned,
+                            id,
+                        } => (TransitionKind::Planned, id),
+                        _ => {
+                            return Err(AuthStoreBindingError::Filesystem(
+                                SecretFsError::UnsafeAuthArtifact,
+                            ));
+                        }
+                    };
+                    let cleanup_artifact = TopLevelArtifactName::Cleanup { kind, id };
+                    let cleanup_name = cleanup_artifact.format();
+                    if TopLevelArtifactName::parse(cleanup_name.as_bytes()) != Ok(cleanup_artifact)
+                    {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::UnsafeAuthArtifact,
+                        ));
+                    }
+                    artifacts.revalidate(&self.locked.layout.secret_fd)?;
+                    self.revalidate()?;
+                    remove_exact_empty_reservation_directory(
+                        &self.locked.layout.secret_fd,
+                        cleanup_name.as_str(),
+                        cleanup,
+                    )?;
+                    filesystem_mutated = true;
+                    #[cfg(test)]
+                    if fault == Some(AuthPlannedRotationCleanupTestFault::Directory) {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                }
+                AuthPlannedRotationReconciliation::PlannedRotationComplete => {
+                    let active =
+                        artifacts
+                            .active_file()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    durabilize_existing_known_file(
+                        &self.locked.layout.secret_fd,
+                        ACTIVE_KEYRING_NAME,
+                        KnownFilePurpose::ActiveKeyring,
+                        active.stat,
+                        active.content.expose(),
+                    )?;
+                    if !filesystem_mutated {
+                        let (_, postcondition, _) =
+                            self.capture_stable_planned_rotation_reconciliation()?;
+                        if postcondition
+                            != AuthPlannedRotationReconciliation::PlannedRotationComplete
+                        {
+                            return Err(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ));
+                        }
+                        return Ok(AuthPlannedRotationCleanupOutcome::AlreadyCompleted);
+                    }
+
+                    after_cleanup
+                        .take()
+                        .ok_or(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ))?();
+                    let (terminal_artifacts, terminal_reconciliation, _) =
+                        self.capture_stable_planned_rotation_reconciliation()?;
+                    if terminal_reconciliation
+                        != AuthPlannedRotationReconciliation::PlannedRotationComplete
+                    {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    }
+                    if let (Some(metadata), Some(expected_database)) =
+                        (retained_metadata.as_ref(), retained_database)
+                    {
+                        self.revalidate_retained_planned_rotation_source(
+                            &terminal_artifacts,
+                            metadata,
+                            expected_database,
+                        )?;
+                    }
+                    if let Some(retained) = retained_artifacts.as_ref() {
+                        retained
+                            .revalidate_completed_cleanup_evidence(&self.locked.layout.secret_fd)?;
+                    }
+                    terminal_artifacts.revalidate(&self.locked.layout.secret_fd)?;
+                    self.revalidate()?;
+                    return Ok(AuthPlannedRotationCleanupOutcome::Completed);
+                }
+                _ => {
+                    if filesystem_mutated {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    }
+                    return Ok(AuthPlannedRotationCleanupOutcome::NotCleanable(
+                        reconciliation,
+                    ));
+                }
+            }
+        }
+        Err(AuthStoreBindingError::Filesystem(
+            SecretFsError::ArtifactChanged,
+        ))
+    }
+
+    pub(super) fn cleanup_retire(&self) -> Result<AuthRetireCleanupOutcome, AuthStoreBindingError> {
+        self.cleanup_retire_inner(
+            #[cfg(test)]
+            None,
+            || {},
+            || {},
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn cleanup_retire_with_test_control(
+        &self,
+        fault: Option<AuthPlannedRotationCleanupTestFault>,
+        before_rename: impl FnOnce(),
+        after_cleanup: impl FnOnce(),
+    ) -> Result<AuthRetireCleanupOutcome, AuthStoreBindingError> {
+        self.cleanup_retire_inner(fault, before_rename, after_cleanup)
+    }
+
+    fn cleanup_retire_inner<BeforeRename, AfterCleanup>(
+        &self,
+        #[cfg(test)] fault: Option<AuthPlannedRotationCleanupTestFault>,
+        before_rename: BeforeRename,
+        after_cleanup: AfterCleanup,
+    ) -> Result<AuthRetireCleanupOutcome, AuthStoreBindingError>
+    where
+        BeforeRename: FnOnce(),
+        AfterCleanup: FnOnce(),
+    {
+        let mut before_rename = Some(before_rename);
+        let mut after_cleanup = Some(after_cleanup);
+        let mut retained_artifacts = None;
+        let mut retained_metadata = None;
+        let mut retained_database = None;
+        let mut filesystem_mutated = false;
+
+        for _ in 0..7 {
+            let (artifacts, reconciliation, database) =
+                self.capture_stable_retire_reconciliation()?;
+            if let (Some(metadata), Some(expected_database)) =
+                (retained_metadata.as_ref(), retained_database)
+            {
+                self.revalidate_retained_retire_source(&artifacts, metadata, expected_database)?;
+            }
+            let captured_metadata = artifacts.decode_retire_metadata();
+            if matches!(
+                reconciliation,
+                AuthRetireReconciliation::RetireForwardOnly(
+                    AuthRetireForwardPhase::AwaitingCleanupRename
+                        | AuthRetireForwardPhase::AwaitingCleanupStagedRemoval
+                        | AuthRetireForwardPhase::AwaitingCleanupPreparedRemoval
+                        | AuthRetireForwardPhase::AwaitingCleanupMetadataRemoval
+                )
+            ) && retained_metadata.is_none()
+            {
+                let metadata =
+                    captured_metadata
+                        .as_ref()
+                        .ok_or(AuthStoreBindingError::Filesystem(
+                            SecretFsError::UnsafeAuthArtifact,
+                        ))?;
+                self.revalidate_retained_retire_source(&artifacts, metadata, database)?;
+            }
+
+            match reconciliation {
+                AuthRetireReconciliation::RetireForwardOnly(
+                    AuthRetireForwardPhase::AwaitingCleanupRename,
+                ) => {
+                    let reservation = artifacts.transition_directory().ok_or(
+                        AuthStoreBindingError::Filesystem(SecretFsError::ArtifactChanged),
+                    )?;
+                    let id = match reservation.artifact {
+                        TopLevelArtifactName::Transition {
+                            kind: TransitionKind::Retire,
+                            id,
+                        } => id,
+                        _ => {
+                            return Err(AuthStoreBindingError::Filesystem(
+                                SecretFsError::UnsafeAuthArtifact,
+                            ));
+                        }
+                    };
+                    let transition_artifact = TopLevelArtifactName::Transition {
+                        kind: TransitionKind::Retire,
+                        id,
+                    };
+                    let cleanup_artifact = TopLevelArtifactName::Cleanup {
+                        kind: TransitionKind::Retire,
+                        id,
+                    };
+                    let transition_name = transition_artifact.format();
+                    let cleanup_name = cleanup_artifact.format();
+                    if TopLevelArtifactName::parse(transition_name.as_bytes())
+                        != Ok(transition_artifact)
+                        || TopLevelArtifactName::parse(cleanup_name.as_bytes())
+                            != Ok(cleanup_artifact)
+                    {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::UnsafeAuthArtifact,
+                        ));
+                    }
+                    before_rename
+                        .take()
+                        .ok_or(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ))?();
+                    let metadata =
+                        captured_metadata
+                            .as_ref()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::UnsafeAuthArtifact,
+                            ))?;
+                    self.revalidate_retained_retire_source(&artifacts, metadata, database)?;
+                    artifacts.revalidate(&self.locked.layout.secret_fd)?;
+                    self.revalidate()?;
+                    rename_exact_reservation_to_cleanup_no_replace(
+                        &self.locked.layout.secret_fd,
+                        transition_name.as_str(),
+                        cleanup_name.as_str(),
+                        reservation,
+                    )?;
+                    filesystem_mutated = true;
+                    retain_retire_cleanup_evidence(
+                        &mut retained_artifacts,
+                        &mut retained_metadata,
+                        &mut retained_database,
+                        artifacts,
+                        captured_metadata,
+                        database,
+                    )?;
+                    #[cfg(test)]
+                    if fault == Some(AuthPlannedRotationCleanupTestFault::Rename) {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                }
+                AuthRetireReconciliation::RetireForwardOnly(
+                    AuthRetireForwardPhase::AwaitingCleanupStagedRemoval,
+                ) => {
+                    let cleanup =
+                        artifacts
+                            .cleanup_directory()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    let (staged, CodecObservation::Valid) =
+                        RetainedReservationParts::from_directory(cleanup)
+                            .staged
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?
+                    else {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    };
+                    artifacts.revalidate(&self.locked.layout.secret_fd)?;
+                    self.revalidate()?;
+                    remove_exact_known_file(
+                        &cleanup.directory_fd,
+                        ReservationEntryName::StagedKeyring.as_str(),
+                        KnownFilePurpose::StagedKeyring,
+                        staged.stat,
+                        staged.content.expose(),
+                        || {},
+                    )?;
+                    filesystem_mutated = true;
+                    retain_retire_cleanup_evidence(
+                        &mut retained_artifacts,
+                        &mut retained_metadata,
+                        &mut retained_database,
+                        artifacts,
+                        captured_metadata,
+                        database,
+                    )?;
+                    #[cfg(test)]
+                    if fault == Some(AuthPlannedRotationCleanupTestFault::Staged) {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                }
+                AuthRetireReconciliation::RetireForwardOnly(
+                    AuthRetireForwardPhase::AwaitingCleanupPreparedRemoval,
+                ) => {
+                    let cleanup =
+                        artifacts
+                            .cleanup_directory()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    let prepared = RetainedReservationParts::from_directory(cleanup)
+                        .prepared
+                        .ok_or(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ))?;
+                    artifacts.revalidate(&self.locked.layout.secret_fd)?;
+                    self.revalidate()?;
+                    remove_exact_known_file(
+                        &cleanup.directory_fd,
+                        ReservationEntryName::Prepared.as_str(),
+                        KnownFilePurpose::Prepared,
+                        prepared.stat,
+                        prepared.content.expose(),
+                        || {},
+                    )?;
+                    filesystem_mutated = true;
+                    retain_retire_cleanup_evidence(
+                        &mut retained_artifacts,
+                        &mut retained_metadata,
+                        &mut retained_database,
+                        artifacts,
+                        captured_metadata,
+                        database,
+                    )?;
+                    #[cfg(test)]
+                    if fault == Some(AuthPlannedRotationCleanupTestFault::Prepared) {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                }
+                AuthRetireReconciliation::RetireForwardOnly(
+                    AuthRetireForwardPhase::AwaitingCleanupMetadataRemoval,
+                ) => {
+                    let cleanup =
+                        artifacts
+                            .cleanup_directory()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    let (metadata_file, CodecObservation::Valid) =
+                        RetainedReservationParts::from_directory(cleanup)
+                            .metadata
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?
+                    else {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    };
+                    artifacts.revalidate(&self.locked.layout.secret_fd)?;
+                    self.revalidate()?;
+                    remove_exact_known_file(
+                        &cleanup.directory_fd,
+                        ReservationEntryName::Metadata.as_str(),
+                        KnownFilePurpose::Metadata,
+                        metadata_file.stat,
+                        metadata_file.content.expose(),
+                        || {},
+                    )?;
+                    filesystem_mutated = true;
+                    retain_retire_cleanup_evidence(
+                        &mut retained_artifacts,
+                        &mut retained_metadata,
+                        &mut retained_database,
+                        artifacts,
+                        captured_metadata,
+                        database,
+                    )?;
+                    #[cfg(test)]
+                    if fault == Some(AuthPlannedRotationCleanupTestFault::Metadata) {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                }
+                AuthRetireReconciliation::RetireForwardOnly(
+                    AuthRetireForwardPhase::AwaitingCleanupDirectoryRemoval,
+                ) => {
+                    let cleanup =
+                        artifacts
+                            .cleanup_directory()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    let id = match cleanup.artifact {
+                        TopLevelArtifactName::Cleanup {
+                            kind: TransitionKind::Retire,
+                            id,
+                        } => id,
+                        _ => {
+                            return Err(AuthStoreBindingError::Filesystem(
+                                SecretFsError::UnsafeAuthArtifact,
+                            ));
+                        }
+                    };
+                    let cleanup_artifact = TopLevelArtifactName::Cleanup {
+                        kind: TransitionKind::Retire,
+                        id,
+                    };
+                    let cleanup_name = cleanup_artifact.format();
+                    if TopLevelArtifactName::parse(cleanup_name.as_bytes()) != Ok(cleanup_artifact)
+                    {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::UnsafeAuthArtifact,
+                        ));
+                    }
+                    artifacts.revalidate(&self.locked.layout.secret_fd)?;
+                    self.revalidate()?;
+                    remove_exact_empty_reservation_directory(
+                        &self.locked.layout.secret_fd,
+                        cleanup_name.as_str(),
+                        cleanup,
+                    )?;
+                    filesystem_mutated = true;
+                    #[cfg(test)]
+                    if fault == Some(AuthPlannedRotationCleanupTestFault::Directory) {
+                        return Err(AuthStoreBindingError::Filesystem(SecretFsError::Io(
+                            io::ErrorKind::Other,
+                        )));
+                    }
+                }
+                AuthRetireReconciliation::CleanActiveOnly => {
+                    let active =
+                        artifacts
+                            .active_file()
+                            .ok_or(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ))?;
+                    durabilize_existing_known_file(
+                        &self.locked.layout.secret_fd,
+                        ACTIVE_KEYRING_NAME,
+                        KnownFilePurpose::ActiveKeyring,
+                        active.stat,
+                        active.content.expose(),
+                    )?;
+                    if !filesystem_mutated {
+                        let (_, postcondition, _) = self.capture_stable_retire_reconciliation()?;
+                        if postcondition != AuthRetireReconciliation::CleanActiveOnly {
+                            return Err(AuthStoreBindingError::Filesystem(
+                                SecretFsError::ArtifactChanged,
+                            ));
+                        }
+                        return Ok(AuthRetireCleanupOutcome::AlreadyCompleted);
+                    }
+
+                    after_cleanup
+                        .take()
+                        .ok_or(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ))?();
+                    let (terminal_artifacts, terminal_reconciliation, _) =
+                        self.capture_stable_retire_reconciliation()?;
+                    if terminal_reconciliation != AuthRetireReconciliation::CleanActiveOnly {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    }
+                    if let (Some(metadata), Some(expected_database)) =
+                        (retained_metadata.as_ref(), retained_database)
+                    {
+                        self.revalidate_retained_retire_source(
+                            &terminal_artifacts,
+                            metadata,
+                            expected_database,
+                        )?;
+                    }
+                    if let Some(retained) = retained_artifacts.as_ref() {
+                        retained
+                            .revalidate_completed_cleanup_evidence(&self.locked.layout.secret_fd)?;
+                    }
+                    terminal_artifacts.revalidate(&self.locked.layout.secret_fd)?;
+                    self.revalidate()?;
+                    return Ok(AuthRetireCleanupOutcome::Completed);
+                }
+                _ => {
+                    if filesystem_mutated {
+                        return Err(AuthStoreBindingError::Filesystem(
+                            SecretFsError::ArtifactChanged,
+                        ));
+                    }
+                    return Ok(AuthRetireCleanupOutcome::NotCleanable(reconciliation));
+                }
+            }
+        }
+        Err(AuthStoreBindingError::Filesystem(
+            SecretFsError::ArtifactChanged,
+        ))
+    }
+
+    fn revalidate_retained_planned_rotation_source(
+        &self,
+        artifacts: &PinnedAuthArtifactSnapshot,
+        metadata: &PlannedRotationMetadataV1,
+        expected: AuthPlannedRotationDatabaseObservation,
+    ) -> Result<(), AuthStoreBindingError> {
+        self.revalidate()?;
+        let expectation = metadata.source_expectation();
+        let database_a = self
+            .conversation
+            .inspect_auth_planned_rotation(Some(expectation))
+            .map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        let database_b = self
+            .conversation
+            .inspect_auth_planned_rotation(Some(expectation))
+            .map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        if database_a != database_b
+            || database_a != expected
+            || database_a.source != AuthPlannedRotationSourceMatch::Exact
+            || database_a.source_fingerprint.is_none()
+        {
+            return Err(AuthStoreBindingError::ConversationStoreChanged);
+        }
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()?;
+        Ok(())
+    }
+
+    fn revalidate_retained_retire_source(
+        &self,
+        artifacts: &PinnedAuthArtifactSnapshot,
+        metadata: &RetireMetadataV1,
+        expected: AuthPlannedRotationDatabaseObservation,
+    ) -> Result<(), AuthStoreBindingError> {
+        self.revalidate()?;
+        let expectation = metadata.source_expectation();
+        let database_a = self
+            .conversation
+            .inspect_auth_retire(Some(expectation))
+            .map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        let database_b = self
+            .conversation
+            .inspect_auth_retire(Some(expectation))
+            .map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        if database_a != database_b
+            || database_a != expected
+            || database_a.source != AuthPlannedRotationSourceMatch::Exact
+            || database_a.source_fingerprint.is_none()
+        {
+            return Err(AuthStoreBindingError::ConversationStoreChanged);
+        }
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()?;
+        Ok(())
+    }
+
     fn capture_stable_initialization_reconciliation(
         &self,
     ) -> Result<(PinnedAuthArtifactSnapshot, AuthInitializationReconciliation), AuthStoreBindingError>
@@ -6012,6 +10169,51 @@ impl OwnedAuthMaintenanceContext {
         Ok(artifacts.reconcile_planned_rotation(database_a, metadata.as_ref()))
     }
 
+    #[cfg(test)]
+    pub(super) fn inspect_retire_reconciliation_with_checkpoints<AfterFilesystemB, AfterDatabaseB>(
+        &self,
+        after_filesystem_b: AfterFilesystemB,
+        after_database_b: AfterDatabaseB,
+    ) -> Result<AuthRetireReconciliation, AuthStoreBindingError>
+    where
+        AfterFilesystemB: FnOnce(),
+        AfterDatabaseB: FnOnce(),
+    {
+        self.inspect_retire_reconciliation_inner(after_filesystem_b, after_database_b)
+    }
+
+    fn inspect_retire_reconciliation_inner<AfterFilesystemB, AfterDatabaseB>(
+        &self,
+        after_filesystem_b: AfterFilesystemB,
+        after_database_b: AfterDatabaseB,
+    ) -> Result<AuthRetireReconciliation, AuthStoreBindingError>
+    where
+        AfterFilesystemB: FnOnce(),
+        AfterDatabaseB: FnOnce(),
+    {
+        self.revalidate()?;
+        let artifacts = self.locked.capture_secret_artifacts()?;
+        let metadata = artifacts.decode_retire_metadata();
+        let expectation = metadata.as_ref().map(RetireMetadataV1::source_expectation);
+        let database_a = self
+            .conversation
+            .inspect_auth_retire(expectation)
+            .map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        after_filesystem_b();
+        let database_b = self
+            .conversation
+            .inspect_auth_retire(expectation)
+            .map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        if database_a != database_b {
+            return Err(AuthStoreBindingError::ConversationStoreChanged);
+        }
+        after_database_b();
+        artifacts.revalidate(&self.locked.layout.secret_fd)?;
+        self.revalidate()?;
+        Ok(artifacts.reconcile_retire(database_a, metadata.as_ref()))
+    }
+
     fn inspect_initialization_reconciliation_inner<AfterFilesystemB, AfterDatabaseB>(
         &self,
         after_filesystem_b: AfterFilesystemB,
@@ -6052,6 +10254,52 @@ impl OwnedAuthMaintenanceContext {
 
     pub(super) fn poison_handle(&self) -> AuthStorePoisonHandle {
         self.conversation.poison_handle()
+    }
+}
+
+pub(super) struct AuthListenerLease {
+    locked: LockedAuthInstance,
+    conversation: AuthConversationStoreBinding,
+    store_identity: StoreDirectoryIdentity,
+    keyring: Keyring,
+}
+
+impl AuthListenerLease {
+    pub(super) fn revalidate(&self) -> Result<(), AuthStoreBindingError> {
+        let store_identity = self
+            .conversation
+            .directory_identity()
+            .map_err(|_| AuthStoreBindingError::ConversationStoreUnavailable)?;
+        let layout_identity = self.locked.revalidate()?;
+        if store_identity != self.store_identity
+            || !store_identity.matches(
+                layout_identity.device,
+                layout_identity.inode,
+                layout_identity.owner,
+            )
+        {
+            return Err(AuthStoreBindingError::ConversationStoreMismatch);
+        }
+        Ok(())
+    }
+
+    pub(super) const fn keyring(&self) -> &Keyring {
+        &self.keyring
+    }
+
+    pub(super) fn poison(&self) {
+        self.conversation.poison();
+    }
+}
+
+impl fmt::Debug for AuthListenerLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthListenerLease")
+            .field("lock", &"[HELD]")
+            .field("conversation_store", &"[BOUND]")
+            .field("keyring", &"[REDACTED]")
+            .finish()
     }
 }
 

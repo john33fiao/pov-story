@@ -345,6 +345,38 @@ impl Keyring {
         Err(KeyringError::OperationFailed)
     }
 
+    pub(crate) fn retire_verify_only(
+        &self,
+        retired_at: AuthTimestampMicros,
+    ) -> Result<Self, KeyringError> {
+        if retired_at < self.active.activated_at {
+            return Err(KeyringError::ClockRegressed);
+        }
+        let verify_only = self
+            .verify_only
+            .as_ref()
+            .ok_or(KeyringError::InvalidLifecycle)?;
+        if retired_at < verify_only.verify_until {
+            return Err(KeyringError::InvalidLifecycle);
+        }
+        let next_version = KeyringVersion::new(
+            self.version
+                .get()
+                .checked_add(1)
+                .ok_or(KeyringError::InvalidLifecycle)?,
+        )?;
+        let seed = Zeroizing::new(self.active.signing_key.to_bytes());
+        let active = active_from_seed(self.active.activated_at, &seed)?;
+        if active.kid != self.active.kid {
+            return Err(KeyringError::InconsistentKeyMaterial);
+        }
+        Ok(Self {
+            version: next_version,
+            active,
+            verify_only: None,
+        })
+    }
+
     fn planned_rotation_from_seed(
         &self,
         version: KeyringVersion,
@@ -415,7 +447,7 @@ impl Keyring {
     }
 
     #[cfg(test)]
-    pub(super) fn planned_rotation_from_test_seed(
+    pub(crate) fn planned_rotation_from_test_seed(
         &self,
         activated_at: u64,
         seed: [u8; KEY_BYTES],
@@ -438,7 +470,7 @@ impl Keyring {
     }
 
     #[cfg(test)]
-    pub(super) fn from_test_seeds(
+    pub(crate) fn from_test_seeds(
         version: u64,
         active_activated_at: u64,
         active_seed: [u8; KEY_BYTES],
@@ -1058,6 +1090,97 @@ mod tests {
                 .planned_rotation_from_test_seed(
                     i64::MAX as u64 - VERIFY_ONLY_OVERLAP_MICROS + 1,
                     RFC8032_SEED_TWO
+                )
+                .unwrap_err(),
+            KeyringError::InvalidLifecycle
+        );
+    }
+
+    #[test]
+    fn retire_verify_only_preserves_active_material_at_the_exact_overlap_boundary() {
+        let keyring = Keyring::from_test_seeds(
+            2,
+            ACTIVE_AT,
+            RFC8032_SEED_TWO,
+            Some((PREVIOUS_AT, RFC8032_SEED_ONE)),
+        )
+        .expect("rotated keyring");
+        let message = b"retire verify-only boundary";
+        let signature = keyring.sign(message);
+
+        let retired = keyring
+            .retire_verify_only(
+                AuthTimestampMicros::new(ACTIVE_AT + VERIFY_ONLY_OVERLAP_MICROS).unwrap(),
+            )
+            .expect("retired keyring");
+        let recovered = Keyring::decode(retired.encode()).expect("canonical retired keyring");
+
+        assert_eq!(recovered.version().get(), 3);
+        assert_eq!(recovered.active_kid(), keyring.active_kid());
+        assert_eq!(
+            recovered.active_activated_at(),
+            keyring.active_activated_at()
+        );
+        assert!(recovered.verify_only_facts().is_none());
+        assert_eq!(recovered.encode().expose_secret().len(), ACTIVE_ONLY_LENGTH);
+        assert!(
+            recovered
+                .verify(
+                    keyring.active_kid(),
+                    message,
+                    &signature,
+                    AuthTimestampMicros::new(ACTIVE_AT + VERIFY_ONLY_OVERLAP_MICROS).unwrap()
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn retire_verify_only_rejects_early_missing_regressed_and_exhausted_state() {
+        let keyring = Keyring::from_test_seeds(
+            2,
+            ACTIVE_AT,
+            RFC8032_SEED_TWO,
+            Some((PREVIOUS_AT, RFC8032_SEED_ONE)),
+        )
+        .expect("rotated keyring");
+        assert_eq!(
+            keyring
+                .retire_verify_only(
+                    AuthTimestampMicros::new(ACTIVE_AT + VERIFY_ONLY_OVERLAP_MICROS - 1).unwrap()
+                )
+                .unwrap_err(),
+            KeyringError::InvalidLifecycle
+        );
+        assert_eq!(
+            keyring
+                .retire_verify_only(AuthTimestampMicros::new(ACTIVE_AT - 1).unwrap())
+                .unwrap_err(),
+            KeyringError::ClockRegressed
+        );
+
+        let active_only =
+            Keyring::from_test_seeds(2, ACTIVE_AT, RFC8032_SEED_TWO, None).expect("active only");
+        assert_eq!(
+            active_only
+                .retire_verify_only(
+                    AuthTimestampMicros::new(ACTIVE_AT + VERIFY_ONLY_OVERLAP_MICROS).unwrap()
+                )
+                .unwrap_err(),
+            KeyringError::InvalidLifecycle
+        );
+
+        let exhausted = Keyring::from_test_seeds(
+            i64::MAX as u64,
+            ACTIVE_AT,
+            RFC8032_SEED_TWO,
+            Some((PREVIOUS_AT, RFC8032_SEED_ONE)),
+        )
+        .expect("maximum-version overlap");
+        assert_eq!(
+            exhausted
+                .retire_verify_only(
+                    AuthTimestampMicros::new(ACTIVE_AT + VERIFY_ONLY_OVERLAP_MICROS).unwrap()
                 )
                 .unwrap_err(),
             KeyringError::InvalidLifecycle

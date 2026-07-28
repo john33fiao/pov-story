@@ -24,6 +24,9 @@ const OUTPUT_ENCODED_BYTES: usize = 43;
 const PHC_PREFIX: &str = "$argon2id$v=19$m=65536,t=3,p=4$";
 
 static KDF_SLOT: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
+#[cfg(test)]
+pub(crate) static KDF_TEST_SERIAL: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// A canonical verifier pinned to the current Argon2id profile.
 pub struct ValidatedVerifier {
@@ -238,13 +241,12 @@ impl Error for KdfError {}
 
 #[cfg(test)]
 mod tests {
-    use std::sync::LazyLock;
-
-    use tokio::sync::{Mutex, oneshot};
+    use tokio::sync::oneshot;
 
     use super::{
-        KdfError, ValidatedVerifier, VerifierValidationError, hash_password, hash_recovery_code,
-        run_with_kdf_slot, run_with_kdf_slot_inner, verify_password, verify_recovery_code,
+        KDF_TEST_SERIAL, KdfError, ValidatedVerifier, VerifierValidationError, hash_password,
+        hash_recovery_code, run_with_kdf_slot, run_with_kdf_slot_inner, verify_password,
+        verify_recovery_code,
     };
     use crate::auth::{NormalizedPassword, RecoveryCode};
 
@@ -253,8 +255,6 @@ mod tests {
         "AAAAAAAAAAAAAAAAAAAAAA$",
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     );
-
-    static KDF_TEST_SERIAL: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn strict_verifier_accepts_only_exact_current_profile() {

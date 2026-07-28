@@ -1,6 +1,6 @@
 # POV-007 Local Login, Refresh And Session Revoke
 
-Status: In Progress — dependency-independent control plane, sentinel/legacy initialization recovery, source/final-CAS, deletion-only cleanup, planned-rotation keyring/metadata contract and planned pre-source preparation/reconciliation/rollback slices implemented; Windows workspace validation restored by POV-034 and POV-031 current-tree removal completed
+Status: In Progress — initialization/planned/retire lifecycle와 local login/JWT/session/revoke/HTTP runtime 구현; controlling-TTY operator와 compromise/loss 및 installed-browser evidence 남음
 
 Type: Delivery
 
@@ -127,8 +127,13 @@ completion을 주장하지 않습니다. 외부 사용자 검증인 POV-022는 �
   revision/time/version corruption, unrelated current key와 changed stage를 무변경
   거부하고 durable bytes decode/validate round trip 및 redacted Debug를 unit test로
   검증합니다. 이 planned pure codec 자체는 filesystem이나 DB를 변경하지 않습니다.
-  Retire/compromise/loss metadata persistence와 planned source-CAS/install/final-CAS/cleanup은
-  아직 unsupported입니다.
+  Retire metadata v1은 initialization/planned와 의미를 섞지 않는 별도 fixed 349-byte
+  checksummed format으로 canonical 261-byte current keyring, exact active/verify-only facts,
+  owner/source revision, audit/transition ID와 verify-only를 제거한 canonical 170-byte staged
+  keyring의 actual length/SHA-256을 묶습니다. Retire source time은 exact verify-until 이상이고
+  result version은 `+1`이며 active private key/KID/activation은 보존되어야 합니다. Planned와
+  retire metadata는 maintenance actor의 source-CAS, active-key replacement, final lifecycle
+  CAS와 cleanup까지 연결됩니다. Compromise/loss metadata persistence는 아직 unsupported입니다.
 - Unix crate-private instance primitive는 exact `stores/`와 `secrets/` directory 및 persistent
   empty `auth-maintenance.lock`을 owner-only mode, no-follow/pinned identity와 close-on-exec로
   검증합니다. Synthetic tests는 unsafe root/child/lock artifact 무변경 거부, root
@@ -316,6 +321,57 @@ completion을 주장하지 않습니다. 외부 사용자 검증인 POV-022는 �
   ABA, pre/post-mutation drift, redaction과 dropped receiver 뒤 admitted completion 및 lock
   lifetime을 검증합니다. 실제 abrupt process termination, power-loss와 filesystem별
   atomicity/durability는 직접 재현하지 않았습니다.
+- Planned source-CAS는 exact `Prepared` reservation의 metadata/staged/prepared evidence를
+  다시 file/directory fsync하고 retained identity/content와 DB source A/B를 재검증한 뒤
+  `active` lifecycle revision을 `transitioning/planned`로 1 증가시킵니다. Result KID/version,
+  transition ID와 source timestamp를 metadata에 맞추고 sole `key_planned` audit를 추가하지만
+  account/password/recovery row와 active key file은 바꾸지 않습니다. Exact replay,
+  response loss, deferred-FK confirmed no-commit와 각 pre-writer durability fence를 fresh
+  committed view와 actor tests로 검증합니다.
+- Planned active-key install은 transition ID에서만 install-temp basename을 derive하고 matching
+  261-byte staged keyring을 exclusive-create/readback/fsync합니다. Existing 170-byte active
+  key와 exact install temp를 Linux/Android/macOS atomic exchange로 바꾸므로 교환 직후 old
+  active private key는 derived temp inode에 보존되고 new verify-only keyring만 active가 됩니다.
+  Fresh reconciliation은 absent/prefix/exact temp, exchanged old-active temp와
+  `AwaitingFinalDbCas`를 구분합니다. Old temp는 retained expected-old key facts와 exact
+  descriptor/path/content가 일치할 때만 unlink하고 containing directory를 fsync합니다.
+  Install-temp, exchange와 old-temp deletion checkpoint 뒤 fresh actor recovery, active inode
+  교체, DB 무변경과 replay를 synthetic tests로 검증합니다.
+- Planned final lifecycle CAS는 exact installed active key, intact transition evidence와 full
+  planned source를 다시 검증한 뒤 lifecycle만 `transitioning/planned`에서 `active`로 바꾸고
+  revision을 한 번 더 증가시키며 transition kind/ID를 비웁니다. Result KID/version/source
+  timestamp, account/credential rows, audit와 active inode는 보존합니다. Exact replay,
+  response loss와 deferred-FK confirmed no-commit를 fresh committed view로 분류합니다.
+- Planned cleanup은 verified planned transition ID에서 derived한 cleanup basename으로
+  reservation을 atomic no-replace rename하고 parent를 fsync한 뒤 deletion-only로
+  `staged-keyring → prepared → metadata → cleanup directory`를 exact-path 제거합니다.
+  각 containing directory를 fsync하고 source/audit, active 261-byte keyring과 inode를
+  유지하며 terminal `PlannedRotationComplete`와 idempotent replay로 수렴합니다. Rename과
+  네 deletion checkpoint 뒤 fresh actor가 exact next phase를 재관찰하고 완료하는 것을
+  synthetic tests로 검증합니다.
+- Retire lifecycle은 verify-only overlap을 가진 canonical 261-byte active keyring과 exact
+  active source에서만 `.auth-transition-retire-<uuidv4>`를 no-replace 예약하고 metadata,
+  matching 170-byte staged keyring, empty prepared sentinel을 owner-only/no-follow/readback/fsync
+  순서로 durabilize합니다. Read-only reconciliation은 six pre-source phase와
+  `AwaitingInstallTemp → InstallTempExact → AwaitingOldActiveTempRemoval →
+  AwaitingFinalDbCas` 및 cleanup phase를 initialization/planned와 구분합니다. Legal current
+  source/key와 complete metadata/staged가 exact match할 때만 resume-or-rollback candidate이고
+  mismatch, unknown/noncanonical artifact와 hard link는 fail closed합니다.
+- Retire source-CAS는 lifecycle만 `active`에서 `transitioning/retire`로 revision `+1`하고
+  result는 same active KID/activation, keyring version `+1`, source timestamp와 sole
+  `key_retired` audit로 묶습니다. Account/password/recovery row와 current key file은 이 단계에서
+  바꾸지 않습니다. Derived install temp와 Linux/Android/macOS atomic exchange로 170-byte
+  active-only result를 설치하고 old 261-byte keyring temp를 exact unlink한 뒤 final CAS가
+  lifecycle을 `active` revision `+1`로 닫습니다. Cleanup은 verified retire transition ID에서
+  derived한 namespace로 no-replace rename하고 staged, prepared, metadata, directory를
+  deletion-only로 제거하여 `CleanActiveOnly`로 수렴합니다.
+- Retire Unix synthetic actor tests는 normal/replay와 exact pre-source rollback, preparation/source/
+  install/final-CAS/cleanup의 durability 또는 COMMIT uncertainty checkpoint 뒤 fresh actor
+  recovery, lifecycle/KID/version/source revision 및 unrelated current-key mismatch,
+  unknown/changed/hard-link artifact, reservation inode ABA, read-only와 pre/post-mutation drift,
+  redaction, dropped receiver 뒤 admitted completion과 maintenance-lock lifetime을 검증합니다.
+  실제 abrupt process termination, power-loss와 filesystem별 atomicity/durability는 직접
+  재현하지 않았습니다.
 - Crate-private no-payload initialization source command는 exact maintenance lock과 bound store를
   소유한 전용 actor OS thread에서 동기적으로 실행됩니다. Retained secret snapshot과 zeroizing
   metadata를 유지한 채 typed DB observation A/B, retained filesystem과 context를 확인하고,
@@ -412,23 +468,61 @@ completion을 주장하지 않습니다. 외부 사용자 검증인 POV-022는 �
   FD/path/manifest revalidation도 rename/unlink 직전 또는 final postcheck 직후 malicious same-UID
   ABA를 원자적으로 배제하거나 이미 끝난 namespace mutation을 되돌리지 않습니다. Unlink는
   copy-on-write, journal 또는 snapshot에서 physical secure erase를 보장하지 않습니다.
-- 이 evidence는 schema, storage, credential primitive, pure in-memory keyring/initialization-transition codec와
-  unwired instance/maintenance-lock/store-binding/detached-actor/read-only initialization reconciliation 및
-  initialization-only pre-source durable preparation·recovery·exact rollback,
-  exact `Prepared → initializing` source-CAS와 pre-writer durability fence,
-  active-key install, final `initializing → active` lifecycle CAS와 deletion-only cleanup primitive
-  slice, planned-rotation keyring/metadata recovery contract와 planned pre-source durable
-  preparation·read-only reconciliation·explicit rollback slice에 한정됩니다.
+- Strict local JWT codec은 Ed25519/`EdDSA`, canonical header/claim set, exact local
+  audience/profile, owner/session UUID, credential version, 10분 lifetime와 ±30초 clock
+  boundary, 4096-byte/token segment/base64url 제한을 강제합니다. Active와 bounded
+  verify-only key로 서명을 검증하되 unknown KID, algorithm/type/audience/profile/claim
+  mismatch, duplicate/unknown field, malformed/expired/future token을 fail closed하고
+  token/KID/identifier를 Debug/error에 노출하지 않습니다.
+- `AuthRuntime`은 startup에서 maintenance lock을 listener lifetime 동안 소유하고 exact
+  active lifecycle, canonical source/account/verifier/throttle와 active keyring을 검증합니다.
+  Shared connection은 read-only observation에만 사용하며 login, prune, refresh, logout,
+  logout-all과 credential/account mutation은 매 command fresh private writer를 거쳐
+  COMMIT 뒤 quiesce/close와 별도 committed-view classifier를 수행합니다. Writer
+  uncertainty가 남으면 success/token/cookie를 발급하지 않고 store/runtime을 poison합니다.
+- Local login은 immutable exact login ID, same-parameter dummy verifier, shared durable
+  password throttle, fixed one-hour marker/outcome replay, 64-marker/8-session cap과 source
+  CAS를 강제합니다. Access JWT와 opaque refresh family/token을 함께 만들고 refresh마다
+  generation을 rotate하며 predecessor replay는 family/session을 revoke합니다. Exact idle/
+  absolute expiry, generation 8191 terminal revoke, restart prune, logout replay와 dropped
+  caller 뒤 admitted mutation completion을 synthetic tests로 검증합니다.
+- Password change, recovery-code rotation, account recovery와 user disable/re-enable은
+  observed verifier/revision/throttle를 다시 비교하고 replacement verifier, credential
+  version/account revision, all-session revoke, outcome invalidation과 applicable throttle
+  reset을 한 transaction에 묶습니다. `logout-all`도 verified live access session을 source
+  transaction에서 재확인한 뒤 owner의 모든 session/family/token을 terminal-delete하고
+  credential version을 증가시킵니다. Targeted Unix test는 두 active session의 access와
+  refresh가 즉시 모두 거부되는 것을 확인합니다.
+- Local HTTP auth surface는 exact `127.0.0.1:8080` Host와
+  `http://127.0.0.1:8080` Origin, `X-POV-CSRF: 1`, optional same-origin Fetch Metadata,
+  POST JSON size/shape, single Bearer/cookie를 강제합니다. Login/refresh/logout/logout-all/
+  password/session endpoint는 auth 응답에 no-store/no-cache/no-referrer를 적용하고 refresh
+  cookie를 `Path=/api/auth; HttpOnly; SameSite=Strict`로만 issue/clear합니다. Production
+  binary는 explicit instance root로 stores와 `AuthRuntime`을 listener bind 전에 열어
+  mixed/invalid auth state에서 fail closed합니다.
+- Public `initialize_confirmed` operator seam은 caller가 replacement recovery code 표시와
+  보관 확인을 끝낸 뒤에만 maintenance lock을 획득한 canonical clean instance에서
+  password/recovery verifier와 CSPRNG keyring을 만들고 preparation, source-CAS, active-key
+  install, final lifecycle CAS와 cleanup을 순서대로 완료합니다. Unix targeted tests는
+  listener-ready terminal state와 second initialization no-replace를 확인합니다. 이 seam은
+  automated synthetic secret injection을 위한 것이며 controlling-TTY prompt 자체는 아직
+  production CLI에 연결하지 않았습니다.
+- 이 evidence는 schema/storage/credential primitive, complete initialization/planned/retire
+  key lifecycle, strict local JWT, login/session/refresh/logout/logout-all, password/recovery/
+  account mutation, fail-closed runtime와 local HTTP boundary 및 confirmed-initialization
+  library seam에 한정됩니다.
   `InitializationComplete`와 cleanup `Completed|AlreadyCompleted`는 metadata가
   제거된 뒤 active revision/KID/version/key/namespace만 확인하는 protocol terminal이며 full
-  mutable auth source, auth validity 또는 listener readiness 증명이 아닙니다. Actor에는
-  planned pre-source inspect/prepare/rollback command만 연결됐으며 planned source-CAS,
-  active-key replacement, final lifecycle CAS, cleanup 및 retire/compromise/loss transition
-  command는 없습니다. Production auth mutation repository, listener,
-  dummy verifier/account selection, JWT, refresh mutation, controlling-TTY flow, reference-device
-  Argon2 benchmark, local HTTP와 production instance-root/runtime wiring, preparation/source
-  predicate 직후 same-UID ABA의 원자적 차단, process crash/power-loss state-machine과
-  installed-browser clauses는 아직 PASS가 아닙니다.
+  mutable auth source, auth validity 또는 listener readiness 증명이 아닙니다. Planned terminal
+  `PlannedRotationComplete`도 metadata가 제거된 뒤 active revision/KID/version/key/namespace만
+  확인하는 protocol state이며 auth validity나 listener readiness가 아닙니다.
+  Retire terminal `CleanActiveOnly`도 metadata가 제거된 뒤 active-only revision/KID/version/
+  key/namespace만 확인하는 protocol state이며 auth validity나 listener readiness가 아닙니다.
+  Compromise/loss transition command와 controlling-TTY prompt/echo·signal restoration,
+  planned/retire production operator command, reference-device Argon2 benchmark,
+  preparation/source predicate 직후 same-UID ABA의 원자적 차단, 실제 process
+  crash/power-loss/filesystem durability 및 installed Chrome/Safari clauses는 아직 PASS가
+  아닙니다. 따라서 ticket completion이나 production activation은 주장하지 않습니다.
 
 ## Cross-platform Verification Baseline
 

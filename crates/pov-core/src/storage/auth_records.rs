@@ -18,8 +18,9 @@ use super::{
     AuthDatabaseReconciliationObservation, AuthInitializationFinalLifecycleMutationOutcome,
     AuthInitializationSourceFingerprint, AuthInitializationSourceMatch,
     AuthInitializationSourceMutationOutcome, AuthInitializingLifecycleFacts,
-    AuthPlannedRotationDatabaseObservation, AuthPlannedRotationSourceFingerprint,
-    AuthPlannedRotationSourceMatch, AuthTransitioningLifecycleFacts, ConversationStore,
+    AuthPlannedRotationDatabaseObservation, AuthPlannedRotationFinalLifecycleMutationOutcome,
+    AuthPlannedRotationSourceFingerprint, AuthPlannedRotationSourceMatch,
+    AuthPlannedRotationSourceMutationOutcome, AuthTransitioningLifecycleFacts, ConversationStore,
     ExistingConnectionAccess, SqliteStore, StoreError, StoreKind, StoreLocation,
     migrations_for_kind, open_existing_store_connection, validate_current_migration_history,
     validate_store_contract_row, validate_store_location,
@@ -27,17 +28,22 @@ use super::{
 #[cfg(test)]
 use super::{
     AuthInitializationFinalLifecycleMutationTestFault, AuthInitializationSourceMutationTestFault,
+    AuthPlannedRotationFinalLifecycleMutationTestFault, AuthPlannedRotationSourceMutationTestFault,
 };
 use crate::auth::{
-    InitializationSourceExpectation, InitializationSourceSeed, PersistedLifecycleKeyId,
-    PersistedLifecycleKeyringVersion, PersistedLifecycleTimestamp, PersistedLifecycleTransitionId,
-    PlannedRotationSourceExpectation, TransitionKind,
+    InitializationSourceExpectation, InitializationSourceSeed, KeyTransitionSourceExpectation,
+    PersistedLifecycleKeyId, PersistedLifecycleKeyringVersion, PersistedLifecycleTimestamp,
+    PersistedLifecycleTransitionId, PlannedRotationSourceExpectation, RetireSourceExpectation,
+    TransitionKind,
 };
 
 #[derive(Clone)]
-struct AuthMutationExecutor {
+pub(crate) struct AuthMutationExecutor {
     location: Arc<StoreLocation>,
     operation_poisoned: Arc<AtomicBool>,
+    operation_serial: Arc<std::sync::Mutex<()>>,
+    #[cfg(test)]
+    runtime_test_fault: Arc<std::sync::Mutex<Option<AuthRuntimeMutationTestFault>>>,
 }
 
 impl AuthMutationExecutor {
@@ -45,7 +51,75 @@ impl AuthMutationExecutor {
         Self {
             location: Arc::clone(&store.location),
             operation_poisoned: Arc::clone(&store.operation_poisoned),
+            operation_serial: Arc::new(std::sync::Mutex::new(())),
+            #[cfg(test)]
+            runtime_test_fault: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    pub(super) fn from_runtime_store(
+        location: Arc<StoreLocation>,
+        operation_poisoned: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            location,
+            operation_poisoned,
+            operation_serial: Arc::new(std::sync::Mutex::new(())),
+            #[cfg(test)]
+            runtime_test_fault: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_next_runtime_test_fault(&self, fault: AuthRuntimeMutationTestFault) {
+        *self
+            .runtime_test_fault
+            .lock()
+            .expect("runtime auth test-fault lock must not be poisoned") = Some(fault);
+    }
+
+    pub(crate) async fn execute_runtime<N, A, C>(
+        &self,
+        apply: A,
+        classify: C,
+    ) -> Result<AuthRuntimeMutationOutcome<N>, AuthRecordsError>
+    where
+        N: Send + Sync + 'static,
+        A: for<'connection> Fn(
+                &Transaction<'connection>,
+            )
+                -> Result<AuthRuntimeApplyDecision<N>, AuthRecordsError>
+            + Send
+            + Sync
+            + 'static,
+        C: Fn(&mut RawConnection) -> Result<AuthRuntimeMutationPostcondition, AuthRecordsError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        #[cfg(test)]
+        let fault = self
+            .runtime_test_fault
+            .lock()
+            .map_err(|_| AuthRecordsError::ExecutorFailed)?
+            .take()
+            .map(CommitFault::from)
+            .unwrap_or(CommitFault::None);
+        #[cfg(not(test))]
+        let fault = CommitFault::None;
+        self.execute(AuthRuntimeMutation { apply, classify }, fault)
+            .await
+            .map(|run| match run {
+                MutationRun::ExpectedNoCommit(outcome) => {
+                    AuthRuntimeMutationOutcome::ExpectedNoCommit(outcome)
+                }
+                MutationRun::CommitResolved(execution) => match execution.disposition {
+                    MutationDisposition::Committed => AuthRuntimeMutationOutcome::Committed,
+                    MutationDisposition::NotCommitted => {
+                        AuthRuntimeMutationOutcome::ConfirmedNotCommitted
+                    }
+                },
+            })
     }
 
     async fn execute<M>(
@@ -61,9 +135,13 @@ impl AuthMutationExecutor {
         let location = Arc::clone(&self.location);
         let operation_poisoned = Arc::clone(&self.operation_poisoned);
         let blocking_poison = Arc::clone(&operation_poisoned);
+        let operation_serial = Arc::clone(&self.operation_serial);
         let result = tokio::task::spawn_blocking(move || {
             let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 let _panic_guard = WorkerPanicPoisonGuard::new(Arc::clone(&blocking_poison));
+                let _serial = operation_serial
+                    .lock()
+                    .map_err(|_| AuthRecordsError::ExecutorFailed)?;
                 fault.pause_before_poison_check();
                 ensure_operation_available(&blocking_poison)?;
                 fault.panic_before_execute();
@@ -85,6 +163,82 @@ impl AuthMutationExecutor {
                 Err(AuthRecordsError::ExecutorFailed)
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthRuntimeMutationTestFault {
+    AfterCommitResponseLoss,
+    DeferredForeignKeyCommitFailure,
+}
+
+#[cfg(test)]
+impl From<AuthRuntimeMutationTestFault> for CommitFault {
+    fn from(value: AuthRuntimeMutationTestFault) -> Self {
+        match value {
+            AuthRuntimeMutationTestFault::AfterCommitResponseLoss => Self::AfterCommitResponseLoss,
+            AuthRuntimeMutationTestFault::DeferredForeignKeyCommitFailure => {
+                Self::DeferredForeignKeyCommitFailure
+            }
+        }
+    }
+}
+
+pub(crate) enum AuthRuntimeApplyDecision<N> {
+    Commit,
+    ExpectedNoCommit(N),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthRuntimeMutationPostcondition {
+    Committed,
+    NotCommitted,
+    Ambiguous,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthRuntimeMutationOutcome<N> {
+    Committed,
+    ConfirmedNotCommitted,
+    ExpectedNoCommit(N),
+}
+
+struct AuthRuntimeMutation<A, C> {
+    apply: A,
+    classify: C,
+}
+
+impl<N, A, C> AuthMutation for AuthRuntimeMutation<A, C>
+where
+    A: for<'connection> Fn(
+        &Transaction<'connection>,
+    ) -> Result<AuthRuntimeApplyDecision<N>, AuthRecordsError>,
+    C: Fn(&mut RawConnection) -> Result<AuthRuntimeMutationPostcondition, AuthRecordsError>,
+{
+    type ExpectedNoCommit = N;
+
+    fn apply(
+        &self,
+        transaction: &Transaction<'_>,
+    ) -> Result<ApplyDecision<Self::ExpectedNoCommit>, AuthRecordsError> {
+        Ok(match (self.apply)(transaction)? {
+            AuthRuntimeApplyDecision::Commit => ApplyDecision::Commit,
+            AuthRuntimeApplyDecision::ExpectedNoCommit(outcome) => {
+                ApplyDecision::ExpectedNoCommit(outcome)
+            }
+        })
+    }
+
+    fn classify(
+        &self,
+        committed_view: &mut RawConnection,
+    ) -> Result<MutationPostcondition, AuthRecordsError> {
+        Ok(match (self.classify)(committed_view)? {
+            AuthRuntimeMutationPostcondition::Committed => MutationPostcondition::Committed,
+            AuthRuntimeMutationPostcondition::NotCommitted => MutationPostcondition::NotCommitted,
+            AuthRuntimeMutationPostcondition::Ambiguous => MutationPostcondition::Ambiguous,
+        })
     }
 }
 
@@ -302,7 +456,7 @@ impl Drop for FreshWriterGuard {
 }
 
 #[derive(Debug)]
-pub(super) enum AuthRecordsError {
+pub(crate) enum AuthRecordsError {
     Store(StoreError),
     Sqlite(rusqlite::Error),
     ExecutorFailed,
@@ -960,6 +1114,528 @@ pub(super) fn commit_initialization_final_lifecycle(
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlannedRotationExpectedNoCommit {
+    AlreadyCommitted,
+    PreconditionChanged,
+}
+
+struct KeyTransitionSourceMutation<E> {
+    expectation: E,
+}
+
+impl<E> AuthMutation for KeyTransitionSourceMutation<E>
+where
+    E: KeyTransitionSourceExpectation,
+{
+    type ExpectedNoCommit = PlannedRotationExpectedNoCommit;
+
+    fn apply(
+        &self,
+        transaction: &Transaction<'_>,
+    ) -> Result<ApplyDecision<Self::ExpectedNoCommit>, AuthRecordsError> {
+        validate_store_contract_row(transaction, StoreKind::Conversation)?;
+        validate_current_migration_history(
+            transaction,
+            StoreKind::Conversation,
+            migrations_for_kind(StoreKind::Conversation),
+        )?;
+        validate_auth_table_inventory(transaction)?;
+
+        let lifecycle = read_auth_lifecycle_observation(transaction)?;
+        let inspection =
+            read_planned_rotation_source_match(transaction, lifecycle, Some(self.expectation))?;
+        match planned_rotation_lifecycle_stage(lifecycle, self.expectation) {
+            Some(PlannedRotationLifecycleStage::PreSource)
+                if inspection.source_match == AuthPlannedRotationSourceMatch::Exact => {}
+            Some(
+                PlannedRotationLifecycleStage::PostSource | PlannedRotationLifecycleStage::Final,
+            ) if inspection.source_match == AuthPlannedRotationSourceMatch::Exact => {
+                return Ok(ApplyDecision::ExpectedNoCommit(
+                    PlannedRotationExpectedNoCommit::AlreadyCommitted,
+                ));
+            }
+            _ => {
+                return Ok(ApplyDecision::ExpectedNoCommit(
+                    PlannedRotationExpectedNoCommit::PreconditionChanged,
+                ));
+            }
+        }
+
+        let changed = transaction.execute(
+            "UPDATE auth_key_lifecycle
+             SET state = 'transitioning',
+                 state_revision = ?1,
+                 expected_kid = ?2,
+                 transition_kind = ?3,
+                 transition_id = ?4,
+                 keyring_version = ?5,
+                 updated_at_micros = ?6
+             WHERE singleton = 1
+               AND state = 'active'
+               AND state_revision = ?7
+               AND expected_kid = ?8
+               AND transition_kind IS NULL
+               AND transition_id IS NULL
+               AND keyring_version = ?9
+               AND updated_at_micros = ?10",
+            params![
+                self.expectation.transitioning_lifecycle_revision(),
+                self.expectation.result_kid(),
+                self.expectation.transition_kind().as_str(),
+                self.expectation.transition_id().as_slice(),
+                self.expectation.result_keyring_version(),
+                self.expectation.source_at_micros(),
+                self.expectation.expected_lifecycle_revision(),
+                self.expectation.expected_active_kid(),
+                self.expectation.expected_keyring_version(),
+                self.expectation.expected_lifecycle_updated_at_micros(),
+            ],
+        )?;
+        if changed == 0 {
+            return self.classify_expected_no_commit(transaction);
+        }
+        expect_mutation_cardinality(changed, 1)?;
+
+        expect_mutation_cardinality(
+            transaction.execute(
+                "INSERT INTO auth_audit(
+                    owner_id, audit_id, action, profile, session_id, attempt_id,
+                    happened_at_micros
+                 ) VALUES (?1, ?2, ?3, NULL, NULL, NULL, ?4)",
+                params![
+                    self.expectation.owner_id().as_slice(),
+                    self.expectation.audit_id().as_slice(),
+                    self.expectation.audit_action(),
+                    self.expectation.source_at_micros(),
+                ],
+            )?,
+            1,
+        )?;
+
+        let lifecycle = read_auth_lifecycle_observation(transaction)?;
+        let inspection =
+            read_planned_rotation_source_match(transaction, lifecycle, Some(self.expectation))?;
+        if planned_rotation_lifecycle_stage(lifecycle, self.expectation)
+            != Some(PlannedRotationLifecycleStage::PostSource)
+            || inspection.source_match != AuthPlannedRotationSourceMatch::Exact
+        {
+            return Err(AuthRecordsError::Store(StoreError::AuthControlPlaneCorrupt));
+        }
+
+        Ok(ApplyDecision::Commit)
+    }
+
+    fn classify(
+        &self,
+        committed_view: &mut RawConnection,
+    ) -> Result<MutationPostcondition, AuthRecordsError> {
+        let observation =
+            inspect_auth_key_transition_snapshot(committed_view, Some(self.expectation))?;
+        Ok(
+            match (
+                planned_rotation_lifecycle_stage(observation.lifecycle, self.expectation),
+                observation.source,
+            ) {
+                (
+                    Some(PlannedRotationLifecycleStage::PostSource),
+                    AuthPlannedRotationSourceMatch::Exact,
+                )
+                | (
+                    Some(PlannedRotationLifecycleStage::Final),
+                    AuthPlannedRotationSourceMatch::Exact,
+                ) => MutationPostcondition::Committed,
+                (
+                    Some(PlannedRotationLifecycleStage::PreSource),
+                    AuthPlannedRotationSourceMatch::Exact,
+                ) => MutationPostcondition::NotCommitted,
+                _ => MutationPostcondition::Ambiguous,
+            },
+        )
+    }
+}
+
+impl<E> KeyTransitionSourceMutation<E>
+where
+    E: KeyTransitionSourceExpectation,
+{
+    fn classify_expected_no_commit(
+        &self,
+        transaction: &Transaction<'_>,
+    ) -> Result<ApplyDecision<PlannedRotationExpectedNoCommit>, AuthRecordsError> {
+        let lifecycle = read_auth_lifecycle_observation(transaction)?;
+        let inspection =
+            read_planned_rotation_source_match(transaction, lifecycle, Some(self.expectation))?;
+        let outcome = match (
+            planned_rotation_lifecycle_stage(lifecycle, self.expectation),
+            inspection.source_match,
+        ) {
+            (
+                Some(
+                    PlannedRotationLifecycleStage::PostSource
+                    | PlannedRotationLifecycleStage::Final,
+                ),
+                AuthPlannedRotationSourceMatch::Exact,
+            ) => PlannedRotationExpectedNoCommit::AlreadyCommitted,
+            _ => PlannedRotationExpectedNoCommit::PreconditionChanged,
+        };
+        Ok(ApplyDecision::ExpectedNoCommit(outcome))
+    }
+}
+
+pub(super) fn commit_planned_rotation_source(
+    location: &StoreLocation,
+    operation_poisoned: &Arc<AtomicBool>,
+    expectation: PlannedRotationSourceExpectation<'_>,
+    #[cfg(test)] test_fault: Option<AuthPlannedRotationSourceMutationTestFault>,
+) -> Result<AuthPlannedRotationSourceMutationOutcome, AuthRecordsError> {
+    let fault = {
+        #[cfg(test)]
+        {
+            match test_fault {
+                None => CommitFault::None,
+                Some(AuthPlannedRotationSourceMutationTestFault::AfterCommitResponseLoss) => {
+                    CommitFault::AfterCommitResponseLoss
+                }
+                Some(
+                    AuthPlannedRotationSourceMutationTestFault::DeferredForeignKeyCommitFailure,
+                ) => CommitFault::DeferredForeignKeyCommitFailure,
+            }
+        }
+        #[cfg(not(test))]
+        {
+            CommitFault::None
+        }
+    };
+
+    ensure_operation_available(operation_poisoned)?;
+    let poison = Arc::clone(operation_poisoned);
+    let mutation = KeyTransitionSourceMutation { expectation };
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let _panic_guard = WorkerPanicPoisonGuard::new(Arc::clone(&poison));
+        ensure_operation_available(&poison)?;
+        execute_blocking(location, &poison, &mutation, &fault)
+    }))
+    .unwrap_or(Err(AuthRecordsError::ExecutorFailed));
+    if result.is_err() {
+        poison.store(true, Ordering::Release);
+    }
+
+    result.map(|run| match run {
+        MutationRun::ExpectedNoCommit(PlannedRotationExpectedNoCommit::AlreadyCommitted) => {
+            AuthPlannedRotationSourceMutationOutcome::AlreadyCommitted
+        }
+        MutationRun::ExpectedNoCommit(PlannedRotationExpectedNoCommit::PreconditionChanged) => {
+            AuthPlannedRotationSourceMutationOutcome::PreconditionChanged
+        }
+        MutationRun::CommitResolved(execution) => match execution.disposition {
+            MutationDisposition::Committed => AuthPlannedRotationSourceMutationOutcome::Committed,
+            MutationDisposition::NotCommitted => {
+                AuthPlannedRotationSourceMutationOutcome::ConfirmedNotCommitted
+            }
+        },
+    })
+}
+
+pub(super) fn commit_retire_source(
+    location: &StoreLocation,
+    operation_poisoned: &Arc<AtomicBool>,
+    expectation: RetireSourceExpectation<'_>,
+    #[cfg(test)] test_fault: Option<AuthPlannedRotationSourceMutationTestFault>,
+) -> Result<AuthPlannedRotationSourceMutationOutcome, AuthRecordsError> {
+    let fault = {
+        #[cfg(test)]
+        {
+            match test_fault {
+                None => CommitFault::None,
+                Some(AuthPlannedRotationSourceMutationTestFault::AfterCommitResponseLoss) => {
+                    CommitFault::AfterCommitResponseLoss
+                }
+                Some(
+                    AuthPlannedRotationSourceMutationTestFault::DeferredForeignKeyCommitFailure,
+                ) => CommitFault::DeferredForeignKeyCommitFailure,
+            }
+        }
+        #[cfg(not(test))]
+        {
+            CommitFault::None
+        }
+    };
+
+    ensure_operation_available(operation_poisoned)?;
+    let poison = Arc::clone(operation_poisoned);
+    let mutation = KeyTransitionSourceMutation { expectation };
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let _panic_guard = WorkerPanicPoisonGuard::new(Arc::clone(&poison));
+        ensure_operation_available(&poison)?;
+        execute_blocking(location, &poison, &mutation, &fault)
+    }))
+    .unwrap_or(Err(AuthRecordsError::ExecutorFailed));
+    if result.is_err() {
+        poison.store(true, Ordering::Release);
+    }
+
+    result.map(|run| match run {
+        MutationRun::ExpectedNoCommit(PlannedRotationExpectedNoCommit::AlreadyCommitted) => {
+            AuthPlannedRotationSourceMutationOutcome::AlreadyCommitted
+        }
+        MutationRun::ExpectedNoCommit(PlannedRotationExpectedNoCommit::PreconditionChanged) => {
+            AuthPlannedRotationSourceMutationOutcome::PreconditionChanged
+        }
+        MutationRun::CommitResolved(execution) => match execution.disposition {
+            MutationDisposition::Committed => AuthPlannedRotationSourceMutationOutcome::Committed,
+            MutationDisposition::NotCommitted => {
+                AuthPlannedRotationSourceMutationOutcome::ConfirmedNotCommitted
+            }
+        },
+    })
+}
+
+struct KeyTransitionFinalLifecycleMutation<E> {
+    expectation: E,
+}
+
+impl<E> AuthMutation for KeyTransitionFinalLifecycleMutation<E>
+where
+    E: KeyTransitionSourceExpectation,
+{
+    type ExpectedNoCommit = PlannedRotationExpectedNoCommit;
+
+    fn apply(
+        &self,
+        transaction: &Transaction<'_>,
+    ) -> Result<ApplyDecision<Self::ExpectedNoCommit>, AuthRecordsError> {
+        validate_store_contract_row(transaction, StoreKind::Conversation)?;
+        validate_current_migration_history(
+            transaction,
+            StoreKind::Conversation,
+            migrations_for_kind(StoreKind::Conversation),
+        )?;
+        validate_auth_table_inventory(transaction)?;
+
+        let lifecycle = read_auth_lifecycle_observation(transaction)?;
+        let inspection =
+            read_planned_rotation_source_match(transaction, lifecycle, Some(self.expectation))?;
+        match planned_rotation_lifecycle_stage(lifecycle, self.expectation) {
+            Some(PlannedRotationLifecycleStage::PostSource)
+                if inspection.source_match == AuthPlannedRotationSourceMatch::Exact => {}
+            Some(PlannedRotationLifecycleStage::Final)
+                if inspection.source_match == AuthPlannedRotationSourceMatch::Exact =>
+            {
+                return Ok(ApplyDecision::ExpectedNoCommit(
+                    PlannedRotationExpectedNoCommit::AlreadyCommitted,
+                ));
+            }
+            _ => {
+                return Ok(ApplyDecision::ExpectedNoCommit(
+                    PlannedRotationExpectedNoCommit::PreconditionChanged,
+                ));
+            }
+        }
+
+        let changed = transaction.execute(
+            "UPDATE auth_key_lifecycle
+             SET state = 'active',
+                 state_revision = ?1,
+                 transition_kind = NULL,
+                 transition_id = NULL
+             WHERE singleton = 1
+               AND state = 'transitioning'
+               AND state_revision = ?2
+               AND expected_kid = ?3
+               AND transition_kind = ?4
+               AND transition_id = ?5
+               AND keyring_version = ?6
+               AND updated_at_micros = ?7",
+            params![
+                self.expectation.final_lifecycle_revision(),
+                self.expectation.transitioning_lifecycle_revision(),
+                self.expectation.result_kid(),
+                self.expectation.transition_kind().as_str(),
+                self.expectation.transition_id().as_slice(),
+                self.expectation.result_keyring_version(),
+                self.expectation.source_at_micros(),
+            ],
+        )?;
+        if changed == 0 {
+            return self.classify_expected_no_commit(transaction);
+        }
+        expect_mutation_cardinality(changed, 1)?;
+
+        let lifecycle = read_auth_lifecycle_observation(transaction)?;
+        let inspection =
+            read_planned_rotation_source_match(transaction, lifecycle, Some(self.expectation))?;
+        if planned_rotation_lifecycle_stage(lifecycle, self.expectation)
+            != Some(PlannedRotationLifecycleStage::Final)
+            || inspection.source_match != AuthPlannedRotationSourceMatch::Exact
+        {
+            return Err(AuthRecordsError::Store(StoreError::AuthControlPlaneCorrupt));
+        }
+
+        Ok(ApplyDecision::Commit)
+    }
+
+    fn classify(
+        &self,
+        committed_view: &mut RawConnection,
+    ) -> Result<MutationPostcondition, AuthRecordsError> {
+        let observation =
+            inspect_auth_key_transition_snapshot(committed_view, Some(self.expectation))?;
+        Ok(
+            match (
+                planned_rotation_lifecycle_stage(observation.lifecycle, self.expectation),
+                observation.source,
+            ) {
+                (
+                    Some(PlannedRotationLifecycleStage::Final),
+                    AuthPlannedRotationSourceMatch::Exact,
+                ) => MutationPostcondition::Committed,
+                (
+                    Some(PlannedRotationLifecycleStage::PostSource),
+                    AuthPlannedRotationSourceMatch::Exact,
+                ) => MutationPostcondition::NotCommitted,
+                _ => MutationPostcondition::Ambiguous,
+            },
+        )
+    }
+}
+
+impl<E> KeyTransitionFinalLifecycleMutation<E>
+where
+    E: KeyTransitionSourceExpectation,
+{
+    fn classify_expected_no_commit(
+        &self,
+        transaction: &Transaction<'_>,
+    ) -> Result<ApplyDecision<PlannedRotationExpectedNoCommit>, AuthRecordsError> {
+        let lifecycle = read_auth_lifecycle_observation(transaction)?;
+        let inspection =
+            read_planned_rotation_source_match(transaction, lifecycle, Some(self.expectation))?;
+        let outcome = match (
+            planned_rotation_lifecycle_stage(lifecycle, self.expectation),
+            inspection.source_match,
+        ) {
+            (Some(PlannedRotationLifecycleStage::Final), AuthPlannedRotationSourceMatch::Exact) => {
+                PlannedRotationExpectedNoCommit::AlreadyCommitted
+            }
+            _ => PlannedRotationExpectedNoCommit::PreconditionChanged,
+        };
+        Ok(ApplyDecision::ExpectedNoCommit(outcome))
+    }
+}
+
+pub(super) fn commit_planned_rotation_final_lifecycle(
+    location: &StoreLocation,
+    operation_poisoned: &Arc<AtomicBool>,
+    expectation: PlannedRotationSourceExpectation<'_>,
+    #[cfg(test)] test_fault: Option<AuthPlannedRotationFinalLifecycleMutationTestFault>,
+) -> Result<AuthPlannedRotationFinalLifecycleMutationOutcome, AuthRecordsError> {
+    let fault = {
+        #[cfg(test)]
+        {
+            match test_fault {
+                None => CommitFault::None,
+                Some(
+                    AuthPlannedRotationFinalLifecycleMutationTestFault::AfterCommitResponseLoss,
+                ) => CommitFault::AfterCommitResponseLoss,
+                Some(
+                    AuthPlannedRotationFinalLifecycleMutationTestFault::DeferredForeignKeyCommitFailure,
+                ) => CommitFault::DeferredForeignKeyCommitFailure,
+            }
+        }
+        #[cfg(not(test))]
+        {
+            CommitFault::None
+        }
+    };
+
+    ensure_operation_available(operation_poisoned)?;
+    let poison = Arc::clone(operation_poisoned);
+    let mutation = KeyTransitionFinalLifecycleMutation { expectation };
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let _panic_guard = WorkerPanicPoisonGuard::new(Arc::clone(&poison));
+        ensure_operation_available(&poison)?;
+        execute_blocking(location, &poison, &mutation, &fault)
+    }))
+    .unwrap_or(Err(AuthRecordsError::ExecutorFailed));
+    if result.is_err() {
+        poison.store(true, Ordering::Release);
+    }
+
+    result.map(|run| match run {
+        MutationRun::ExpectedNoCommit(PlannedRotationExpectedNoCommit::AlreadyCommitted) => {
+            AuthPlannedRotationFinalLifecycleMutationOutcome::AlreadyCommitted
+        }
+        MutationRun::ExpectedNoCommit(PlannedRotationExpectedNoCommit::PreconditionChanged) => {
+            AuthPlannedRotationFinalLifecycleMutationOutcome::PreconditionChanged
+        }
+        MutationRun::CommitResolved(execution) => match execution.disposition {
+            MutationDisposition::Committed => {
+                AuthPlannedRotationFinalLifecycleMutationOutcome::Committed
+            }
+            MutationDisposition::NotCommitted => {
+                AuthPlannedRotationFinalLifecycleMutationOutcome::ConfirmedNotCommitted
+            }
+        },
+    })
+}
+
+pub(super) fn commit_retire_final_lifecycle(
+    location: &StoreLocation,
+    operation_poisoned: &Arc<AtomicBool>,
+    expectation: RetireSourceExpectation<'_>,
+    #[cfg(test)] test_fault: Option<AuthPlannedRotationFinalLifecycleMutationTestFault>,
+) -> Result<AuthPlannedRotationFinalLifecycleMutationOutcome, AuthRecordsError> {
+    let fault = {
+        #[cfg(test)]
+        {
+            match test_fault {
+                None => CommitFault::None,
+                Some(
+                    AuthPlannedRotationFinalLifecycleMutationTestFault::AfterCommitResponseLoss,
+                ) => CommitFault::AfterCommitResponseLoss,
+                Some(
+                    AuthPlannedRotationFinalLifecycleMutationTestFault::DeferredForeignKeyCommitFailure,
+                ) => CommitFault::DeferredForeignKeyCommitFailure,
+            }
+        }
+        #[cfg(not(test))]
+        {
+            CommitFault::None
+        }
+    };
+
+    ensure_operation_available(operation_poisoned)?;
+    let poison = Arc::clone(operation_poisoned);
+    let mutation = KeyTransitionFinalLifecycleMutation { expectation };
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let _panic_guard = WorkerPanicPoisonGuard::new(Arc::clone(&poison));
+        ensure_operation_available(&poison)?;
+        execute_blocking(location, &poison, &mutation, &fault)
+    }))
+    .unwrap_or(Err(AuthRecordsError::ExecutorFailed));
+    if result.is_err() {
+        poison.store(true, Ordering::Release);
+    }
+
+    result.map(|run| match run {
+        MutationRun::ExpectedNoCommit(PlannedRotationExpectedNoCommit::AlreadyCommitted) => {
+            AuthPlannedRotationFinalLifecycleMutationOutcome::AlreadyCommitted
+        }
+        MutationRun::ExpectedNoCommit(PlannedRotationExpectedNoCommit::PreconditionChanged) => {
+            AuthPlannedRotationFinalLifecycleMutationOutcome::PreconditionChanged
+        }
+        MutationRun::CommitResolved(execution) => match execution.disposition {
+            MutationDisposition::Committed => {
+                AuthPlannedRotationFinalLifecycleMutationOutcome::Committed
+            }
+            MutationDisposition::NotCommitted => {
+                AuthPlannedRotationFinalLifecycleMutationOutcome::ConfirmedNotCommitted
+            }
+        },
+    })
+}
+
 const AUTH_TABLES: [&str; 12] = [
     "auth_key_lifecycle",
     "auth_accounts",
@@ -1062,12 +1738,34 @@ pub(super) fn inspect_auth_planned_rotation(
     location: &StoreLocation,
     expectation: Option<PlannedRotationSourceExpectation<'_>>,
 ) -> Result<AuthPlannedRotationDatabaseObservation, StoreError> {
+    inspect_auth_key_transition(
+        location,
+        expectation,
+        "authentication planned rotation inspection",
+    )
+}
+
+pub(super) fn inspect_auth_retire(
+    location: &StoreLocation,
+    expectation: Option<RetireSourceExpectation<'_>>,
+) -> Result<AuthPlannedRotationDatabaseObservation, StoreError> {
+    inspect_auth_key_transition(location, expectation, "authentication retire inspection")
+}
+
+fn inspect_auth_key_transition<E>(
+    location: &StoreLocation,
+    expectation: Option<E>,
+    operation: &'static str,
+) -> Result<AuthPlannedRotationDatabaseObservation, StoreError>
+where
+    E: KeyTransitionSourceExpectation,
+{
     let mut reader = open_existing_store_connection(
         location,
         StoreKind::Conversation,
         ExistingConnectionAccess::ReadOnly,
     )?;
-    let snapshot = inspect_auth_planned_rotation_snapshot(&mut reader, expectation);
+    let snapshot = inspect_auth_key_transition_snapshot(&mut reader, expectation);
     reader.flush_prepared_statement_cache();
     let close = reader.close();
     let result = match (snapshot, close) {
@@ -1075,7 +1773,7 @@ pub(super) fn inspect_auth_planned_rotation(
         (Err(error), Ok(())) => Err(error),
         (snapshot, Err((_reader, close_error))) => Err(StoreError::LifecycleCleanup {
             kind: StoreKind::Conversation,
-            operation: "authentication planned rotation inspection",
+            operation,
             primary_error: if snapshot.is_ok() {
                 "snapshot inspection completed".to_owned()
             } else {
@@ -1084,18 +1782,20 @@ pub(super) fn inspect_auth_planned_rotation(
             cleanup_error: close_error.to_string(),
         }),
     };
-    let location_validation =
-        validate_store_location(location, "auth planned rotation inspection readback");
+    let location_validation = validate_store_location(location, operation);
     match (result, location_validation) {
         (Ok(state), Ok(())) => Ok(state),
         (Err(error), _) | (Ok(_), Err(error)) => Err(error),
     }
 }
 
-fn inspect_auth_planned_rotation_snapshot(
+fn inspect_auth_key_transition_snapshot<E>(
     reader: &mut RawConnection,
-    expectation: Option<PlannedRotationSourceExpectation<'_>>,
-) -> Result<AuthPlannedRotationDatabaseObservation, StoreError> {
+    expectation: Option<E>,
+) -> Result<AuthPlannedRotationDatabaseObservation, StoreError>
+where
+    E: KeyTransitionSourceExpectation,
+{
     let transaction = reader.transaction_with_behavior(TransactionBehavior::Deferred)?;
     let inspection = (|| {
         validate_store_contract_row(&transaction, StoreKind::Conversation)?;
@@ -1107,9 +1807,13 @@ fn inspect_auth_planned_rotation_snapshot(
         validate_auth_table_inventory(&transaction)?;
         let lifecycle = read_auth_lifecycle_observation(&transaction)?;
         let (source, source_fingerprint) = match lifecycle {
-            AuthDatabaseLifecycleObservation::Active(facts) => {
+            AuthDatabaseLifecycleObservation::Active(_)
+            | AuthDatabaseLifecycleObservation::Transitioning(_)
+                if expectation.is_some()
+                    || matches!(lifecycle, AuthDatabaseLifecycleObservation::Active(_)) =>
+            {
                 let inspection =
-                    read_planned_rotation_source_match(&transaction, facts, expectation)?;
+                    read_planned_rotation_source_match(&transaction, lifecycle, expectation)?;
                 (inspection.source_match, Some(inspection.fingerprint))
             }
             _ => (AuthPlannedRotationSourceMatch::NotApplicable, None),
@@ -1214,6 +1918,57 @@ fn inspect_auth_lifecycle_snapshot(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlannedRotationLifecycleStage {
+    PreSource,
+    PostSource,
+    Final,
+}
+
+fn planned_rotation_lifecycle_stage<E>(
+    lifecycle: AuthDatabaseLifecycleObservation,
+    expectation: E,
+) -> Option<PlannedRotationLifecycleStage>
+where
+    E: KeyTransitionSourceExpectation,
+{
+    match lifecycle {
+        AuthDatabaseLifecycleObservation::Active(facts)
+            if expectation.matches_active_lifecycle(
+                facts.state_revision,
+                facts.expected_kid,
+                facts.keyring_version,
+                facts.updated_at_micros,
+            ) =>
+        {
+            Some(PlannedRotationLifecycleStage::PreSource)
+        }
+        AuthDatabaseLifecycleObservation::Transitioning(facts)
+            if expectation.matches_transitioning_lifecycle(
+                facts.state_revision,
+                facts.kind,
+                facts.transition_id,
+                facts.expected_kid,
+                facts.keyring_version,
+                facts.updated_at_micros,
+            ) =>
+        {
+            Some(PlannedRotationLifecycleStage::PostSource)
+        }
+        AuthDatabaseLifecycleObservation::Active(facts)
+            if expectation.matches_final_active_lifecycle(
+                facts.state_revision,
+                facts.expected_kid,
+                facts.keyring_version,
+                facts.updated_at_micros,
+            ) =>
+        {
+            Some(PlannedRotationLifecycleStage::Final)
+        }
+        _ => None,
+    }
+}
+
 struct PlannedRotationSourceInspection {
     source_match: AuthPlannedRotationSourceMatch,
     fingerprint: AuthPlannedRotationSourceFingerprint,
@@ -1222,11 +1977,14 @@ struct PlannedRotationSourceInspection {
 const PLANNED_ROTATION_SOURCE_FINGERPRINT_DOMAIN: &[u8] =
     b"pov.auth.planned-rotation-source-snapshot.v1\0";
 
-fn read_planned_rotation_source_match(
+fn read_planned_rotation_source_match<E>(
     transaction: &Transaction<'_>,
-    lifecycle: AuthActiveLifecycleFacts,
-    expectation: Option<PlannedRotationSourceExpectation<'_>>,
-) -> Result<PlannedRotationSourceInspection, StoreError> {
+    lifecycle: AuthDatabaseLifecycleObservation,
+    expectation: Option<E>,
+) -> Result<PlannedRotationSourceInspection, StoreError>
+where
+    E: KeyTransitionSourceExpectation,
+{
     let mut hasher = Sha256::new();
     hasher.update(PLANNED_ROTATION_SOURCE_FINGERPRINT_DOMAIN);
 
@@ -1421,38 +2179,71 @@ fn read_planned_rotation_source_match(
         recovery_verifier.as_bytes(),
     );
 
-    let audit_id_available = if let Some(expectation) = expectation {
-        let count: i64 = transaction.query_row(
-            "SELECT count(*) FROM auth_audit WHERE audit_id = ?1",
-            [expectation.audit_id().as_slice()],
-            |row| row.get(0),
+    let audit = if let Some(expectation) = expectation {
+        let mut statement = transaction.prepare(
+            "SELECT owner_id, action, profile, session_id, attempt_id, happened_at_micros
+             FROM auth_audit
+             WHERE audit_id = ?1",
         )?;
-        if !matches!(count, 0 | 1) {
+        let mut rows = statement.query([expectation.audit_id().as_slice()])?;
+        let value = rows
+            .next()?
+            .map(|row| {
+                Ok::<_, rusqlite::Error>((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .transpose()?;
+        if rows.next()?.is_some() {
             return Err(StoreError::AuthControlPlaneCorrupt);
         }
-        count == 0
+        value
     } else {
-        true
+        None
     };
 
+    let common_source_matches = expectation.is_some_and(|expectation| {
+        expectation.matches_owner_id(&owner_id)
+            && expectation.credential_version() == credential_version
+            && expectation.account_revision() == account_revision
+            && expectation.password_credential_revision() == password_revision
+            && expectation.recovery_credential_revision() == recovery_revision
+    });
     let source_match = match expectation {
-        None => AuthPlannedRotationSourceMatch::Canonical,
-        Some(expectation)
-            if expectation.matches_active_lifecycle(
-                lifecycle.state_revision,
-                lifecycle.expected_kid,
-                lifecycle.keyring_version,
-                lifecycle.updated_at_micros,
-            ) && expectation.matches_owner_id(&owner_id)
-                && expectation.credential_version() == credential_version
-                && expectation.account_revision() == account_revision
-                && expectation.password_credential_revision() == password_revision
-                && expectation.recovery_credential_revision() == recovery_revision
-                && audit_id_available =>
-        {
-            AuthPlannedRotationSourceMatch::Exact
+        None if matches!(lifecycle, AuthDatabaseLifecycleObservation::Active(_)) => {
+            AuthPlannedRotationSourceMatch::Canonical
         }
-        Some(_) => AuthPlannedRotationSourceMatch::Mismatch,
+        Some(expectation) => {
+            let lifecycle_stage = planned_rotation_lifecycle_stage(lifecycle, expectation);
+            let audit_matches = match lifecycle_stage {
+                Some(PlannedRotationLifecycleStage::PreSource) => audit.is_none(),
+                Some(
+                    PlannedRotationLifecycleStage::PostSource
+                    | PlannedRotationLifecycleStage::Final,
+                ) => audit.is_some_and(
+                    |(audit_owner, action, profile, session_id, attempt_id, happened_at)| {
+                        expectation.matches_owner_id(&audit_owner)
+                            && action == expectation.audit_action()
+                            && profile.is_none()
+                            && session_id.is_none()
+                            && attempt_id.is_none()
+                            && happened_at == expectation.source_at_micros()
+                    },
+                ),
+                None => false,
+            };
+            if common_source_matches && audit_matches {
+                AuthPlannedRotationSourceMatch::Exact
+            } else {
+                AuthPlannedRotationSourceMatch::Mismatch
+            }
+        }
+        None => AuthPlannedRotationSourceMatch::NotApplicable,
     };
     Ok(PlannedRotationSourceInspection {
         source_match,
@@ -2393,8 +3184,17 @@ mod tests {
 
     use tempfile::tempdir;
     use tokio_rusqlite::rusqlite::params;
+    #[cfg(unix)]
+    use uuid::Uuid;
 
     use super::*;
+    #[cfg(unix)]
+    use crate::auth::{
+        AuditId, AuthOwnerId, AuthTimestampMicros, Keyring, PlannedRotationMetadataInput,
+        PlannedRotationPreparationV1, SourceTimestampMicros, TransitionId,
+    };
+    #[cfg(unix)]
+    use crate::storage::AuthConversationStoreBinding;
     use crate::storage::{BUSY_TIMEOUT_MILLIS, StoreSet, read_report, validate_store_report};
 
     const TEST_OWNER: [u8; 16] = [0x11; 16];
@@ -2766,6 +3566,74 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn with_planned_rotation_fixture<R>(
+        binding: &AuthConversationStoreBinding,
+        run: impl FnOnce(&PlannedRotationPreparationV1) -> R,
+    ) -> R {
+        const INITIAL_KEY_SEED: [u8; 32] = [0x91; 32];
+        const INITIAL_SOURCE_AT: u64 = 1_700_000_000_000_001;
+        const PLANNED_TRANSITION: [u8; 16] = [
+            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x46, 0x66, 0x86, 0x66, 0x66, 0x66, 0x66, 0x66,
+            0x66, 0x66,
+        ];
+        const PLANNED_AUDIT: [u8; 16] = [
+            0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x47, 0x77, 0x87, 0x77, 0x77, 0x77, 0x77, 0x77,
+            0x77, 0x77,
+        ];
+        const OWNER_ID: [u8; 16] = [
+            0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x84, 0x44, 0x44, 0x44, 0x44, 0x44,
+            0x44, 0x44,
+        ];
+
+        with_initialization_source_seed(
+            TEST_TRANSITION,
+            "owner",
+            INITIAL_KEY_SEED,
+            |initialization| {
+                assert_eq!(
+                    binding
+                        .commit_initialization_source(initialization)
+                        .expect("initialization source commit"),
+                    AuthInitializationSourceMutationOutcome::Committed
+                );
+                assert_eq!(
+                    binding
+                        .commit_initialization_final_lifecycle(initialization.expectation())
+                        .expect("initialization final lifecycle"),
+                    AuthInitializationFinalLifecycleMutationOutcome::Committed
+                );
+            },
+        );
+
+        let current = Keyring::from_test_seeds(1, INITIAL_SOURCE_AT - 1, INITIAL_KEY_SEED, None)
+            .expect("current planned keyring");
+        let preparation = PlannedRotationPreparationV1::from_current_keyring(
+            PlannedRotationMetadataInput {
+                transition_id: TransitionId::from_uuid(Uuid::from_bytes(PLANNED_TRANSITION))
+                    .expect("planned transition"),
+                owner_id: AuthOwnerId::from_uuid(Uuid::from_bytes(OWNER_ID))
+                    .expect("planned owner"),
+                audit_id: AuditId::from_uuid(Uuid::from_bytes(PLANNED_AUDIT))
+                    .expect("planned audit"),
+                key_activated_at_micros: AuthTimestampMicros::new(INITIAL_SOURCE_AT + 10)
+                    .expect("planned activation"),
+                source_at_micros: SourceTimestampMicros::new(INITIAL_SOURCE_AT + 11)
+                    .expect("planned source timestamp"),
+                expected_lifecycle_revision: 2,
+                expected_lifecycle_updated_at_micros: SourceTimestampMicros::new(INITIAL_SOURCE_AT)
+                    .expect("active lifecycle timestamp"),
+                credential_version: 1,
+                account_revision: 1,
+                password_credential_revision: 1,
+                recovery_credential_revision: 1,
+            },
+            &current,
+        )
+        .expect("planned preparation");
+        run(&preparation)
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn clean_initialization_snapshot_survives_explicit_reopen() {
         let directory = tempdir().expect("temporary store directory");
@@ -2794,6 +3662,187 @@ mod tests {
             AuthDatabaseLifecycleObservation::CleanUninitialized
         );
         reopened.close().await.expect("reopened stores close");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planned_rotation_source_and_final_lifecycle_are_exact_replayable_and_redacted() {
+        let directory = tempdir().expect("temporary store directory");
+        let store_root = directory.path().join("stores");
+        let stores = StoreSet::open(&store_root).await.expect("stores open");
+        let binding = stores
+            .conversation
+            .auth_maintenance_binding()
+            .expect("auth binding");
+
+        with_planned_rotation_fixture(&binding, |preparation| {
+            let expectation = preparation.source_expectation();
+            let pre_source = binding
+                .inspect_auth_planned_rotation(Some(expectation))
+                .expect("planned pre-source observation");
+            assert_eq!(pre_source.source, AuthPlannedRotationSourceMatch::Exact);
+            assert!(matches!(
+                planned_rotation_lifecycle_stage(pre_source.lifecycle, expectation),
+                Some(PlannedRotationLifecycleStage::PreSource)
+            ));
+
+            let source = binding
+                .commit_planned_rotation_source(expectation)
+                .expect("planned source commit");
+            assert_eq!(source, AuthPlannedRotationSourceMutationOutcome::Committed);
+            assert_eq!(
+                format!("{source:?}"),
+                "AuthPlannedRotationSourceMutationOutcome::Committed"
+            );
+            let post_source = binding
+                .inspect_auth_planned_rotation(Some(expectation))
+                .expect("planned post-source observation");
+            assert_eq!(post_source.source, AuthPlannedRotationSourceMatch::Exact);
+            assert!(matches!(
+                planned_rotation_lifecycle_stage(post_source.lifecycle, expectation),
+                Some(PlannedRotationLifecycleStage::PostSource)
+            ));
+            assert_eq!(
+                binding
+                    .commit_planned_rotation_source(expectation)
+                    .expect("planned source replay"),
+                AuthPlannedRotationSourceMutationOutcome::AlreadyCommitted
+            );
+
+            let final_lifecycle = binding
+                .commit_planned_rotation_final_lifecycle(expectation)
+                .expect("planned final lifecycle");
+            assert_eq!(
+                final_lifecycle,
+                AuthPlannedRotationFinalLifecycleMutationOutcome::Committed
+            );
+            assert_eq!(
+                format!("{final_lifecycle:?}"),
+                "AuthPlannedRotationFinalLifecycleMutationOutcome::Committed"
+            );
+            let final_observation = binding
+                .inspect_auth_planned_rotation(Some(expectation))
+                .expect("planned final observation");
+            assert_eq!(
+                final_observation.source,
+                AuthPlannedRotationSourceMatch::Exact
+            );
+            assert!(matches!(
+                planned_rotation_lifecycle_stage(final_observation.lifecycle, expectation),
+                Some(PlannedRotationLifecycleStage::Final)
+            ));
+            assert_eq!(
+                binding
+                    .commit_planned_rotation_final_lifecycle(expectation)
+                    .expect("planned final replay"),
+                AuthPlannedRotationFinalLifecycleMutationOutcome::AlreadyCommitted
+            );
+        });
+
+        stores.close().await.expect("stores close");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planned_rotation_source_and_final_lifecycle_resolve_commit_uncertainty() {
+        for final_lifecycle in [false, true] {
+            let directory = tempdir().expect("temporary store directory");
+            let stores = StoreSet::open(directory.path().join("stores"))
+                .await
+                .expect("stores open");
+            let binding = stores
+                .conversation
+                .auth_maintenance_binding()
+                .expect("auth binding");
+
+            with_planned_rotation_fixture(&binding, |preparation| {
+                let expectation = preparation.source_expectation();
+                let source = binding
+                    .commit_planned_rotation_source_with_test_fault(
+                        expectation,
+                        AuthPlannedRotationSourceMutationTestFault::AfterCommitResponseLoss,
+                    )
+                    .expect("planned source response-loss classification");
+                assert_eq!(source, AuthPlannedRotationSourceMutationOutcome::Committed);
+
+                if final_lifecycle {
+                    let final_outcome = binding
+                        .commit_planned_rotation_final_lifecycle_with_test_fault(
+                            expectation,
+                            AuthPlannedRotationFinalLifecycleMutationTestFault::AfterCommitResponseLoss,
+                        )
+                        .expect("planned final response-loss classification");
+                    assert_eq!(
+                        final_outcome,
+                        AuthPlannedRotationFinalLifecycleMutationOutcome::Committed
+                    );
+                }
+            });
+
+            stores.close().await.expect("stores close");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planned_rotation_failed_commits_are_freshly_classified_as_not_committed() {
+        for final_lifecycle in [false, true] {
+            let directory = tempdir().expect("temporary store directory");
+            let stores = StoreSet::open(directory.path().join("stores"))
+                .await
+                .expect("stores open");
+            let binding = stores
+                .conversation
+                .auth_maintenance_binding()
+                .expect("auth binding");
+
+            with_planned_rotation_fixture(&binding, |preparation| {
+                let expectation = preparation.source_expectation();
+                if final_lifecycle {
+                    assert_eq!(
+                        binding
+                            .commit_planned_rotation_source(expectation)
+                            .expect("planned source commit"),
+                        AuthPlannedRotationSourceMutationOutcome::Committed
+                    );
+                    assert_eq!(
+                        binding
+                            .commit_planned_rotation_final_lifecycle_with_test_fault(
+                                expectation,
+                                AuthPlannedRotationFinalLifecycleMutationTestFault::DeferredForeignKeyCommitFailure,
+                            )
+                            .expect("planned final failed-commit classification"),
+                        AuthPlannedRotationFinalLifecycleMutationOutcome::ConfirmedNotCommitted
+                    );
+                    let observation = binding
+                        .inspect_auth_planned_rotation(Some(expectation))
+                        .expect("planned post-source remains");
+                    assert_eq!(
+                        planned_rotation_lifecycle_stage(observation.lifecycle, expectation),
+                        Some(PlannedRotationLifecycleStage::PostSource)
+                    );
+                } else {
+                    assert_eq!(
+                        binding
+                            .commit_planned_rotation_source_with_test_fault(
+                                expectation,
+                                AuthPlannedRotationSourceMutationTestFault::DeferredForeignKeyCommitFailure,
+                            )
+                            .expect("planned source failed-commit classification"),
+                        AuthPlannedRotationSourceMutationOutcome::ConfirmedNotCommitted
+                    );
+                    let observation = binding
+                        .inspect_auth_planned_rotation(Some(expectation))
+                        .expect("planned pre-source remains");
+                    assert_eq!(
+                        planned_rotation_lifecycle_stage(observation.lifecycle, expectation),
+                        Some(PlannedRotationLifecycleStage::PreSource)
+                    );
+                }
+            });
+
+            stores.close().await.expect("stores close");
+        }
     }
 
     #[cfg(unix)]

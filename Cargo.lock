@@ -706,9 +706,13 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "mime_guess",
+ "pov-core",
  "rust-embed",
+ "serde",
+ "serde_json",
  "tokio",
  "tower",
+ "uuid",
 ]
 
 [[package]]

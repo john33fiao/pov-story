@@ -25,13 +25,13 @@ use tokio_rusqlite::{
 use crate::auth::{
     InitializationSourceExpectation, InitializationSourceSeed, PersistedLifecycleKeyId,
     PersistedLifecycleKeyringVersion, PersistedLifecycleTimestamp, PersistedLifecycleTransitionId,
-    PlannedRotationSourceExpectation, TransitionKind,
+    PlannedRotationSourceExpectation, RetireSourceExpectation, TransitionKind,
 };
 use crate::identity::SourceDomain;
 
 #[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))]
-mod auth_records;
+pub(crate) mod auth_records;
 pub(crate) mod conversation_records;
 pub(crate) mod job_records;
 
@@ -373,6 +373,83 @@ impl SqliteStore<ConversationStore> {
         binding.directory_identity()?;
         Ok(binding)
     }
+
+    pub(crate) fn auth_runtime_store(&self) -> Result<AuthRuntimeStore, StoreError> {
+        let store = AuthRuntimeStore {
+            connection: self.connection.clone(),
+            location: Arc::clone(&self.location),
+            operation_poisoned: Arc::clone(&self.operation_poisoned),
+        };
+        store.directory_identity()?;
+        Ok(store)
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+pub(crate) struct AuthRuntimeStore {
+    connection: Connection,
+    location: Arc<StoreLocation>,
+    operation_poisoned: Arc<AtomicBool>,
+}
+
+#[cfg(unix)]
+impl AuthRuntimeStore {
+    pub(crate) fn directory_identity(&self) -> Result<StoreDirectoryIdentity, StoreError> {
+        let kind = StoreKind::Conversation;
+        if self.operation_poisoned.load(Ordering::Acquire) {
+            return Err(StoreError::OperationPoisoned { kind });
+        }
+        validate_store_location(&self.location, "auth runtime store binding")?;
+        Ok(self.location.directory_identity)
+    }
+
+    pub(crate) async fn call<R, F>(&self, operation: &'static str, call: F) -> Result<R, StoreError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut RawConnection) -> Result<R, StoreError> + Send + 'static,
+    {
+        let kind = StoreKind::Conversation;
+        if self.operation_poisoned.load(Ordering::Acquire) {
+            return Err(StoreError::OperationPoisoned { kind });
+        }
+        validate_store_location(&self.location, operation)?;
+        let operation_poisoned = Arc::clone(&self.operation_poisoned);
+        let result = self
+            .connection
+            .call(move |connection| {
+                if operation_poisoned.load(Ordering::Acquire) {
+                    return Err(StoreError::OperationPoisoned { kind });
+                }
+                validate_store_contract_row(connection, kind)?;
+                validate_current_migration_history(connection, kind, migrations_for_kind(kind))?;
+                let result = call(connection)?;
+                validate_store_contract_row(connection, kind)?;
+                validate_current_migration_history(connection, kind, migrations_for_kind(kind))?;
+                Ok(result)
+            })
+            .await
+            .map_err(map_call_error);
+        let location = validate_store_location(&self.location, operation);
+        match (result, location) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), _) | (Ok(_), Err(error)) => {
+                self.operation_poisoned.store(true, Ordering::Release);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn poison(&self) {
+        self.operation_poisoned.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn mutation_executor(&self) -> auth_records::AuthMutationExecutor {
+        auth_records::AuthMutationExecutor::from_runtime_store(
+            Arc::clone(&self.location),
+            Arc::clone(&self.operation_poisoned),
+        )
+    }
 }
 
 #[cfg(unix)]
@@ -490,6 +567,114 @@ pub(crate) enum AuthInitializationFinalLifecycleMutationTestFault {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum AuthPlannedRotationSourceMutationOutcome {
+    Committed,
+    AlreadyCommitted,
+    ConfirmedNotCommitted,
+    PreconditionChanged,
+}
+
+#[cfg(unix)]
+impl fmt::Debug for AuthPlannedRotationSourceMutationOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Committed => "AuthPlannedRotationSourceMutationOutcome::Committed",
+            Self::AlreadyCommitted => "AuthPlannedRotationSourceMutationOutcome::AlreadyCommitted",
+            Self::ConfirmedNotCommitted => {
+                "AuthPlannedRotationSourceMutationOutcome::ConfirmedNotCommitted"
+            }
+            Self::PreconditionChanged => {
+                "AuthPlannedRotationSourceMutationOutcome::PreconditionChanged"
+            }
+        })
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct AuthPlannedRotationSourceMutationError;
+
+#[cfg(unix)]
+impl fmt::Debug for AuthPlannedRotationSourceMutationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthPlannedRotationSourceMutationError")
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Display for AuthPlannedRotationSourceMutationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("authentication planned rotation source mutation failed")
+    }
+}
+
+#[cfg(unix)]
+impl Error for AuthPlannedRotationSourceMutationError {}
+
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthPlannedRotationSourceMutationTestFault {
+    AfterCommitResponseLoss,
+    DeferredForeignKeyCommitFailure,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum AuthPlannedRotationFinalLifecycleMutationOutcome {
+    Committed,
+    AlreadyCommitted,
+    ConfirmedNotCommitted,
+    PreconditionChanged,
+}
+
+#[cfg(unix)]
+impl fmt::Debug for AuthPlannedRotationFinalLifecycleMutationOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Committed => "AuthPlannedRotationFinalLifecycleMutationOutcome::Committed",
+            Self::AlreadyCommitted => {
+                "AuthPlannedRotationFinalLifecycleMutationOutcome::AlreadyCommitted"
+            }
+            Self::ConfirmedNotCommitted => {
+                "AuthPlannedRotationFinalLifecycleMutationOutcome::ConfirmedNotCommitted"
+            }
+            Self::PreconditionChanged => {
+                "AuthPlannedRotationFinalLifecycleMutationOutcome::PreconditionChanged"
+            }
+        })
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct AuthPlannedRotationFinalLifecycleMutationError;
+
+#[cfg(unix)]
+impl fmt::Debug for AuthPlannedRotationFinalLifecycleMutationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthPlannedRotationFinalLifecycleMutationError")
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Display for AuthPlannedRotationFinalLifecycleMutationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("authentication planned rotation final lifecycle mutation failed")
+    }
+}
+
+#[cfg(unix)]
+impl Error for AuthPlannedRotationFinalLifecycleMutationError {}
+
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthPlannedRotationFinalLifecycleMutationTestFault {
+    AfterCommitResponseLoss,
+    DeferredForeignKeyCommitFailure,
+}
+
+#[cfg(unix)]
 impl AuthConversationStoreBinding {
     pub(crate) fn directory_identity(&self) -> Result<StoreDirectoryIdentity, StoreError> {
         let kind = StoreKind::Conversation;
@@ -539,6 +724,21 @@ impl AuthConversationStoreBinding {
             return Err(StoreError::OperationPoisoned { kind });
         }
         let result = auth_records::inspect_auth_planned_rotation(&self.location, expectation);
+        if result.is_err() {
+            self.poison();
+        }
+        result
+    }
+
+    pub(crate) fn inspect_auth_retire(
+        &self,
+        expectation: Option<RetireSourceExpectation<'_>>,
+    ) -> Result<AuthPlannedRotationDatabaseObservation, StoreError> {
+        let kind = StoreKind::Conversation;
+        if self.operation_poisoned.load(Ordering::Acquire) {
+            return Err(StoreError::OperationPoisoned { kind });
+        }
+        let result = auth_records::inspect_auth_retire(&self.location, expectation);
         if result.is_err() {
             self.poison();
         }
@@ -637,6 +837,194 @@ impl AuthConversationStoreBinding {
             self.poison();
         }
         result.map_err(|_| AuthInitializationFinalLifecycleMutationError)
+    }
+
+    pub(crate) fn commit_planned_rotation_source(
+        &self,
+        expectation: PlannedRotationSourceExpectation<'_>,
+    ) -> Result<AuthPlannedRotationSourceMutationOutcome, AuthPlannedRotationSourceMutationError>
+    {
+        self.commit_planned_rotation_source_inner(
+            expectation,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_planned_rotation_source_with_test_fault(
+        &self,
+        expectation: PlannedRotationSourceExpectation<'_>,
+        fault: AuthPlannedRotationSourceMutationTestFault,
+    ) -> Result<AuthPlannedRotationSourceMutationOutcome, AuthPlannedRotationSourceMutationError>
+    {
+        self.commit_planned_rotation_source_inner(expectation, Some(fault))
+    }
+
+    fn commit_planned_rotation_source_inner(
+        &self,
+        expectation: PlannedRotationSourceExpectation<'_>,
+        #[cfg(test)] fault: Option<AuthPlannedRotationSourceMutationTestFault>,
+    ) -> Result<AuthPlannedRotationSourceMutationOutcome, AuthPlannedRotationSourceMutationError>
+    {
+        if self.operation_poisoned.load(Ordering::Acquire) {
+            return Err(AuthPlannedRotationSourceMutationError);
+        }
+        let result = auth_records::commit_planned_rotation_source(
+            &self.location,
+            &self.operation_poisoned,
+            expectation,
+            #[cfg(test)]
+            fault,
+        );
+        if result.is_err() {
+            self.poison();
+        }
+        result.map_err(|_| AuthPlannedRotationSourceMutationError)
+    }
+
+    pub(crate) fn commit_retire_source(
+        &self,
+        expectation: RetireSourceExpectation<'_>,
+    ) -> Result<AuthPlannedRotationSourceMutationOutcome, AuthPlannedRotationSourceMutationError>
+    {
+        self.commit_retire_source_inner(
+            expectation,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_retire_source_with_test_fault(
+        &self,
+        expectation: RetireSourceExpectation<'_>,
+        fault: AuthPlannedRotationSourceMutationTestFault,
+    ) -> Result<AuthPlannedRotationSourceMutationOutcome, AuthPlannedRotationSourceMutationError>
+    {
+        self.commit_retire_source_inner(expectation, Some(fault))
+    }
+
+    fn commit_retire_source_inner(
+        &self,
+        expectation: RetireSourceExpectation<'_>,
+        #[cfg(test)] fault: Option<AuthPlannedRotationSourceMutationTestFault>,
+    ) -> Result<AuthPlannedRotationSourceMutationOutcome, AuthPlannedRotationSourceMutationError>
+    {
+        if self.operation_poisoned.load(Ordering::Acquire) {
+            return Err(AuthPlannedRotationSourceMutationError);
+        }
+        let result = auth_records::commit_retire_source(
+            &self.location,
+            &self.operation_poisoned,
+            expectation,
+            #[cfg(test)]
+            fault,
+        );
+        if result.is_err() {
+            self.poison();
+        }
+        result.map_err(|_| AuthPlannedRotationSourceMutationError)
+    }
+
+    pub(crate) fn commit_planned_rotation_final_lifecycle(
+        &self,
+        expectation: PlannedRotationSourceExpectation<'_>,
+    ) -> Result<
+        AuthPlannedRotationFinalLifecycleMutationOutcome,
+        AuthPlannedRotationFinalLifecycleMutationError,
+    > {
+        self.commit_planned_rotation_final_lifecycle_inner(
+            expectation,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_planned_rotation_final_lifecycle_with_test_fault(
+        &self,
+        expectation: PlannedRotationSourceExpectation<'_>,
+        fault: AuthPlannedRotationFinalLifecycleMutationTestFault,
+    ) -> Result<
+        AuthPlannedRotationFinalLifecycleMutationOutcome,
+        AuthPlannedRotationFinalLifecycleMutationError,
+    > {
+        self.commit_planned_rotation_final_lifecycle_inner(expectation, Some(fault))
+    }
+
+    fn commit_planned_rotation_final_lifecycle_inner(
+        &self,
+        expectation: PlannedRotationSourceExpectation<'_>,
+        #[cfg(test)] fault: Option<AuthPlannedRotationFinalLifecycleMutationTestFault>,
+    ) -> Result<
+        AuthPlannedRotationFinalLifecycleMutationOutcome,
+        AuthPlannedRotationFinalLifecycleMutationError,
+    > {
+        if self.operation_poisoned.load(Ordering::Acquire) {
+            return Err(AuthPlannedRotationFinalLifecycleMutationError);
+        }
+        let result = auth_records::commit_planned_rotation_final_lifecycle(
+            &self.location,
+            &self.operation_poisoned,
+            expectation,
+            #[cfg(test)]
+            fault,
+        );
+        if result.is_err() {
+            self.poison();
+        }
+        result.map_err(|_| AuthPlannedRotationFinalLifecycleMutationError)
+    }
+
+    pub(crate) fn commit_retire_final_lifecycle(
+        &self,
+        expectation: RetireSourceExpectation<'_>,
+    ) -> Result<
+        AuthPlannedRotationFinalLifecycleMutationOutcome,
+        AuthPlannedRotationFinalLifecycleMutationError,
+    > {
+        self.commit_retire_final_lifecycle_inner(
+            expectation,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_retire_final_lifecycle_with_test_fault(
+        &self,
+        expectation: RetireSourceExpectation<'_>,
+        fault: AuthPlannedRotationFinalLifecycleMutationTestFault,
+    ) -> Result<
+        AuthPlannedRotationFinalLifecycleMutationOutcome,
+        AuthPlannedRotationFinalLifecycleMutationError,
+    > {
+        self.commit_retire_final_lifecycle_inner(expectation, Some(fault))
+    }
+
+    fn commit_retire_final_lifecycle_inner(
+        &self,
+        expectation: RetireSourceExpectation<'_>,
+        #[cfg(test)] fault: Option<AuthPlannedRotationFinalLifecycleMutationTestFault>,
+    ) -> Result<
+        AuthPlannedRotationFinalLifecycleMutationOutcome,
+        AuthPlannedRotationFinalLifecycleMutationError,
+    > {
+        if self.operation_poisoned.load(Ordering::Acquire) {
+            return Err(AuthPlannedRotationFinalLifecycleMutationError);
+        }
+        let result = auth_records::commit_retire_final_lifecycle(
+            &self.location,
+            &self.operation_poisoned,
+            expectation,
+            #[cfg(test)]
+            fault,
+        );
+        if result.is_err() {
+            self.poison();
+        }
+        result.map_err(|_| AuthPlannedRotationFinalLifecycleMutationError)
     }
 
     pub(crate) fn poison(&self) {
