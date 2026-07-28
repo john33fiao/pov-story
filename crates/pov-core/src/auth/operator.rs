@@ -37,22 +37,29 @@ const INIT_FAILURE: &str = "authentication operator initialization failed";
 /// input rather than accidentally accepting a password from a pipeline.
 pub async fn run_operator_init(
     instance_root: impl AsRef<Path>,
-    stores: &StoreSet,
     login_id: &str,
     now_micros: u64,
 ) -> Result<(), OperatorInitError> {
+    let instance_root = instance_root.as_ref();
     let mut terminal = ControllingTerminal::open()?;
     let (password, recovery) = collect_confirmation(&mut terminal)?;
-    initialize_confirmed(
+    // Opening StoreSet bootstraps the instance's store directory and SQLite files.
+    // Keep that filesystem mutation strictly after the operator confirmation.
+    let stores = StoreSet::open(instance_root.join("stores"))
+        .await
+        .map_err(|_| OperatorInitError)?;
+    let result = initialize_confirmed(
         instance_root,
-        stores,
+        &stores,
         login_id,
         &password,
         &recovery,
         now_micros,
     )
     .await
-    .map_err(|_| OperatorInitError)
+    .map_err(|_| OperatorInitError);
+    let close = stores.close().await.map_err(|_| OperatorInitError);
+    result.and(close)
 }
 
 trait OperatorTerminal {
@@ -137,12 +144,23 @@ impl ControllingTerminal {
 
 struct EchoGuard<'a> {
     file: &'a File,
-    original: Termios,
+    original: Option<Termios>,
+}
+
+impl EchoGuard<'_> {
+    fn restore(&mut self) -> Result<(), OperatorInitError> {
+        let original = self.original.as_ref().ok_or(OperatorInitError)?;
+        tcsetattr(self.file, OptionalActions::Now, original).map_err(|_| OperatorInitError)?;
+        self.original = None;
+        Ok(())
+    }
 }
 
 impl Drop for EchoGuard<'_> {
     fn drop(&mut self) {
-        let _ = tcsetattr(self.file, OptionalActions::Now, &self.original);
+        if let Some(original) = &self.original {
+            let _ = tcsetattr(self.file, OptionalActions::Now, original);
+        }
     }
 }
 
@@ -153,15 +171,18 @@ impl OperatorTerminal for ControllingTerminal {
         let mut hidden = original.clone();
         hidden.local_modes.remove(LocalModes::ECHO);
         tcsetattr(&self.file, OptionalActions::Now, &hidden).map_err(|_| OperatorInitError)?;
-        let guard = EchoGuard {
+        let mut guard = EchoGuard {
             file: &self.file,
-            original,
+            original: Some(original),
         };
         let mut line = Vec::new();
         BufReader::new(&self.file)
             .take(1026)
             .read_until(b'\n', &mut line)
             .map_err(|_| OperatorInitError)?;
+        // Drop remains the unwind/error fallback, but a successful prompt must
+        // observe restoration rather than silently discarding its error.
+        guard.restore()?;
         drop(guard);
         self.write_all(b"\n")?;
         self.ensure_foreground()?;

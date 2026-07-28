@@ -18,20 +18,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(unix)]
 async fn run() -> Result<(), Box<dyn Error>> {
     let command = parse_command(std::env::args_os().skip(1))?;
-    let (instance_root, login_id) = match command {
-        Command::Serve { instance_root } => (instance_root, None),
+    let instance_root = match command {
+        Command::Serve { instance_root } => instance_root,
         Command::AuthInit {
             instance_root,
             login_id,
-        } => (instance_root, Some(login_id)),
+        } => {
+            return run_operator_init(&instance_root, &login_id, current_time_micros()?)
+                .await
+                .map_err(Into::into);
+        }
     };
     let stores = StoreSet::open(instance_root.join("stores")).await?;
     let now_micros = current_time_micros()?;
-    if let Some(login_id) = login_id {
-        let result = run_operator_init(&instance_root, &stores, &login_id, now_micros).await;
-        stores.close().await?;
-        return result.map_err(Into::into);
-    }
     let runtime = Arc::new(AuthRuntime::open(&instance_root, &stores, now_micros).await?);
     let listener = TcpListener::bind(DEFAULT_BIND_ADDRESS).await?;
     axum::serve(listener, app_with_auth(runtime)).await?;
