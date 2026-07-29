@@ -1,6 +1,6 @@
 # POV-008 Idempotent Conversation Append And Outbox
 
-Status: In Progress — dependency-independent persistence core implemented; production activation gated by POV-007
+Status: In Progress — persistence acceptance verified; project-local RTD After unavailable
 
 Type: Delivery
 
@@ -60,9 +60,20 @@ owner-scoped conversation, append-only event, idempotency key, audit와 transact
 
 ## Remaining Before Completion
 
-- POV-007 must provide the production issuer/verifier for `VerifiedAuthContext`; this ticket does not create a bypass constructor.
-- `pov-api` activation and authenticated browser flow remain POV-010 scope.
-- Full repository validation and RTD After must pass on the final changed set before this ticket can move to Completed.
+- [x] POV-007 provides the production issuer/verifier for `VerifiedAuthContext`.
+  `AuthRuntime::verify_access` validates the local JWT, active session, credential version,
+  enabled account and active key lifecycle before minting the owner capability. The synthetic
+  constructor remains test-only and this ticket adds no listener bypass or raw production
+  constructor.
+- [x] 2026-07-29 close-out audit rechecked the migration, repository and targeted tests against
+  every acceptance criterion. `pov-api` activation and authenticated browser flow remain
+  [POV-010](POV-010-minimal-authenticated-local-text-chat.md) scope and are not claimed here.
+- [x] Final changed-set repository validation passes: frontend format/lint/typecheck/build,
+  Rust format/workspace check/workspace test, Markdown relative links and `git diff --check`.
+- [ ] Project-local RTD After must pass before this ticket can move to Completed. The current
+  public repository has no `AGENTS.md` or `.agents/skills/rtd-after/SKILL.md`, and no `rtd-after`
+  command is installed, so the required project-specific gate cannot currently be executed. Do
+  not substitute the global `rtd-setup` template for this completion evidence.
 
 ## Rollback
 

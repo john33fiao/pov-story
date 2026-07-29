@@ -20,7 +20,7 @@ Repository posture: public fresh-history baseline verified 2026-07-27; POV-031 c
 | Ticket | Type | Status | Outcome |
 | --- | --- | --- | --- |
 | [POV-007 Local login, refresh and session revoke](tickets/POV-007-local-login-refresh-and-session-revoke.md) | Delivery | Completed — 2026-07-29; supported-Unix production init smoke와 final repository validation 완료 | narrowed local auth runtime delivery 종료; installed-browser·장기 key 운영·recovery·platform/durability claim은 transferred ticket에 유지 |
-| [POV-008 Idempotent conversation append and outbox](tickets/POV-008-idempotent-conversation-append-and-outbox.md) | Delivery | In Progress — persistence core implemented; POV-007 dependency completed | owner-scoped append, retry conflict, audit/outbox와 post-commit readback의 synthetic contract를 검증 |
+| [POV-008 Idempotent conversation append and outbox](tickets/POV-008-idempotent-conversation-append-and-outbox.md) | Delivery | In Progress — persistence acceptance verified; project-local RTD After unavailable | owner-scoped append, retry conflict, audit/outbox와 post-commit readback 검증 완료; RTD gate 복구 뒤 close-out |
 | [POV-009 Durable single-slot job queue](tickets/POV-009-durable-single-slot-job-queue.md) | Delivery | In Progress — durable persistence core implemented; runtime activation gated by POV-007/008/010/011/012 | outbox 기반 enqueue, fixed-normal FIFO, fenced single-slot lease, 보수적 recovery halt와 retry/cancellation/timing/event history를 보존 |
 
 ## Auth Follow-ups — Not Initial H1 Gates
