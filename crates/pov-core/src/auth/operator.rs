@@ -1,7 +1,7 @@
 use std::{
     fmt,
     fs::{File, OpenOptions},
-    io::{self, BufRead, BufReader, IsTerminal, Read, Write},
+    io::{self, IsTerminal, Write},
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
 };
@@ -41,8 +41,10 @@ pub async fn run_operator_init(
     now_micros: u64,
 ) -> Result<(), OperatorInitError> {
     let instance_root = instance_root.as_ref();
+    preflight_instance_root(instance_root)?;
     let mut terminal = ControllingTerminal::open()?;
     let (password, recovery) = collect_confirmation(&mut terminal)?;
+    terminal.ensure_foreground()?;
     // Opening StoreSet bootstraps the instance's store directory and SQLite files.
     // Keep that filesystem mutation strictly after the operator confirmation.
     let stores = StoreSet::open(instance_root.join("stores"))
@@ -85,6 +87,7 @@ fn collect_confirmation(
 
 struct ControllingTerminal {
     file: File,
+    signals: signal_coordination::SignalCoordinator,
 }
 
 impl ControllingTerminal {
@@ -104,7 +107,10 @@ impl ControllingTerminal {
         // Refuse to start unless both reading and restoring terminal state work.
         let original = tcgetattr(&file).map_err(|_| OperatorInitError)?;
         tcsetattr(&file, OptionalActions::Now, &original).map_err(|_| OperatorInitError)?;
-        Ok(Self { file })
+        // Coordination is established before echo can be disabled. It uses
+        // sigwait on a helper thread; no process-wide signal handler is installed.
+        let signals = signal_coordination::SignalCoordinator::start()?;
+        Ok(Self { file, signals })
     }
 
     fn ensure_foreground(&self) -> Result<(), OperatorInitError> {
@@ -124,10 +130,7 @@ impl ControllingTerminal {
     fn read_line(&mut self, maximum: usize) -> Result<Vec<u8>, OperatorInitError> {
         self.ensure_foreground()?;
         let mut line = Vec::new();
-        BufReader::new(&self.file)
-            .take((maximum + 2) as u64)
-            .read_until(b'\n', &mut line)
-            .map_err(|_| OperatorInitError)?;
+        self.signals.read_line(&self.file, maximum, &mut line)?;
         self.ensure_foreground()?;
         if line.last() == Some(&b'\n') {
             line.pop();
@@ -176,13 +179,11 @@ impl OperatorTerminal for ControllingTerminal {
             original: Some(original),
         };
         let mut line = Vec::new();
-        BufReader::new(&self.file)
-            .take(1026)
-            .read_until(b'\n', &mut line)
-            .map_err(|_| OperatorInitError)?;
+        let read = self.signals.read_line(&self.file, 1024, &mut line);
         // Drop remains the unwind/error fallback, but a successful prompt must
         // observe restoration rather than silently discarding its error.
         guard.restore()?;
+        read?;
         drop(guard);
         self.write_all(b"\n")?;
         self.ensure_foreground()?;
@@ -204,6 +205,170 @@ impl OperatorTerminal for ControllingTerminal {
     fn confirm_saved(&mut self) -> Result<bool, OperatorInitError> {
         self.write_all(b"Type SAVED to confirm secure storage: ")?;
         Ok(self.read_line(16)? == b"SAVED")
+    }
+}
+
+fn preflight_instance_root(root: &Path) -> Result<(), OperatorInitError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(OperatorInitError),
+    };
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(OperatorInitError);
+    }
+    for child in ["stores", "secrets"] {
+        let path = root.join(child);
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata)
+                if metadata.is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.uid() == rustix::process::geteuid().as_raw()
+                    && metadata.permissions().mode() & 0o077 == 0 => {}
+            Ok(_) => return Err(OperatorInitError),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(OperatorInitError),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod signal_coordination {
+    use std::{
+        fs::File,
+        io::Read,
+        os::fd::AsFd,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicI32, Ordering},
+        },
+        thread,
+    };
+
+    use super::OperatorInitError;
+    use nix::{
+        poll::{PollFd, PollFlags, PollTimeout, poll},
+        sys::signal::{SigSet, SigmaskHow, Signal, kill, pthread_sigmask},
+        unistd::getpid,
+    };
+
+    const SIGNALS: [Signal; 4] = [
+        Signal::SIGINT,
+        Signal::SIGTERM,
+        Signal::SIGHUP,
+        Signal::SIGQUIT,
+    ];
+
+    pub(super) struct SignalCoordinator {
+        previous: SigSet,
+        stopped: Arc<AtomicBool>,
+        caught: Arc<AtomicI32>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+
+    impl SignalCoordinator {
+        pub(super) fn start() -> Result<Self, OperatorInitError> {
+            let mut mask = SigSet::empty();
+            for signal in SIGNALS {
+                mask.add(signal);
+            }
+            // SIGUSR1 is a private wakeup used only to join the sigwait thread.
+            mask.add(Signal::SIGUSR1);
+            let mut previous = SigSet::empty();
+            pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&mask), Some(&mut previous))
+                .map_err(|_| OperatorInitError)?;
+            let stopped = Arc::new(AtomicBool::new(false));
+            let caught = Arc::new(AtomicI32::new(0));
+            let worker_stopped = Arc::clone(&stopped);
+            let worker_caught = Arc::clone(&caught);
+            let worker = thread::Builder::new()
+                .name("pov-auth-sigwait".into())
+                .spawn(move || {
+                    if let Ok(signal) = mask.wait()
+                        && !worker_stopped.load(Ordering::Acquire)
+                        && SIGNALS.contains(&signal)
+                    {
+                        worker_caught.store(signal as i32, Ordering::Release);
+                    }
+                })
+                .map_err(|_| {
+                    let _ = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&previous), None);
+                    OperatorInitError
+                })?;
+            Ok(Self {
+                previous,
+                stopped,
+                caught,
+                worker: Some(worker),
+            })
+        }
+
+        pub(super) fn read_line(
+            &self,
+            file: &File,
+            maximum: usize,
+            output: &mut Vec<u8>,
+        ) -> Result<(), OperatorInitError> {
+            loop {
+                if self.caught.load(Ordering::Acquire) != 0 {
+                    return Err(OperatorInitError);
+                }
+                let mut fds = [PollFd::new(file.as_fd(), PollFlags::POLLIN)];
+                if poll(&mut fds, PollTimeout::from(20_u16)).map_err(|_| OperatorInitError)? == 0 {
+                    continue;
+                }
+                let mut byte = [0_u8; 1];
+                if (&*file).read(&mut byte).map_err(|_| OperatorInitError)? != 1 {
+                    return Err(OperatorInitError);
+                }
+                output.push(byte[0]);
+                if byte[0] == b'\n' {
+                    return Ok(());
+                }
+                if output.len() > maximum + 1 {
+                    return Err(OperatorInitError);
+                }
+            }
+        }
+    }
+
+    impl Drop for SignalCoordinator {
+        fn drop(&mut self) {
+            self.stopped.store(true, Ordering::Release);
+            if self.caught.load(Ordering::Acquire) == 0 {
+                let _ = kill(getpid(), Signal::SIGUSR1);
+            }
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+            let signal = self.caught.load(Ordering::Acquire);
+            // Re-queue the accepted signal while blocked, then restore the exact
+            // prior mask so ordinary subprocess termination semantics apply.
+            if signal != 0 {
+                if let Ok(signal) = Signal::try_from(signal) {
+                    let _ = kill(getpid(), signal);
+                }
+            }
+            let _ = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&self.previous), None);
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod signal_coordination {
+    use super::OperatorInitError;
+    pub(super) struct SignalCoordinator;
+    impl SignalCoordinator {
+        pub(super) fn start() -> Result<Self, OperatorInitError> {
+            Err(OperatorInitError)
+        }
     }
 }
 

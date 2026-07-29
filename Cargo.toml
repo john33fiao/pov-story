@@ -19,6 +19,7 @@ ed25519-dalek = { version = "3.0.0", default-features = false, features = [
   "zeroize",
 ] }
 getrandom = "0.4.3"
+nix = { version = "0.31.3", features = ["poll", "signal"] }
 mime_guess = "2.0.5"
 process-wrap = { version = "9.1.0", default-features = false, features = [
   "kill-on-drop",

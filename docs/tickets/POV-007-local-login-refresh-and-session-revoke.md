@@ -24,6 +24,7 @@ accepted auth decision에 따라 ID/password login, 짧은 수명의 access toke
 - [ADR-0004](../decisions/0004-local-authentication-and-session-security-contract.md)의 access token verification과 owner context middleware
 - auth verifier 내부에서만 production `VerifiedAuthContext` 발급; public/raw owner constructor 금지
 - explicit instance root/login ID만 받는 production `auth init`; password echo suppression, `/dev/tty` foreground 검증, CSPRNG recovery code 단회 표시와 저장 확인 전 durable mutation 금지
+- Linux production binary PTY evidence에서 confirmation 전 filesystem bootstrap 금지와 SIGINT/SIGTERM/SIGHUP/SIGQUIT의 explicit termios restore 및 signal 종료 semantics 검증; macOS 실행 evidence는 아직 남음
 - refresh replay detection과 related session revoke
 - password change, saved recovery-code rotation/recovery와 user disable/re-enable
 - local browser token/cookie profile
@@ -501,13 +502,13 @@ completion을 주장하지 않습니다. 외부 사용자 검증인 POV-022는 �
   cookie를 `Path=/api/auth; HttpOnly; SameSite=Strict`로만 issue/clear합니다. Production
   binary는 explicit instance root로 stores와 `AuthRuntime`을 listener bind 전에 열어
   mixed/invalid auth state에서 fail closed합니다.
-- Public `initialize_confirmed` operator seam은 caller가 replacement recovery code 표시와
-  보관 확인을 끝낸 뒤에만 maintenance lock을 획득한 canonical clean instance에서
-  password/recovery verifier와 CSPRNG keyring을 만들고 preparation, source-CAS, active-key
-  install, final lifecycle CAS와 cleanup을 순서대로 완료합니다. Unix targeted tests는
-  listener-ready terminal state와 second initialization no-replace를 확인합니다. 이 seam은
-  automated synthetic secret injection을 위한 것이며 controlling-TTY prompt 자체는 아직
-  production CLI에 연결하지 않았습니다.
+- Production `auth init`은 read-only owner/layout preflight 뒤 controlling TTY에서만
+  password를 받고 recovery code를 단회 표시하며 exact `SAVED` 확인 뒤에만 StoreSet과
+  maintenance initialization을 엽니다. Linux production-binary PTY evidence는 password read
+  동안 실제 ECHO disable, SIGINT/SIGTERM/SIGHUP/SIGQUIT 뒤 explicit restore와 원 signal
+  termination, 그리고 signal/no-TTY/parser failure의 bootstrap mutation 부재를 확인합니다.
+  Public `initialize_confirmed` seam의 synthetic tests는 listener-ready terminal state와
+  second initialization no-replace를 별도로 확인합니다.
 - 이 evidence는 schema/storage/credential primitive, complete initialization/planned/retire
   key lifecycle, strict local JWT, login/session/refresh/logout/logout-all, password/recovery/
   account mutation, fail-closed runtime와 local HTTP boundary 및 confirmed-initialization
@@ -519,7 +520,7 @@ completion을 주장하지 않습니다. 외부 사용자 검증인 POV-022는 �
   확인하는 protocol state이며 auth validity나 listener readiness가 아닙니다.
   Retire terminal `CleanActiveOnly`도 metadata가 제거된 뒤 active-only revision/KID/version/
   key/namespace만 확인하는 protocol state이며 auth validity나 listener readiness가 아닙니다.
-  Compromise/loss transition command와 controlling-TTY prompt/echo·signal restoration,
+  Compromise/loss transition command, macOS controlling-TTY subprocess evidence,
   planned/retire production operator command, reference-device Argon2 benchmark,
   preparation/source predicate 직후 same-UID ABA의 원자적 차단, 실제 process
   crash/power-loss/filesystem durability 및 installed Chrome/Safari clauses는 아직 PASS가

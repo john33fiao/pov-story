@@ -6,7 +6,7 @@ POV Story는 메모, 음성, 일정, 할 일, 작업일지와 장기 기억을 �
 
 - Rust/Axum process가 React/Vite production shell과 data-independent health API를 `127.0.0.1:8080` same-origin으로 제공합니다.
 - owner/source/revision, 네 SQLite lifecycle, safe process supervisor와 POV-008/009 persistence core가 구현되어 있습니다.
-- 인증은 schema, credential·key lifecycle과 initialization primitive까지만 구현됐고 production login/JWT/HTTP/runtime wiring은 아직 없습니다. 신규 initialization은 corpus evaluation을 주장하지 않는 persisted sentinel을 사용하며 password blocklist enforcement는 current tree에서 제거됐습니다.
+- 인증은 local login/JWT/session/revoke HTTP runtime과 controlling-TTY `auth init` operator까지 연결됐습니다. 신규 initialization은 corpus evaluation을 주장하지 않는 persisted sentinel을 사용하며 password blocklist enforcement는 current tree에서 제거됐습니다.
 - Windows Rust workspace check/test baseline은 [POV-034](docs/deps/POV-034-restore-windows-workspace-validation-baseline.md)에서 복구됐고 Unix auth maintenance capability는 Windows에서 계속 비활성입니다.
 - 실제 lifelog 접수, background dispatcher, provider/model 실행은 활성화되지 않았습니다.
 
