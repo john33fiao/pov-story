@@ -16,4 +16,5 @@ tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tower.workspace = true
