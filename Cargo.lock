@@ -723,6 +723,7 @@ dependencies = [
  "base64ct",
  "ed25519-dalek",
  "getrandom",
+ "nix",
  "pov-platform",
  "process-wrap",
  "rustix",

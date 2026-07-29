@@ -10,7 +10,7 @@ use pov_core::{
 #[cfg(unix)]
 use tokio::net::TcpListener;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
     run().await
 }
