@@ -1,6 +1,6 @@
 # POV-009 Durable Single-slot Job Queue
 
-Status: In Progress — durable persistence core implemented; runtime activation pending
+Status: Completed — 2026-07-29; durable persistence acceptance and production auth dependency verified
 
 Type: Delivery
 
@@ -59,7 +59,7 @@ Conversation DB에 job state, attempt, fenced lease, fixed-normal FIFO, retry sc
 - 마지막 attempt는 confirmation 대기로 전이하지 않고 follower FIFO를 막지 않습니다.
 - persisted wall-clock이 뒤로 가면 queue admission/mutation은 mutation 없이 fail closed합니다.
 
-현재 persistence core는 이 criteria를 겨냥한 synthetic repository target을 갖지만, ticket은 runtime end-to-end acceptance 전까지 완료하지 않습니다.
+현재 persistence delivery는 이 criteria를 current repository target에서 충족합니다. outbox source를 enqueue하는 동일 request는 ledger replay와 `(owner, outbox, kind)` uniqueness로 job 하나에 수렴하고, key를 잃은 response-loss caller도 exact source lookup으로 결과를 복구합니다. 자동 background ingestion, HTTP/API, browser와 provider end-to-end activation은 아래 후속 ticket 범위이며 이 완료에서 주장하지 않습니다.
 
 ## State And Recovery Boundary
 
@@ -82,9 +82,9 @@ recovery_required
 
 `leased`, `running`, `cancel_requested`, `recovery_required`는 singleton active capability와 결합됩니다. `recovery_required`는 terminal 성공이 아니라 system-wide halt이며, expired started work의 부재를 외부에서 확인하기 전에는 새 attempt를 만들지 않습니다.
 
-## Verification
+## Completion Evidence
 
-현재 test targets:
+현재 test evidence:
 
 - enqueue replay/conflict, duplicate source와 cross-owner fail-closed
 - independent store handle의 concurrent singleton claim과 fixed-normal FIFO
@@ -99,16 +99,20 @@ recovery_required
 - persisted clock regression의 mutation-free fail-closed 및 floor recovery
 - migration exact-prefix, invalid transition, job/enqueue ledger/owner-mutation ledger/attempt/event/singleton control의 UPDATE/DELETE/`INSERT OR REPLACE` guard
 
-최종 evidence 대상으로 workspace fast validation과 `git diff --check`를 사용합니다. 이 문서는 아직 실행 결과나 PASS 수치를 확정하지 않습니다.
+- `cargo test --locked -p pov-core job::tests -- --nocapture`: 17 passed, 0 failed.
+- `cargo test --locked -p pov-core backup_hook_creates_valid_independent_online_snapshots -- --nocapture`: 1 passed, 0 failed.
+- frontend format/lint/typecheck/build와 Rust format/locked workspace check/locked workspace test가 current HEAD에서 통과했습니다.
+- Markdown relative links와 `git diff --check`를 final changed set에서 확인했습니다.
+- project-local RTD After 13단계가 final changed set을 `READY`로 판정했습니다.
+- `AuthRuntime::verify_access`만 production `VerifiedAuthContext`를 생성하고 synthetic constructor는 `cfg(test)`로 제한됩니다. Queue owner surface는 이 capability를 요구하며 HTTP activation은 포함하지 않습니다.
 
 ## Rollback
 
 dispatcher를 중지하고 queued/running job을 안전한 terminal 또는 pending 상태로 보존할 수 있어야 합니다. job history를 삭제해 rollback하지 않습니다.
 
-## Remaining Activation And Integration
+## Remaining Non-Claimed Activation And Integration
 
-- POV-007의 production auth issuer/verifier가 없어 owner-facing repository를 실제 request에 활성화할 수 없습니다.
-- POV-008 append/outbox persistence는 구현됐지만 API와 runtime outbox ingestion이 아직 연결되지 않았습니다.
+- POV-007 production issuer/verifier와 POV-008 append/outbox persistence dependency는 충족됐지만 queue repository는 아직 HTTP request나 background outbox ingestion loop에 연결되지 않았습니다.
 - POV-010이 authenticated local text intake와 durable receipt를 실제 Web Chat에 연결해야 합니다.
 - POV-011이 owner-scoped event history를 authenticated replayable SSE cursor로 노출해야 합니다.
 - POV-012가 supervised loopback provider, process-absence 확인과 job completion/result append를 연결해야 합니다.
