@@ -1,6 +1,6 @@
 # POV-008 Idempotent Conversation Append And Outbox
 
-Status: In Progress — persistence acceptance verified; project-local RTD After unavailable
+Status: Completed — 2026-07-29; persistence acceptance, production auth dependency and final validation verified
 
 Type: Delivery
 
@@ -58,7 +58,7 @@ owner-scoped conversation, append-only event, idempotency key, audit와 transact
 - post-commit joined readback recomputes the content hash and verifies fingerprint, correlation and the event/outbox/audit relationship before returning success.
 - synthetic tests cover independent-connection same-key and same-revision races, a later revision committed between commit/readback, payload/target/revision conflicts, cross-owner fail-closed reads, exact-byte roundtrip, UPDATE/DELETE/REPLACE immutable triggers, pre-outbox rollback, response-loss recovery, queued report/backup poison recheck, dirty-writer reopen, backup/reopen and redacted Debug output.
 
-## Remaining Before Completion
+## Completion Evidence
 
 - [x] POV-007 provides the production issuer/verifier for `VerifiedAuthContext`.
   `AuthRuntime::verify_access` validates the local JWT, active session, credential version,
@@ -70,10 +70,9 @@ owner-scoped conversation, append-only event, idempotency key, audit와 transact
   [POV-010](POV-010-minimal-authenticated-local-text-chat.md) scope and are not claimed here.
 - [x] Final changed-set repository validation passes: frontend format/lint/typecheck/build,
   Rust format/workspace check/workspace test, Markdown relative links and `git diff --check`.
-- [ ] Project-local RTD After must pass before this ticket can move to Completed. The current
-  public repository has no `AGENTS.md` or `.agents/skills/rtd-after/SKILL.md`, and no `rtd-after`
-  command is installed, so the required project-specific gate cannot currently be executed. Do
-  not substitute the global `rtd-setup` template for this completion evidence.
+- [x] Project-local RTD After completed all 13 review/readiness steps as READY on the final changed
+  set. The repository's intentionally ignored local `AGENTS.md` and RTD Before/After skills were
+  restored from current code, manifest and canonical-document facts before this gate ran.
 
 ## Rollback
 
