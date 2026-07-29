@@ -1,6 +1,6 @@
 # POV-007 Local Login, Refresh And Session Revoke
 
-Status: In Progress — initialization/planned/retire lifecycle, local login/JWT/session/revoke/HTTP runtime와 controlling-TTY `auth init` operator 구현; compromise/loss 및 installed-browser evidence 남음
+Status: In Progress — narrowed local-auth runtime 구현 완료; supported-Unix production `auth init` smoke와 final repository validation 남음
 
 Type: Delivery
 
@@ -16,32 +16,54 @@ Depends on: POV-004, POV-005
 
 accepted auth decision에 따라 ID/password login, 짧은 수명의 access token, rotating opaque refresh token, logout과 session revoke를 구현합니다. 보호 API는 request payload가 아니라 검증된 session subject로 owner scope를 주입합니다.
 
+## Completion Boundary
+
+이 ticket은 **초기화된 한 owner가 local HTTP profile에서 login, refresh, logout,
+logout-all과 session revoke를 fail closed로 사용할 수 있는 runtime**까지 소유합니다.
+장기 키 운영, 복구 및 환경별 hardening을 모두 같은 ticket의 완료 조건으로 묶지 않습니다.
+
+[ADR-0004](../decisions/0004-local-authentication-and-session-security-contract.md)의
+보안 계약은 그대로 유지합니다. 아래 분리는 계약을 약화하거나 unsupported state를
+허용하는 변경이 아니라, 구현·검증 책임과 activation gate를 좁히는 delivery sequencing
+변경입니다.
+
+| Transferred outcome | Owner | POV-007/H1 gate |
+| --- | --- | --- |
+| planned rotation·verify-only retire production operator | [POV-035](POV-035-planned-key-rotation-and-retirement-operator.md) | 초기 H1 text capture gate 아님; 장기 key maintenance/release claim 전 필요 |
+| compromise·loss recovery와 production operator | [POV-036](POV-036-auth-key-compromise-and-loss-recovery.md) | 초기 H1 text capture gate 아님; 해당 recovery 지원 claim 전 필요 |
+| installed-browser login/refresh/logout, cookie·storage evidence | [POV-010](POV-010-minimal-authenticated-local-text-chat.md) | H1 product/browser evidence에서 검증 |
+| platform PTY matrix, reference-device Argon2, abrupt crash/power-loss, same-UID ABA residual | [POV-037](POV-037-auth-platform-and-durability-hardening.md) | 초기 H1 text capture gate 아님; 해당 platform/durability claim 전 필요 |
+
+POV-007 completion은 현재 구현된 Unix auth maintenance profile만 주장합니다. Native
+Windows auth maintenance/runtime을 성공 stub으로 간주하지 않으며, POV-010 dogfood
+platform을 정할 때 별도 delivery 필요 여부를 결정합니다.
+
 ## Scope
 
 - explicit clean-instance sentinel, listener-closed resumable signing-key/account bootstrap와 password verification
-- exclusive auth maintenance lock, planned rotation, verify-only retirement, compromise/loss recovery와 crash-resumable key lifecycle
+- exclusive auth maintenance lock, initialization reservation과 crash-resumable bootstrap lifecycle
 - login, refresh rotation, logout와 active session persistence
 - [ADR-0004](../decisions/0004-local-authentication-and-session-security-contract.md)의 access token verification과 owner context middleware
 - auth verifier 내부에서만 production `VerifiedAuthContext` 발급; public/raw owner constructor 금지
 - explicit instance root/login ID만 받는 production `auth init`; password echo suppression, `/dev/tty` foreground 검증, CSPRNG recovery code 단회 표시와 저장 확인 전 durable mutation 금지
-- Cargo production-subprocess parser/dispatch evidence에서 비정규·secret-looking argv, redirected stdio/no controlling TTY의 진단 redaction과 mutation 부재 검증; Linux/macOS production PTY signal·success evidence는 아직 남음
+- Cargo production-subprocess parser/dispatch evidence에서 비정규·secret-looking argv, redirected stdio/no controlling TTY의 진단 redaction과 mutation 부재 검증
 - refresh replay detection과 related session revoke
 - password change, saved recovery-code rotation/recovery와 user disable/re-enable
-- local browser token/cookie profile
+- local HTTP token/cookie profile; installed-browser product flow는 POV-010에서 검증
 - auth/token redaction과 negative audit evidence
 
 ## Delivery Slices
 
 1. Conversation DB auth control-plane migration, typed records와 commit-uncertainty용 reopenable writer
-2. owner-only secret filesystem, maintenance lock, canonical keyring, initialization source-CAS와 crash-resumable key lifecycle
+2. owner-only secret filesystem, maintenance lock, canonical keyring, initialization source-CAS와 crash-resumable bootstrap lifecycle
 3. password/recovery validation, durable throttle와 controlling-TTY maintenance commands
 4. strict access JWT, login/session/refresh state machine와 opaque verified-owner issuer
-5. fail-closed startup, local auth HTTP/cookie boundary와 installed-browser evidence
+5. fail-closed startup과 local auth HTTP/cookie boundary
 
 각 slice는 listener를 우회하거나 synthetic production auth context를 만들지 않습니다. 모든
-slice와 conditional browser evidence가 완료되기 전에는 production activation과 ticket
-completion을 주장하지 않습니다. 외부 사용자 검증인 POV-022는 이 ticket의 선행 조건이
-아닙니다.
+slice, supported-Unix production initialization smoke와 final validation이 완료되기 전에는
+ticket completion을 주장하지 않습니다. 외부 사용자 검증인 POV-022와 transferred
+POV-035~037은 이 ticket의 선행 조건이 아닙니다.
 
 ## Out Of Scope
 
@@ -50,6 +72,11 @@ completion을 주장하지 않습니다. 외부 사용자 검증인 POV-022는 �
 - remote Cloudflare session profile
 - shared workspace roles
 - domain record mutation
+- planned rotation·verify-only retire production operator
+- compromise·loss recovery와 production operator
+- installed-browser UI/evidence
+- exhaustive platform PTY, power-loss/filesystem durability와 same-UID malicious ABA 증명
+- native Windows auth maintenance/runtime enablement
 
 ## Acceptance Criteria
 
@@ -57,9 +84,11 @@ completion을 주장하지 않습니다. 외부 사용자 검증인 POV-022는 �
 - owner scope는 verified subject와 active session에서만 생성되며 body/URL owner ID로 바뀌지 않습니다.
 - refresh token은 사용마다 rotate되고 이전 token replay 시 결정된 session revoke policy가 적용됩니다.
 - logout, password change와 user disable 이후 관련 refresh credential을 사용할 수 없습니다.
-- access/refresh token이 URL, Web Storage, IndexedDB, log와 오류 응답에 나타나지 않습니다.
-- local browser에서 login, refresh와 logout flow를 synthetic account로 재현할 수 있습니다.
-- initialization/planned/retire/compromise/loss key transition의 모든 injected crash 뒤 listener가 mixed state에서 열리지 않고 허용된 resume/rollback으로 terminal state에 도달합니다.
+- access/refresh token이 redirect URL, server log와 오류 응답에 나타나지 않고 refresh
+  credential은 local profile의 HttpOnly cookie로만 발급됩니다.
+- initialization의 injected durability/commit uncertainty 뒤 listener가 mixed state에서 열리지 않고 허용된 resume/rollback으로 terminal state에 도달합니다.
+- unsupported 또는 incomplete planned/retire/compromise/loss state에서는 listener가 fail closed합니다.
+- 한 supported Unix 환경에서 production `auth init` exact success, terminal restore, listener-ready startup과 second-init no-replace를 재현할 수 있습니다.
 
 ## Verification
 
@@ -68,6 +97,7 @@ completion을 주장하지 않습니다. 외부 사용자 검증인 POV-022는 �
 - `AUTH-REV-02` SSE-close와 `AUTH-CACHE-01` SSE clause 및 `AUTH-SSE-01`은 POV-011, `AUTH-CACHE-01` upload clause와 `AUTH-UP-01`은 POV-015가 다시 검증합니다.
 - auth success, invalid signature/claim, expired token, replay와 revoke tests
 - owner spoofing negative test
+- supported-Unix production `auth init` success, terminal restore, listener-ready startup와 second-init no-replace smoke
 - actual repository format, check, test, build and `git diff --check`
 
 ## Implementation Evidence
@@ -523,12 +553,21 @@ completion을 주장하지 않습니다. 외부 사용자 검증인 POV-022는 �
   확인하는 protocol state이며 auth validity나 listener readiness가 아닙니다.
   Retire terminal `CleanActiveOnly`도 metadata가 제거된 뒤 active-only revision/KID/version/
   key/namespace만 확인하는 protocol state이며 auth validity나 listener readiness가 아닙니다.
-  Linux/macOS production PTY의 signal별 restore/retermination, exact success, output fault,
-  pgrp race와 contention snapshot evidence, compromise/loss transition command,
-  planned/retire production operator command, reference-device Argon2 benchmark,
-  preparation/source predicate 직후 same-UID ABA의 원자적 차단, 실제 process
-  crash/power-loss/filesystem durability 및 installed Chrome/Safari clauses는 아직 PASS가
-  아닙니다. 따라서 ticket completion이나 production activation은 주장하지 않습니다.
+  이 ticket의 narrowed completion boundary에서 아직 남은 것은 한 supported Unix 환경의
+  production `auth init` exact-success/listener-ready/second-init smoke와 final repository
+  validation입니다. Linux/macOS 전체 PTY matrix, output fault, pgrp race, contention snapshot,
+  reference-device Argon2, same-UID ABA와 실제 crash/power-loss/filesystem durability는
+  [POV-037](POV-037-auth-platform-and-durability-hardening.md), planned/retire operator는
+  [POV-035](POV-035-planned-key-rotation-and-retirement-operator.md), compromise/loss는
+  [POV-036](POV-036-auth-key-compromise-and-loss-recovery.md), installed-browser clauses는
+  [POV-010](POV-010-minimal-authenticated-local-text-chat.md)이 소유합니다.
+
+## Remaining Before Completion
+
+- 한 declared supported Unix 환경에서 production `auth init` exact success, terminal restore,
+  `AuthRuntime` listener-ready startup과 second initialization no-replace smoke를 기록합니다.
+- 최종 changed set에서 frontend/Rust repository validation과 `git diff --check`를 통과합니다.
+- ticket status, TODO와 WBS를 같은 evidence 기준으로 `Completed`로 전환합니다.
 
 ## Cross-platform Verification Baseline
 
@@ -550,5 +589,9 @@ auth schema를 계속 적용하지만 Unix auth maintenance capability를 compil
 - [POV-004](../deps/POV-004-core-data-identity-and-store-boundaries.md)
 - [POV-005](../deps/POV-005-authentication-and-session-security-decision.md)
 - [POV-034](../deps/POV-034-restore-windows-workspace-validation-baseline.md)
+- [POV-035](POV-035-planned-key-rotation-and-retirement-operator.md)
+- [POV-036](POV-036-auth-key-compromise-and-loss-recovery.md)
+- [POV-037](POV-037-auth-platform-and-durability-hardening.md)
+- [POV-010](POV-010-minimal-authenticated-local-text-chat.md)
 - [ADR-0004](../decisions/0004-local-authentication-and-session-security-contract.md)
 - [POV-022](POV-022-first-segment-and-voice-wedge-discovery-gate.md)

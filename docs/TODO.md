@@ -1,6 +1,6 @@
 # TODO
 
-Last updated: 2026-07-27
+Last updated: 2026-07-29
 
 Current phase: H6 follow-on direction accepted; H0 completed including Windows workspace validation baseline; H1 single-owner product delivery active; external POV-022 research deferred until the personal product is complete or explicitly reprioritized
 
@@ -19,9 +19,22 @@ Repository posture: public fresh-history baseline verified 2026-07-27; POV-031 c
 
 | Ticket | Type | Status | Outcome |
 | --- | --- | --- | --- |
-| [POV-007 Local login, refresh and session revoke](tickets/POV-007-local-login-refresh-and-session-revoke.md) | Delivery | In Progress — auth schema, typed no-commit/commit-uncertainty storage, credential primitive, canonical keyring와 pure initialization-transition metadata codec, owner-only instance/maintenance-lock/store-binding/detached-actor, read-only initialization reconciliation, sentinel/legacy pre-source recovery·rollback, exact source-CAS, active-key install, final lifecycle CAS와 deletion-only cleanup implemented; Windows validation restored by POV-034 and POV-031 completed | planned/retire/compromise/loss transition, production auth mutation/JWT/session repository, local HTTP와 runtime wiring을 fail-closed slice로 연결 |
+| [POV-007 Local login, refresh and session revoke](tickets/POV-007-local-login-refresh-and-session-revoke.md) | Delivery | In Progress — narrowed boundary의 auth schema, initialization, credential/JWT/session/revoke repository, fail-closed runtime·HTTP와 controlling-TTY `auth init` 구현 | supported-Unix production init smoke와 final repository validation로 local auth runtime delivery 종료 |
 | [POV-008 Idempotent conversation append and outbox](tickets/POV-008-idempotent-conversation-append-and-outbox.md) | Delivery | In Progress — persistence core implemented; activation gated by POV-007 | owner-scoped append, retry conflict, audit/outbox와 post-commit readback의 synthetic contract를 검증 |
 | [POV-009 Durable single-slot job queue](tickets/POV-009-durable-single-slot-job-queue.md) | Delivery | In Progress — durable persistence core implemented; runtime activation gated by POV-007/008/010/011/012 | outbox 기반 enqueue, fixed-normal FIFO, fenced single-slot lease, 보수적 recovery halt와 retry/cancellation/timing/event history를 보존 |
+
+## Auth Follow-ups — Not Initial H1 Gates
+
+| Ticket | Type | Status | Activation boundary |
+| --- | --- | --- | --- |
+| [POV-035 Planned key rotation and retirement operator](tickets/POV-035-planned-key-rotation-and-retirement-operator.md) | Delivery | Planned — maintenance core implemented, production operator absent | 장기 key maintenance와 release claim 전 |
+| [POV-036 Auth key compromise and loss recovery](tickets/POV-036-auth-key-compromise-and-loss-recovery.md) | Delivery | Planned — ADR contract accepted, persisted transition/operator 미구현 | compromise/loss recovery 지원 claim 전 |
+| [POV-037 Auth platform and durability hardening](tickets/POV-037-auth-platform-and-durability-hardening.md) | Hardening evidence | Planned — explicit evidence backlog | 해당 platform, reference-device performance 또는 durability claim 전 |
+
+브라우저 login/refresh/logout와 cookie/storage evidence는 별도 hardening ticket이 아니라
+[POV-010](tickets/POV-010-minimal-authenticated-local-text-chat.md)의 H1 product flow에서
+검증합니다. Native Windows auth maintenance/runtime은 현재 성공으로 주장하지 않으며,
+POV-010 dogfood platform 선택에서 별도 delivery 필요 여부를 결정합니다.
 
 ## Next
 
@@ -64,6 +77,7 @@ H3~H5 상세 delivery ticket은 [POV-021](tickets/POV-021-voice-round-trip-evide
 - [ ] 개인용 H1~H5 완성 또는 명시적 재우선순위 결정 뒤 POV-022 외부 사용자 검증 활성화
 - [x] POV-001에서 Rust toolchain, Node version, package manager를 실제 manifest와 함께 고정
 - [x] [ADR-0004](decisions/0004-local-authentication-and-session-security-contract.md)에서 authentication cryptography, key lifecycle과 refresh lifetime 결정
+- [ ] POV-010 activation 전에 H1 dogfood platform을 declared supported Unix/WSL 또는 native Windows 중 명시하고, native Windows를 선택하면 별도 auth delivery ticket 생성
 - [ ] POV-014에서 temporary Blob encryption, retention, quota와 irreversible purge contract 결정
 - [ ] model/runtime artifact pinning과 versioned quality gate 결정
 - [ ] backup, export, restore와 explicit purge policy 결정

@@ -19,11 +19,13 @@ POV-001의 offline shell에 login, owner-scoped conversation 선택, text submit
 ## Scope
 
 - local login and logout surface
+- same-origin refresh and expired-access recovery
 - conversation creation/selection and text composer
 - idempotent submit and durable receipt
 - stored user-event timeline and error state
 - keyboard accessibility and basic status semantics
 - no-external-asset offline flow
+- installed-browser cookie, URL, storage, cache와 redaction evidence
 
 ## Out Of Scope
 
@@ -41,6 +43,12 @@ POV-001의 offline shell에 login, owner-scoped conversation 선택, text submit
 - auth expiry, validation, conflict와 storage failure가 서로 구분된 안전한 상태로 보입니다.
 - 인터넷을 끊어도 shell, login과 stored text capture에 필요한 외부 asset 요청이 없습니다.
 - keyboard만으로 login, submit과 stored event 확인이 가능합니다.
+- access/refresh token이 URL, Web Storage, IndexedDB, browser-visible log와 error surface에
+  나타나지 않습니다.
+- refresh cookie는 exact local profile의 `Path=/api/auth`, `HttpOnly`,
+  `SameSite=Strict`와 cache-control contract를 유지하고 logout 뒤 clear됩니다.
+- evidence를 실행한 installed browser/version만 PASS로 기록하며 unavailable Chrome/Safari
+  조합을 검증된 것으로 확장하지 않습니다.
 
 ## Verification
 
@@ -48,6 +56,7 @@ POV-001의 offline shell에 login, owner-scoped conversation 선택, text submit
 - local same-origin capture smoke
 - duplicate submit, auth expiry and storage failure browser test
 - offline browser network inspection
+- installed-browser login/refresh/logout, cookie flags, URL/storage/cache inspection
 - actual repository validation commands and `git diff --check`
 
 ## Rollback
