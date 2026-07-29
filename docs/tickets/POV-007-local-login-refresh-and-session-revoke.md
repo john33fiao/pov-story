@@ -1,6 +1,6 @@
 # POV-007 Local Login, Refresh And Session Revoke
 
-Status: In Progress — narrowed local-auth runtime 구현 완료; supported-Unix production `auth init` smoke와 final repository validation 남음
+Status: Completed — 2026-07-29; supported-Unix production `auth init` smoke와 final repository validation 완료
 
 Type: Delivery
 
@@ -553,21 +553,43 @@ POV-035~037은 이 ticket의 선행 조건이 아닙니다.
   확인하는 protocol state이며 auth validity나 listener readiness가 아닙니다.
   Retire terminal `CleanActiveOnly`도 metadata가 제거된 뒤 active-only revision/KID/version/
   key/namespace만 확인하는 protocol state이며 auth validity나 listener readiness가 아닙니다.
-  이 ticket의 narrowed completion boundary에서 아직 남은 것은 한 supported Unix 환경의
-  production `auth init` exact-success/listener-ready/second-init smoke와 final repository
-  validation입니다. Linux/macOS 전체 PTY matrix, output fault, pgrp race, contention snapshot,
+- 2026-07-29 Ubuntu WSL2 Linux 6.6.87.2 x86_64, UID 1000의 WSL-native `0700`
+  임시 경로에서 baseline `2c6fa27`의 exact Git tree
+  `dcbcbb6863406a8e231f32eb04f73c503cfaa01d`를 검증했습니다. `/mnt/c` checkout은
+  `RootWritableByOthers` 때문에 Unix 성공 근거로 사용하지 않았습니다.
+- Production binary PTY smoke는 synthetic password만 입력하고 password echo suppression,
+  recovery marker exact 1회, exact `SAVED`, success exit와 original termios 복원을 확인했습니다.
+  같은 synthetic instance에서 production serve가 `AuthRuntime`을 열고
+  `GET /api/health` listener readiness를 반환했으며, second initialization은 실패하고
+  모든 `auth_*` table의 semantic digest와 secret artifact content/mode digest가 전후
+  동일했습니다. Harness는 transcript와 password, recovery code, KID, token 또는 temporary
+  credential을 출력하지 않습니다.
+- `scripts/test_operator_pty.py`, `scripts/test_production_auth_smoke.py`, production
+  subprocess parser/dispatch tests, KDF-serialized confirmed initialization tests와
+  `POV_INSTANCE_ROOT`를 명시한 POSIX `scripts/smoke.sh`가 통과했습니다. Windows exact
+  `cargo check/test --locked --workspace --all-targets`와 WSL-native Unix
+  `cargo check --locked --workspace --all-targets`,
+  `KDF_TEST_SERIAL=1 cargo test --locked --workspace --all-targets -- --test-threads=1`도
+  통과했습니다.
+- WSL-native 기본 병렬 workspace test는 auth suite `306 passed, 1 ignored` 뒤 global
+  single process slot을 공유하는 unrelated process-supervisor test 4건의 2-second readiness
+  window가 서로 간섭해 실패했습니다. 해당 binary는 `--test-threads=1`에서
+  `22 passed, 15 ignored`이며 전체 직렬 workspace suite도 통과했습니다. 실패한 기본 병렬
+  실행은 PASS로 기록하지 않습니다.
+- Linux/macOS 전체 PTY matrix, output fault, pgrp race, contention snapshot,
   reference-device Argon2, same-UID ABA와 실제 crash/power-loss/filesystem durability는
   [POV-037](POV-037-auth-platform-and-durability-hardening.md), planned/retire operator는
   [POV-035](POV-035-planned-key-rotation-and-retirement-operator.md), compromise/loss는
   [POV-036](POV-036-auth-key-compromise-and-loss-recovery.md), installed-browser clauses는
   [POV-010](POV-010-minimal-authenticated-local-text-chat.md)이 소유합니다.
 
-## Remaining Before Completion
+## Completion Evidence
 
-- 한 declared supported Unix 환경에서 production `auth init` exact success, terminal restore,
-  `AuthRuntime` listener-ready startup과 second initialization no-replace smoke를 기록합니다.
-- 최종 changed set에서 frontend/Rust repository validation과 `git diff --check`를 통과합니다.
-- ticket status, TODO와 WBS를 같은 evidence 기준으로 `Completed`로 전환합니다.
+- [x] Declared supported Unix 환경에서 production `auth init` exact success, terminal restore,
+  `AuthRuntime` listener-ready startup과 second initialization no-replace smoke 기록
+- [x] 최종 changed set의 frontend/Rust repository validation, POSIX smoke와
+  `git diff --check` 통과
+- [x] ticket status, TODO와 WBS를 같은 evidence 기준으로 `Completed` 전환
 
 ## Cross-platform Verification Baseline
 

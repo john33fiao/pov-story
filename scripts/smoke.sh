@@ -6,6 +6,12 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repository_root=$(dirname "$script_dir")
 base_url="http://127.0.0.1:8080"
 cargo_command=${CARGO:-cargo}
+instance_root=${POV_INSTANCE_ROOT:-}
+
+if [ -z "$instance_root" ]; then
+  echo "POV_INSTANCE_ROOT must name an instance completed by production auth init." >&2
+  exit 1
+fi
 
 cd "$repository_root"
 
@@ -16,7 +22,7 @@ if curl --connect-timeout 2 --max-time 5 --fail --silent --show-error \
 fi
 
 "$cargo_command" build --locked --release -p pov-api
-./target/release/pov-api &
+./target/release/pov-api --instance-root "$instance_root" &
 server_pid=$!
 
 cleanup() {

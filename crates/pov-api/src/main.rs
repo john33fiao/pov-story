@@ -1,4 +1,7 @@
-use std::{error::Error, io, path::PathBuf, sync::Arc, time::SystemTime};
+use std::{error::Error, io, path::PathBuf};
+
+#[cfg(unix)]
+use std::{sync::Arc, time::SystemTime};
 
 #[cfg(unix)]
 use pov_api::{DEFAULT_BIND_ADDRESS, app_with_auth};
@@ -49,7 +52,6 @@ async fn serve(instance_root: PathBuf) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[cfg(unix)]
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
     Serve {
@@ -111,7 +113,7 @@ fn current_time_micros() -> Result<u64, io::Error> {
     u64::try_from(micros).map_err(|_| io::Error::other("system clock is out of range"))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::{Command, parse_command};
 

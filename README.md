@@ -10,7 +10,7 @@ POV Story는 메모, 음성, 일정, 할 일, 작업일지와 장기 기억을 �
 - Windows Rust workspace check/test baseline은 [POV-034](docs/deps/POV-034-restore-windows-workspace-validation-baseline.md)에서 복구됐고 Unix auth maintenance capability는 Windows에서 계속 비활성입니다.
 - 실제 lifelog 접수, background dispatcher, provider/model 실행은 활성화되지 않았습니다.
 
-현재 근접 작업은 [POV-007 auth delivery](docs/tickets/POV-007-local-login-refresh-and-session-revoke.md)부터 H1 single-owner 제품 흐름을 완성하는 것입니다. [POV-022 외부 사용자 discovery](docs/tickets/POV-022-first-segment-and-voice-wedge-discovery-gate.md)는 개인용 H1~H5 완성 뒤의 후순위 제품 검증 backlog이며 현재 delivery를 막지 않습니다.
+현재 근접 작업은 완료된 [POV-007 auth delivery](docs/tickets/POV-007-local-login-refresh-and-session-revoke.md)에 이어 [POV-008](docs/tickets/POV-008-idempotent-conversation-append-and-outbox.md)부터 H1 single-owner 제품 흐름을 완성하는 것입니다. [POV-022 외부 사용자 discovery](docs/tickets/POV-022-first-segment-and-voice-wedge-discovery-gate.md)는 개인용 H1~H5 완성 뒤의 후순위 제품 검증 backlog이며 현재 delivery를 막지 않습니다.
 
 ## 빠른 실행
 
@@ -21,13 +21,19 @@ nvm install
 nvm use
 npm --prefix web ci
 npm --prefix web run build
-cargo run --locked --release -p pov-api
+cargo build --locked --release -p pov-api
 ```
 
 최초 owner 인증은 redirect할 수 없는 controlling TTY에서 별도로 초기화합니다. password나 recovery code를 인자나 환경 변수로 전달하는 형식은 제공하지 않습니다.
 
 ```bash
 cargo run --locked --release -p pov-api -- auth init --instance-root /absolute/private/path --login-id owner_01
+```
+
+초기화한 같은 instance를 explicit root로 열어 server를 실행합니다.
+
+```bash
+cargo run --locked --release -p pov-api -- --instance-root /absolute/private/path
 ```
 
 다른 terminal에서 health endpoint를 확인합니다.
@@ -46,13 +52,15 @@ npm --prefix web run build
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo test --locked --workspace --all-targets
-sh scripts/smoke.sh
+POV_INSTANCE_ROOT=/absolute/private/path sh scripts/smoke.sh
 git diff --check
 ```
 
 변경 영역별 전체 fast/conditional 검증은 해당 ticket과 project workflow를 따릅니다.
 [POV-034](docs/deps/POV-034-restore-windows-workspace-validation-baseline.md)는 Windows와 Unix의 platform-gated auth/storage 검증 증거를 함께 보존합니다.
-Windows에서 `scripts/smoke.sh`를 실행하려면 Git Bash 또는 WSL처럼 POSIX shell을 제공하는 환경이 필요합니다.
+`POV_INSTANCE_ROOT`는 production `auth init`을 완료한 instance여야 합니다. Windows에서
+`scripts/smoke.sh`를 실행하려면 Git Bash 또는 WSL처럼 POSIX shell을 제공하는 환경이
+필요합니다.
 
 ## 문서
 

@@ -51,9 +51,9 @@ history rewrite나 visibility review가 pending 상태로 남아 있지 않습�
 | S3 | Project license review | Completed — MIT | POV-031 current-tree third-party inventory completed | project-owned code는 MIT, dependency license는 dependency-owned 범위로 분리; contribution policy만 미결 |
 | S4 | Public repository posture | Confirmed — 2026-07-27 | fresh repository baseline | 새 저장소가 public이며 sanitized current tree만 반입된 상태를 정본으로 채택 |
 
-이 track은 H1 activation을 더 이상 막지 않습니다. POV-007의 남은 수용 기준은 active
-ticket을 따르며, 향후 visibility나 repository-security 정책을 바꾸면 새 decision
-record로 관리합니다.
+이 track은 H1 activation을 더 이상 막지 않으며 POV-007도 narrowed completion boundary를
+완료했습니다. 향후 visibility나 repository-security 정책을 바꾸면 새 decision record로
+관리합니다.
 
 ## H6 Follow-on Backlog
 
@@ -132,7 +132,7 @@ flowchart LR
 | 2 | [POV-004 Core data identity and store boundary contracts](deps/POV-004-core-data-identity-and-store-boundaries.md) | Completed delivery | POV-001 | owner/source/revision/correlation과 store lifecycle을 executable contract로 고정 |
 | 3 | [POV-005 Authentication and session security decision](deps/POV-005-authentication-and-session-security-decision.md) | Completed decision | POV-001 | ADR-0004가 구현 전 인증·token·cookie·revoke 경계와 executable test matrix를 확정 |
 | 4 | [POV-006 Provider ports and safe process supervisor](deps/POV-006-provider-ports-and-safe-process-supervisor.md) | Completed delivery | POV-001, POV-004 | model/media runtime을 replaceable port와 shell-free supervisor 뒤에 격리 |
-| 5 | [POV-007 Local login, refresh and session revoke](tickets/POV-007-local-login-refresh-and-session-revoke.md) | In-progress delivery; narrowed boundary의 initialization, credential/JWT/session/revoke repository, fail-closed runtime·HTTP와 controlling-TTY `auth init` 구현; supported-Unix production smoke와 final validation 남음 | POV-004, POV-005 | 검증된 auth context가 owner scope를 강제하고 login/refresh/logout/revoke local runtime을 제공 |
+| 5 | [POV-007 Local login, refresh and session revoke](tickets/POV-007-local-login-refresh-and-session-revoke.md) | Completed delivery — 2026-07-29; supported-Unix production init/listener-ready/second-init no-replace smoke와 final validation 완료 | POV-004, POV-005 | 검증된 auth context가 owner scope를 강제하고 login/refresh/logout/revoke local runtime을 제공 |
 | 6 | [POV-008 Idempotent conversation append and outbox](tickets/POV-008-idempotent-conversation-append-and-outbox.md) | In-progress delivery; persistence core implemented | POV-004, POV-007 | 입력이 retry와 embedding failure에도 하나의 durable source event로 남음 |
 | 7 | [POV-009 Durable single-slot job queue](tickets/POV-009-durable-single-slot-job-queue.md) | In-progress delivery; persistence core implemented | POV-008 | outbox 기반 fixed-normal FIFO, fenced single-slot lease, 보수적 recovery halt와 retry/latency history를 복구; runtime activation은 POV-007/008/010~012에 gated |
 | 8 | [POV-010 Minimal authenticated local text chat](tickets/POV-010-minimal-authenticated-local-text-chat.md) | Delivery | POV-007, POV-008 | 사용자가 offline Web Chat에서 text를 저장하고 durable receipt를 확인 |
@@ -170,7 +170,7 @@ claim 전에 각각 완료합니다. Installed-browser auth evidence는 POV-010�
 
 - POV-031 구현 선행 조건: [POV-034](deps/POV-034-restore-windows-workspace-validation-baseline.md) Windows baseline과 [ADR-0005](decisions/0005-password-blocklist-removal-and-legacy-auth-compatibility.md) Accepted 충족; [POV-031](deps/POV-031-remove-password-blocklist-feature.md) 완료
 - repository safety baseline: 새 public history 검증, MIT 적용과 [POV-032](deps/POV-032-purge-password-blocklist-history-and-caches.md) superseded archive 완료
-- H1 delivery와 POV-007 local auth runtime: ADR-0005/POV-031 gate 완료; narrowed POV-007의 supported-Unix production init smoke와 final validation
+- H1 delivery와 POV-007 local auth runtime: ADR-0005/POV-031 gate 및 narrowed POV-007의 supported-Unix production init smoke와 final validation 완료
 - POV-010 activation 전 dogfood platform: declared supported Unix/WSL 또는 native Windows를 명시하고, native Windows를 선택하면 성공 stub 없이 별도 auth delivery ticket 생성
 - POV-022 외부 사용자 검증: 개인용 H1~H5 완성 뒤 또는 명시적 재우선순위 결정 뒤 활성화하며 현재 delivery dependency로 사용하지 않음
 - 외부 contribution 허용 전: 제출·검토·라이선스 동의 정책 확정
