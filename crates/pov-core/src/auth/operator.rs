@@ -40,11 +40,53 @@ pub async fn run_operator_init(
     login_id: &str,
     now_micros: u64,
 ) -> Result<(), OperatorInitError> {
+    let confirmed = prepare_operator_init(instance_root, login_id, now_micros)?;
+    complete_operator_init(confirmed).await
+}
+
+/// Secret-bearing, non-debuggable handoff created only after the terminal and
+/// signal lifecycle has been explicitly restored.
+pub struct ConfirmedOperatorInit {
+    instance_root: std::path::PathBuf,
+    login_id: String,
+    password: NormalizedPassword,
+    recovery: RecoveryCode,
+    now_micros: u64,
+}
+
+pub fn prepare_operator_init(
+    instance_root: impl AsRef<Path>,
+    login_id: &str,
+    now_micros: u64,
+) -> Result<ConfirmedOperatorInit, OperatorInitError> {
     let instance_root = instance_root.as_ref();
     preflight_instance_root(instance_root)?;
     let mut terminal = ControllingTerminal::open()?;
-    let (password, recovery) = collect_confirmation(&mut terminal)?;
-    terminal.ensure_foreground()?;
+    let collected = collect_confirmation(&mut terminal);
+    // This is the normal/error lifecycle, not Drop: restore the original
+    // terminal, stop/join coordination, and restore the creating thread's mask.
+    terminal.finish()?;
+    let (password, recovery) = collected?;
+    preflight_instance_root(instance_root)?;
+    Ok(ConfirmedOperatorInit {
+        instance_root: instance_root.to_path_buf(),
+        login_id: login_id.to_owned(),
+        password,
+        recovery,
+        now_micros,
+    })
+}
+
+pub async fn complete_operator_init(
+    confirmed: ConfirmedOperatorInit,
+) -> Result<(), OperatorInitError> {
+    let ConfirmedOperatorInit {
+        instance_root,
+        login_id,
+        password,
+        recovery,
+        now_micros,
+    } = confirmed;
     // Opening StoreSet bootstraps the instance's store directory and SQLite files.
     // Keep that filesystem mutation strictly after the operator confirmation.
     let stores = StoreSet::open(instance_root.join("stores"))
@@ -53,7 +95,7 @@ pub async fn run_operator_init(
     let result = initialize_confirmed(
         instance_root,
         &stores,
-        login_id,
+        &login_id,
         &password,
         &recovery,
         now_micros,
@@ -88,6 +130,7 @@ fn collect_confirmation(
 struct ControllingTerminal {
     file: File,
     signals: signal_coordination::SignalCoordinator,
+    original: Termios,
 }
 
 impl ControllingTerminal {
@@ -110,7 +153,11 @@ impl ControllingTerminal {
         // Coordination is established before echo can be disabled. It uses
         // sigwait on a helper thread; no process-wide signal handler is installed.
         let signals = signal_coordination::SignalCoordinator::start()?;
-        Ok(Self { file, signals })
+        Ok(Self {
+            file,
+            signals,
+            original,
+        })
     }
 
     fn ensure_foreground(&self) -> Result<(), OperatorInitError> {
@@ -125,6 +172,19 @@ impl ControllingTerminal {
         self.ensure_foreground()?;
         self.file.write_all(bytes).map_err(|_| OperatorInitError)?;
         self.file.flush().map_err(|_| OperatorInitError)
+    }
+
+    fn finish(mut self) -> Result<(), OperatorInitError> {
+        self.ensure_foreground()?;
+        tcsetattr(&self.file, OptionalActions::Now, &self.original)
+            .map_err(|_| OperatorInitError)?;
+        if !termios_matches(
+            &tcgetattr(&self.file).map_err(|_| OperatorInitError)?,
+            &self.original,
+        ) {
+            return Err(OperatorInitError);
+        }
+        self.signals.finish()
     }
 
     fn read_line(&mut self, maximum: usize) -> Result<Vec<u8>, OperatorInitError> {
@@ -143,6 +203,19 @@ impl ControllingTerminal {
         }
         Ok(line)
     }
+}
+
+fn termios_matches(left: &Termios, right: &Termios) -> bool {
+    left.input_modes == right.input_modes
+        && left.output_modes == right.output_modes
+        && left.control_modes == right.control_modes
+        && left.local_modes == right.local_modes
+        // rustix intentionally keeps the SpecialCodes array opaque; its Debug
+        // representation covers every element and is stable within this build.
+        && format!("{:?}", left.special_codes) == format!("{:?}", right.special_codes)
+        && left.input_speed() == right.input_speed()
+        && left.output_speed() == right.output_speed()
+        && left.line_discipline == right.line_discipline
 }
 
 struct EchoGuard<'a> {
@@ -248,6 +321,7 @@ mod signal_coordination {
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicI32, Ordering},
+            mpsc,
         },
         thread,
     };
@@ -255,7 +329,10 @@ mod signal_coordination {
     use super::OperatorInitError;
     use nix::{
         poll::{PollFd, PollFlags, PollTimeout, poll},
-        sys::signal::{SigSet, SigmaskHow, Signal, kill, pthread_sigmask},
+        sys::{
+            pthread::{Pthread, pthread_kill, pthread_self},
+            signal::{SigSet, SigmaskHow, Signal, kill, pthread_sigmask},
+        },
         unistd::getpid,
     };
 
@@ -271,6 +348,7 @@ mod signal_coordination {
         stopped: Arc<AtomicBool>,
         caught: Arc<AtomicI32>,
         worker: Option<thread::JoinHandle<()>>,
+        worker_pthread: Pthread,
     }
 
     impl SignalCoordinator {
@@ -288,9 +366,11 @@ mod signal_coordination {
             let caught = Arc::new(AtomicI32::new(0));
             let worker_stopped = Arc::clone(&stopped);
             let worker_caught = Arc::clone(&caught);
+            let (pthread_sender, pthread_receiver) = mpsc::sync_channel(1);
             let worker = thread::Builder::new()
                 .name("pov-auth-sigwait".into())
                 .spawn(move || {
+                    let _ = pthread_sender.send(pthread_self());
                     if let Ok(signal) = mask.wait()
                         && !worker_stopped.load(Ordering::Acquire)
                         && SIGNALS.contains(&signal)
@@ -302,11 +382,13 @@ mod signal_coordination {
                     let _ = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&previous), None);
                     OperatorInitError
                 })?;
+            let worker_pthread = pthread_receiver.recv().map_err(|_| OperatorInitError)?;
             Ok(Self {
                 previous,
                 stopped,
                 caught,
                 worker: Some(worker),
+                worker_pthread,
             })
         }
 
@@ -337,26 +419,42 @@ mod signal_coordination {
                 }
             }
         }
+
+        pub(super) fn finish(&mut self) -> Result<(), OperatorInitError> {
+            self.cleanup(true)
+        }
+
+        fn cleanup(&mut self, strict: bool) -> Result<(), OperatorInitError> {
+            self.stopped.store(true, Ordering::Release);
+            if self.caught.load(Ordering::Acquire) == 0 {
+                // Thread-directed and synchronously consumed by sigwait: the
+                // private wakeup never becomes a process-pending application signal.
+                pthread_kill(self.worker_pthread, Signal::SIGUSR1)
+                    .map_err(|_| OperatorInitError)?;
+            }
+            if let Some(worker) = self.worker.take() {
+                worker.join().map_err(|_| OperatorInitError)?;
+            }
+            let signal = self.caught.load(Ordering::Acquire);
+            if signal != 0 {
+                let signal = Signal::try_from(signal).map_err(|_| OperatorInitError)?;
+                kill(getpid(), signal).map_err(|_| OperatorInitError)?;
+            }
+            pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&self.previous), None)
+                .map_err(|_| OperatorInitError)?;
+            if signal != 0 && strict {
+                // A default/custom disposition normally does not return. An
+                // ignored inherited disposition remains preserved and becomes
+                // an operator failure rather than permitting mutation.
+                return Err(OperatorInitError);
+            }
+            Ok(())
+        }
     }
 
     impl Drop for SignalCoordinator {
         fn drop(&mut self) {
-            self.stopped.store(true, Ordering::Release);
-            if self.caught.load(Ordering::Acquire) == 0 {
-                let _ = kill(getpid(), Signal::SIGUSR1);
-            }
-            if let Some(worker) = self.worker.take() {
-                let _ = worker.join();
-            }
-            let signal = self.caught.load(Ordering::Acquire);
-            // Re-queue the accepted signal while blocked, then restore the exact
-            // prior mask so ordinary subprocess termination semantics apply.
-            if signal != 0 {
-                if let Ok(signal) = Signal::try_from(signal) {
-                    let _ = kill(getpid(), signal);
-                }
-            }
-            let _ = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&self.previous), None);
+            let _ = self.cleanup(false);
         }
     }
 }

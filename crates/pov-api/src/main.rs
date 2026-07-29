@@ -4,31 +4,42 @@ use std::{error::Error, io, path::PathBuf, sync::Arc, time::SystemTime};
 use pov_api::{DEFAULT_BIND_ADDRESS, app_with_auth};
 #[cfg(unix)]
 use pov_core::{
-    auth::{AuthRuntime, run_operator_init},
+    auth::{AuthRuntime, complete_operator_init, prepare_operator_init},
     storage::StoreSet,
 };
 #[cfg(unix)]
 use tokio::net::TcpListener;
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn Error>> {
-    run().await
-}
-
-#[cfg(unix)]
-async fn run() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     let command = parse_command(std::env::args_os().skip(1))?;
-    let instance_root = match command {
-        Command::Serve { instance_root } => instance_root,
+    match command {
+        #[cfg(unix)]
+        Command::Serve { instance_root } => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(serve(instance_root)),
+        #[cfg(unix)]
         Command::AuthInit {
             instance_root,
             login_id,
         } => {
-            return run_operator_init(&instance_root, &login_id, current_time_micros()?)
-                .await
-                .map_err(Into::into);
+            // Prompting and signal-mask coordination must finish on this original
+            // single thread before Tokio is allowed to create worker threads.
+            let confirmed =
+                prepare_operator_init(&instance_root, &login_id, current_time_micros()?)?;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(complete_operator_init(confirmed))
+                .map_err(Into::into)
         }
-    };
+        #[cfg(not(unix))]
+        _ => Err(io::Error::other("production authentication requires Unix").into()),
+    }
+}
+
+#[cfg(unix)]
+async fn serve(instance_root: PathBuf) -> Result<(), Box<dyn Error>> {
     let stores = StoreSet::open(instance_root.join("stores")).await?;
     let now_micros = current_time_micros()?;
     let runtime = Arc::new(AuthRuntime::open(&instance_root, &stores, now_micros).await?);
@@ -36,11 +47,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
     axum::serve(listener, app_with_auth(runtime)).await?;
     stores.close().await?;
     Ok(())
-}
-
-#[cfg(not(unix))]
-async fn run() -> Result<(), Box<dyn Error>> {
-    Err(io::Error::other("production authentication requires Unix").into())
 }
 
 #[cfg(unix)]
