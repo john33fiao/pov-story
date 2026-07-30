@@ -59,5 +59,5 @@ generation capability를 비활성화해도 login, text capture, timeline과 dur
 - [Architecture](../ARCHITECTURE.md)
 - [Roadmap](../WBS.md)
 - [POV-006](../deps/POV-006-provider-ports-and-safe-process-supervisor.md)
-- [POV-009](POV-009-durable-single-slot-job-queue.md)
+- [POV-009](../deps/POV-009-durable-single-slot-job-queue.md)
 - [POV-010](POV-010-minimal-authenticated-local-text-chat.md)

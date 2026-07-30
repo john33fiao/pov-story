@@ -1,6 +1,6 @@
 # TODO
 
-Last updated: 2026-07-29
+Last updated: 2026-07-30
 
 Current phase: H6 follow-on direction accepted; H0 completed including Windows workspace validation baseline; H1 single-owner product delivery active; external POV-022 research deferred until the personal product is complete or explicitly reprioritized
 
@@ -17,11 +17,12 @@ Repository posture: public fresh-history baseline verified 2026-07-27; POV-031 c
 
 ## Now
 
-| Ticket | Type | Status | Outcome |
+POV-010을 시작하기 전에 H1 dogfood platform을 declared supported Unix/WSL 또는 native Windows 중 하나로 명시합니다. Native Windows를 선택하면 성공 stub 없이 별도 auth delivery ticket을 먼저 만듭니다. 이번 repository initialization은 platform을 선택하지 않습니다.
+
+| Item | Type | Status | Outcome |
 | --- | --- | --- | --- |
-| [POV-007 Local login, refresh and session revoke](tickets/POV-007-local-login-refresh-and-session-revoke.md) | Delivery | Completed — 2026-07-29; supported-Unix production init smoke와 final repository validation 완료 | narrowed local auth runtime delivery 종료; installed-browser·장기 key 운영·recovery·platform/durability claim은 transferred ticket에 유지 |
-| [POV-008 Idempotent conversation append and outbox](tickets/POV-008-idempotent-conversation-append-and-outbox.md) | Delivery | Completed — 2026-07-29; persistence acceptance, production auth dependency와 final RTD/repository validation 완료 | owner-scoped append, retry conflict, audit/outbox와 post-commit readback contract 종료 |
-| [POV-009 Durable single-slot job queue](tickets/POV-009-durable-single-slot-job-queue.md) | Delivery | Completed — 2026-07-29; persistence acceptance, production auth dependency와 final RTD/repository validation 완료 | durable queue persistence delivery 종료; API·browser·provider runtime activation은 POV-010/011/012에 유지 |
+| H1 dogfood platform declaration | Decision gate | Open — required before POV-010 activation | declared supported Unix/WSL 또는 native Windows를 명시하고, native Windows 선택 시 별도 auth delivery ticket 생성 |
+| [POV-010 Minimal authenticated local text chat](tickets/POV-010-minimal-authenticated-local-text-chat.md) | Delivery | Planned — awaiting dogfood platform declaration | installed-browser login/refresh/logout과 owner-scoped text capture, durable receipt, stored timeline 검증 |
 
 ## Auth Follow-ups — Not Initial H1 Gates
 
@@ -41,7 +42,7 @@ POV-010 dogfood platform 선택에서 별도 delivery 필요 여부를 결정합
 | Horizon | Status | Outcome | Tickets |
 | --- | --- | --- | --- |
 | H0 — Reproducible local boundary | Completed including Windows validation repair | same-origin shell, source/store/auth와 process safety contract를 executable evidence로 재현 | [POV-001](deps/POV-001-local-offline-walking-skeleton.md), [POV-004](deps/POV-004-core-data-identity-and-store-boundaries.md), [POV-005](deps/POV-005-authentication-and-session-security-decision.md), [POV-006](deps/POV-006-provider-ports-and-safe-process-supervisor.md), [POV-034](deps/POV-034-restore-windows-workspace-validation-baseline.md) |
-| H1 — Trustworthy text capture | In Progress — POV-007/008/009 completed; continues with POV-010 | 한 owner가 offline에서 text를 durable하게 남기고 retry·status·local inference failure를 신뢰 | [POV-007](tickets/POV-007-local-login-refresh-and-session-revoke.md), [POV-008](tickets/POV-008-idempotent-conversation-append-and-outbox.md), [POV-009](tickets/POV-009-durable-single-slot-job-queue.md), [POV-010](tickets/POV-010-minimal-authenticated-local-text-chat.md), [POV-011](tickets/POV-011-authenticated-replayable-job-status-stream.md), [POV-012](tickets/POV-012-loopback-llm-text-round-trip.md), [POV-013](tickets/POV-013-conversation-core-offline-evidence-gate.md) |
+| H1 — Trustworthy text capture | In Progress — POV-007/008/009 completed; continues with POV-010 | 한 owner가 offline에서 text를 durable하게 남기고 retry·status·local inference failure를 신뢰 | [POV-007](deps/POV-007-local-login-refresh-and-session-revoke.md), [POV-008](deps/POV-008-idempotent-conversation-append-and-outbox.md), [POV-009](deps/POV-009-durable-single-slot-job-queue.md), [POV-010](tickets/POV-010-minimal-authenticated-local-text-chat.md), [POV-011](tickets/POV-011-authenticated-replayable-job-status-stream.md), [POV-012](tickets/POV-012-loopback-llm-text-round-trip.md), [POV-013](tickets/POV-013-conversation-core-offline-evidence-gate.md) |
 | H2 — Correctable voice recall | Gated by POV-013 | 음성을 교정 가능한 current revision으로 만들고 근거와 함께 recall하며 raw audio를 policy대로 purge | [POV-002 epic](tickets/POV-002-voice-lifelog-round-trip.md), [POV-014](tickets/POV-014-temporary-blob-lifecycle-and-privacy-contract.md), [POV-015](tickets/POV-015-authenticated-idempotent-voice-intake.md), [POV-033](tickets/POV-033-windows-python-whisper-turbo-provider.md), [POV-016](tickets/POV-016-supervised-audio-normalization-and-transcription.md), [POV-017](tickets/POV-017-immutable-transcript-correction-revisions.md), [POV-018](tickets/POV-018-current-revision-hybrid-transcript-retrieval.md), [POV-019](tickets/POV-019-retry-safe-audio-purge.md), [POV-020](tickets/POV-020-evidence-grounded-next-day-recall.md), [POV-023](tickets/POV-023-source-derivative-reconciliation.md), [POV-021](tickets/POV-021-voice-round-trip-evidence-gate.md) |
 
 실행 순서, dependency와 horizon exit evidence는 [Outcome Roadmap And WBS](WBS.md)를 따릅니다.
@@ -100,9 +101,9 @@ H3~H5 상세 delivery ticket은 [POV-021](tickets/POV-021-voice-round-trip-evide
 
 ## Recently Completed
 
-- 2026-07-29: [POV-009](tickets/POV-009-durable-single-slot-job-queue.md) outbox-backed enqueue, fixed-normal FIFO, fenced single-slot lease, conservative recovery halt와 durable retry/cancellation/timing/event persistence delivery 완료.
-- 2026-07-29: [POV-008](tickets/POV-008-idempotent-conversation-append-and-outbox.md) owner-scoped idempotent append, transactional outbox/audit, post-commit readback와 cross-owner fail-closed persistence delivery 완료.
-- 2026-07-29: [POV-007](tickets/POV-007-local-login-refresh-and-session-revoke.md) narrowed local auth runtime의 supported-Unix production `auth init`, listener-ready/second-init no-replace smoke와 final repository validation 완료.
+- 2026-07-29: [POV-009](deps/POV-009-durable-single-slot-job-queue.md) outbox-backed enqueue, fixed-normal FIFO, fenced single-slot lease, conservative recovery halt와 durable retry/cancellation/timing/event persistence delivery 완료.
+- 2026-07-29: [POV-008](deps/POV-008-idempotent-conversation-append-and-outbox.md) owner-scoped idempotent append, transactional outbox/audit, post-commit readback와 cross-owner fail-closed persistence delivery 완료.
+- 2026-07-29: [POV-007](deps/POV-007-local-login-refresh-and-session-revoke.md) narrowed local auth runtime의 supported-Unix production `auth init`, listener-ready/second-init no-replace smoke와 final repository validation 완료.
 - 2026-07-27: 새 public repository의 fresh reachable history와 tracked-content hygiene를 확인하고 [POV-032](deps/POV-032-purge-password-blocklist-history-and-caches.md)를 repository restart로 superseded 처리.
 - 2026-07-27: [POV-031](deps/POV-031-remove-password-blocklist-feature.md) ADR-0005 Accepted, current-tree corpus/updater/enforcement 제거와 sentinel/legacy persisted compatibility 검증 완료.
 - 2026-07-27: [POV-034](deps/POV-034-restore-windows-workspace-validation-baseline.md) Unix-only auth record module/import/type gate alignment, Windows workspace check/test and Unix auth maintenance regression evidence completed.

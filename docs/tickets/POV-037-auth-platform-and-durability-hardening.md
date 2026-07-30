@@ -69,7 +69,7 @@ regression suite는 유지합니다. 측정 결과는 삭제하지 않고 platfo
 
 ## Links
 
-- [POV-007](POV-007-local-login-refresh-and-session-revoke.md)
+- [POV-007](../deps/POV-007-local-login-refresh-and-session-revoke.md)
 - [POV-035](POV-035-planned-key-rotation-and-retirement-operator.md)
 - [POV-036](POV-036-auth-key-compromise-and-loss-recovery.md)
 - [POV-034](../deps/POV-034-restore-windows-workspace-validation-baseline.md)

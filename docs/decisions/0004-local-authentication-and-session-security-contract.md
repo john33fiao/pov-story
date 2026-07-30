@@ -280,7 +280,7 @@ ADR이 필요합니다.
 
 - [Architecture](../ARCHITECTURE.md)
 - [POV-005 completion record](../deps/POV-005-authentication-and-session-security-decision.md)
-- [POV-007 implementation ticket](../tickets/POV-007-local-login-refresh-and-session-revoke.md)
+- [POV-007 implementation ticket](../deps/POV-007-local-login-refresh-and-session-revoke.md)
 - [RFC 8725 — JSON Web Token Best Current Practices](https://www.rfc-editor.org/rfc/rfc8725.html)
 - [RFC 9700 — OAuth 2.0 Security Best Current Practice](https://www.rfc-editor.org/rfc/rfc9700.html)
 - [RFC 9106 — Argon2 Memory-Hard Function](https://www.rfc-editor.org/rfc/rfc9106.html)

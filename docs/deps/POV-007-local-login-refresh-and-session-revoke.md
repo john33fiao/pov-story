@@ -29,10 +29,10 @@ logout-all과 session revoke를 fail closed로 사용할 수 있는 runtime**까
 
 | Transferred outcome | Owner | POV-007/H1 gate |
 | --- | --- | --- |
-| planned rotation·verify-only retire production operator | [POV-035](POV-035-planned-key-rotation-and-retirement-operator.md) | 초기 H1 text capture gate 아님; 장기 key maintenance/release claim 전 필요 |
-| compromise·loss recovery와 production operator | [POV-036](POV-036-auth-key-compromise-and-loss-recovery.md) | 초기 H1 text capture gate 아님; 해당 recovery 지원 claim 전 필요 |
-| installed-browser login/refresh/logout, cookie·storage evidence | [POV-010](POV-010-minimal-authenticated-local-text-chat.md) | H1 product/browser evidence에서 검증 |
-| platform PTY matrix, reference-device Argon2, abrupt crash/power-loss, same-UID ABA residual | [POV-037](POV-037-auth-platform-and-durability-hardening.md) | 초기 H1 text capture gate 아님; 해당 platform/durability claim 전 필요 |
+| planned rotation·verify-only retire production operator | [POV-035](../tickets/POV-035-planned-key-rotation-and-retirement-operator.md) | 초기 H1 text capture gate 아님; 장기 key maintenance/release claim 전 필요 |
+| compromise·loss recovery와 production operator | [POV-036](../tickets/POV-036-auth-key-compromise-and-loss-recovery.md) | 초기 H1 text capture gate 아님; 해당 recovery 지원 claim 전 필요 |
+| installed-browser login/refresh/logout, cookie·storage evidence | [POV-010](../tickets/POV-010-minimal-authenticated-local-text-chat.md) | H1 product/browser evidence에서 검증 |
+| platform PTY matrix, reference-device Argon2, abrupt crash/power-loss, same-UID ABA residual | [POV-037](../tickets/POV-037-auth-platform-and-durability-hardening.md) | 초기 H1 text capture gate 아님; 해당 platform/durability claim 전 필요 |
 
 POV-007 completion은 현재 구현된 Unix auth maintenance profile만 주장합니다. Native
 Windows auth maintenance/runtime을 성공 stub으로 간주하지 않으며, POV-010 dogfood
@@ -578,10 +578,10 @@ POV-035~037은 이 ticket의 선행 조건이 아닙니다.
   실행은 PASS로 기록하지 않습니다.
 - Linux/macOS 전체 PTY matrix, output fault, pgrp race, contention snapshot,
   reference-device Argon2, same-UID ABA와 실제 crash/power-loss/filesystem durability는
-  [POV-037](POV-037-auth-platform-and-durability-hardening.md), planned/retire operator는
-  [POV-035](POV-035-planned-key-rotation-and-retirement-operator.md), compromise/loss는
-  [POV-036](POV-036-auth-key-compromise-and-loss-recovery.md), installed-browser clauses는
-  [POV-010](POV-010-minimal-authenticated-local-text-chat.md)이 소유합니다.
+  [POV-037](../tickets/POV-037-auth-platform-and-durability-hardening.md), planned/retire operator는
+  [POV-035](../tickets/POV-035-planned-key-rotation-and-retirement-operator.md), compromise/loss는
+  [POV-036](../tickets/POV-036-auth-key-compromise-and-loss-recovery.md), installed-browser clauses는
+  [POV-010](../tickets/POV-010-minimal-authenticated-local-text-chat.md)이 소유합니다.
 
 ## Completion Evidence
 
@@ -593,7 +593,7 @@ POV-035~037은 이 ticket의 선행 조건이 아닙니다.
 
 ## Cross-platform Verification Baseline
 
-[POV-034](../deps/POV-034-restore-windows-workspace-validation-baseline.md)는
+[POV-034](POV-034-restore-windows-workspace-validation-baseline.md)는
 `storage/auth_records.rs`, 이를 소비하는 storage binding/type과 crate-private transition
 re-export를 같은 Unix gate로 정렬했습니다. Windows는 migration `0004`/`0005`와 canonical
 auth schema를 계속 적용하지만 Unix auth maintenance capability를 compile하거나 stub으로
@@ -608,12 +608,12 @@ auth schema를 계속 적용하지만 Unix auth maintenance capability를 compil
 
 - [Architecture](../ARCHITECTURE.md)
 - [Roadmap](../WBS.md)
-- [POV-004](../deps/POV-004-core-data-identity-and-store-boundaries.md)
-- [POV-005](../deps/POV-005-authentication-and-session-security-decision.md)
-- [POV-034](../deps/POV-034-restore-windows-workspace-validation-baseline.md)
-- [POV-035](POV-035-planned-key-rotation-and-retirement-operator.md)
-- [POV-036](POV-036-auth-key-compromise-and-loss-recovery.md)
-- [POV-037](POV-037-auth-platform-and-durability-hardening.md)
-- [POV-010](POV-010-minimal-authenticated-local-text-chat.md)
+- [POV-004](POV-004-core-data-identity-and-store-boundaries.md)
+- [POV-005](POV-005-authentication-and-session-security-decision.md)
+- [POV-034](POV-034-restore-windows-workspace-validation-baseline.md)
+- [POV-035](../tickets/POV-035-planned-key-rotation-and-retirement-operator.md)
+- [POV-036](../tickets/POV-036-auth-key-compromise-and-loss-recovery.md)
+- [POV-037](../tickets/POV-037-auth-platform-and-durability-hardening.md)
+- [POV-010](../tickets/POV-010-minimal-authenticated-local-text-chat.md)
 - [ADR-0004](../decisions/0004-local-authentication-and-session-security-contract.md)
-- [POV-022](POV-022-first-segment-and-voice-wedge-discovery-gate.md)
+- [POV-022](../tickets/POV-022-first-segment-and-voice-wedge-discovery-gate.md)

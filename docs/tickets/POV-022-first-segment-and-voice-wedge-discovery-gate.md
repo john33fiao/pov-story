@@ -387,4 +387,4 @@ participant research 시작 전에 v1을 폐기하면 폐기 이유를 기록하
 - [Outcome Roadmap And WBS](../WBS.md)
 - [ADR-0003](../decisions/0003-lifelogging-foundation-and-storyworld-follow-on.md)
 - [POV-001](../deps/POV-001-local-offline-walking-skeleton.md)
-- [POV-007](POV-007-local-login-refresh-and-session-revoke.md)
+- [POV-007](../deps/POV-007-local-login-refresh-and-session-revoke.md)

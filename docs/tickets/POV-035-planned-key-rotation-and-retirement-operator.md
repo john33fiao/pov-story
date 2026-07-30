@@ -60,7 +60,7 @@ operator command 노출을 제거하되 이미 시작된 legal transition eviden
 
 ## Links
 
-- [POV-007](POV-007-local-login-refresh-and-session-revoke.md)
+- [POV-007](../deps/POV-007-local-login-refresh-and-session-revoke.md)
 - [POV-036](POV-036-auth-key-compromise-and-loss-recovery.md)
 - [ADR-0004](../decisions/0004-local-authentication-and-session-security-contract.md)
 

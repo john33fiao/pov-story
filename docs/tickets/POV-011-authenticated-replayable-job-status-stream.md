@@ -58,5 +58,5 @@ stream endpoint를 끄고 durable status를 polling으로 읽는 임시 fallback
 
 - [Architecture](../ARCHITECTURE.md)
 - [Roadmap](../WBS.md)
-- [POV-009](POV-009-durable-single-slot-job-queue.md)
+- [POV-009](../deps/POV-009-durable-single-slot-job-queue.md)
 - [POV-010](POV-010-minimal-authenticated-local-text-chat.md)

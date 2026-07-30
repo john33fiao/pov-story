@@ -68,5 +68,5 @@ text composer route를 비활성화해도 이미 저장된 conversation event는
 - [Product Strategy](../PRODUCT_STRATEGY.md)
 - [Roadmap](../WBS.md)
 - [POV-001](../deps/POV-001-local-offline-walking-skeleton.md)
-- [POV-007](POV-007-local-login-refresh-and-session-revoke.md)
-- [POV-008](POV-008-idempotent-conversation-append-and-outbox.md)
+- [POV-007](../deps/POV-007-local-login-refresh-and-session-revoke.md)
+- [POV-008](../deps/POV-008-idempotent-conversation-append-and-outbox.md)

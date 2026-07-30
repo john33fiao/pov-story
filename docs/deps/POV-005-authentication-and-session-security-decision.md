@@ -98,4 +98,4 @@ local과 remote profile의 ID/password session, access token, opaque refresh rot
 - [Roadmap](../WBS.md)
 - [ADR-0004](../decisions/0004-local-authentication-and-session-security-contract.md)
 - [POV-001](../deps/POV-001-local-offline-walking-skeleton.md)
-- [POV-007](../tickets/POV-007-local-login-refresh-and-session-revoke.md)
+- [POV-007](POV-007-local-login-refresh-and-session-revoke.md)

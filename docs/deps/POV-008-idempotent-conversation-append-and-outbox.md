@@ -67,7 +67,7 @@ owner-scoped conversation, append-only event, idempotency key, audit와 transact
   constructor.
 - [x] 2026-07-29 close-out audit rechecked the migration, repository and targeted tests against
   every acceptance criterion. `pov-api` activation and authenticated browser flow remain
-  [POV-010](POV-010-minimal-authenticated-local-text-chat.md) scope and are not claimed here.
+  [POV-010](../tickets/POV-010-minimal-authenticated-local-text-chat.md) scope and are not claimed here.
 - [x] Final changed-set repository validation passes: frontend format/lint/typecheck/build,
   Rust format/workspace check/workspace test, Markdown relative links and `git diff --check`.
 - [x] Project-local RTD After completed all 13 review/readiness steps as READY on the final changed
@@ -82,5 +82,5 @@ owner-scoped conversation, append-only event, idempotency key, audit와 transact
 
 - [Architecture](../ARCHITECTURE.md)
 - [Roadmap](../WBS.md)
-- [POV-004](../deps/POV-004-core-data-identity-and-store-boundaries.md)
+- [POV-004](POV-004-core-data-identity-and-store-boundaries.md)
 - [POV-007](POV-007-local-login-refresh-and-session-revoke.md)

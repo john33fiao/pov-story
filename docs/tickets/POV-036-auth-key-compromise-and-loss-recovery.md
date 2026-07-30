@@ -62,7 +62,7 @@ operator entrypoint를 닫아 신규 recovery 시작을 막되 이미 시작된 
 
 ## Links
 
-- [POV-007](POV-007-local-login-refresh-and-session-revoke.md)
+- [POV-007](../deps/POV-007-local-login-refresh-and-session-revoke.md)
 - [POV-035](POV-035-planned-key-rotation-and-retirement-operator.md)
 - [ADR-0004](../decisions/0004-local-authentication-and-session-security-contract.md)
 

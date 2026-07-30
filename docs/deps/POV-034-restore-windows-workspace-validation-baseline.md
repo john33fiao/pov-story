@@ -121,7 +121,7 @@ auth path를 활성화하지 않습니다.
 ## Links
 
 - [POV-001](POV-001-local-offline-walking-skeleton.md)
-- [POV-007](../tickets/POV-007-local-login-refresh-and-session-revoke.md)
+- [POV-007](POV-007-local-login-refresh-and-session-revoke.md)
 - [POV-031](POV-031-remove-password-blocklist-feature.md)
 - [POV-033](../tickets/POV-033-windows-python-whisper-turbo-provider.md)
 - [Architecture](../ARCHITECTURE.md)

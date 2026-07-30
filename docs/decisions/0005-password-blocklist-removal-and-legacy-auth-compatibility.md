@@ -396,7 +396,7 @@ Candidate 1은 이 POV-031 slice에서 거절합니다.
 ## Links
 
 - [ADR-0004](0004-local-authentication-and-session-security-contract.md)
-- [POV-007](../tickets/POV-007-local-login-refresh-and-session-revoke.md)
+- [POV-007](../deps/POV-007-local-login-refresh-and-session-revoke.md)
 - [POV-031](../deps/POV-031-remove-password-blocklist-feature.md)
 - [POV-032](../deps/POV-032-purge-password-blocklist-history-and-caches.md)
 - [Architecture](../ARCHITECTURE.md)
