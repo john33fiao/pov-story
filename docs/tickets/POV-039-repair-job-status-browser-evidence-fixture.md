@@ -1,6 +1,6 @@
 # POV-039 Repair Job Status Browser Evidence Fixture
 
-Status: Planned — opened by POV-013 `fix`
+Status: Completed — 2026-08-01; Chromium, unit and frontend baseline PASS
 
 Type: Corrective test
 
@@ -45,6 +45,28 @@ linkage인 `conversation_id`와 `source_event_id`를 필수로 검증하지만 P
 - `npm --prefix web run test`
 - frontend format, lint, typecheck and production build
 - `git diff --check` and relative Markdown-link check
+
+## Evidence Result
+
+Completed on 2026-08-01 with a test-only fixture repair.
+
+- `web/e2e/job-events.spec.ts`의 `statusEvent`에 canonical UUID v4
+  `conversation_id`와 `source_event_id`를 추가했습니다. Production parser, SSE/API schema,
+  migration, auth, queue, generation과 UI source는 변경하지 않았습니다.
+- `npm --prefix web run test:browser`는 sandbox의 loopback bind `EPERM` 뒤 같은 명령을 host
+  경계에서 재실행해 current Chromium project `1/1` PASS했습니다. 기존 refresh handoff,
+  reconnect cursor, reload와 bearer-token URL/storage/cache non-persistence assertion은 그대로
+  실행됐습니다.
+- `npm --prefix web run test`는 `2` files와 `13/13` tests가 PASS했습니다. Owner-scoped
+  conversation linkage가 빠진 malformed event를 거부하는 unit regression은 변경하지
+  않았습니다.
+- Frontend format, lint, typecheck와 production build, `git diff --check`, changed Markdown
+  relative-link check가 PASS했습니다. Playwright가 만든 ignored
+  `test-results/.last-run.json` 때문에 첫 format check가 실패했지만 generated file을 제거한
+  뒤 같은 명령이 PASS했고 tracked artifact로 남지 않았습니다.
+- 이 결과는 POV-039만 완료합니다. POV-013의 exact `70ad661` E04/E08 FAIL은 역사적 실행
+  결과로 유지하며, POV-040, POV-013 전체 재실행과 E10/E11 target-Chrome evidence는
+  남아 있습니다.
 
 ## Rollback
 

@@ -106,7 +106,7 @@ flowchart LR
     P010 --> P012
     P011 --> P013["POV-013 Conversation gate"]
     P012 --> P013
-    P013 -. fix .-> P039["POV-039 Browser fixture"]
+    P013 -. fix .-> P039["POV-039 Browser fixture completed"]
     P013 -. fix .-> P040["POV-040 macOS filename baseline"]
     P039 --> P013
     P040 --> P013
@@ -144,8 +144,8 @@ flowchart LR
 | 8 | [POV-010 Minimal authenticated local text chat](tickets/POV-010-minimal-authenticated-local-text-chat.md) | Completed delivery — 2026-07-31; core/API/Web, pinned frontend와 Rust repository baseline PASS | POV-007, POV-008 | owner-scoped local Web Chat의 login, text 저장, durable receipt와 timeline을 component·contract·repository evidence로 검증 |
 | 9 | [POV-011 Authenticated replayable job status stream](deps/POV-011-authenticated-replayable-job-status-stream.md) | Completed — 2026-07-31; implementation/Chromium과 actual macOS locked baseline PASS | POV-009, POV-010 | token refresh와 reconnect 뒤에도 owner-scoped 상태를 이어 봄; Linux runtime 사용은 제공하지 않으며 completion gate가 아님 |
 | 10 | [POV-012 Loopback LLM text round trip](tickets/POV-012-loopback-llm-text-round-trip.md) | Completed delivery — 2026-07-31; Core/API/Web, fake provider, actual local model과 locked baseline PASS | POV-006, POV-009, POV-010 | authenticated loopback inference, atomic assistant/provenance와 crash/timeout/cancel/unavailable UX를 검증; model은 narrow candidate로 유지 |
-| 11 | [POV-013 Conversation Core offline evidence gate](tickets/POV-013-conversation-core-offline-evidence-gate.md) | In Progress evidence gate — `fix` | POV-004~012; corrective POV-039/040 | offline, owner isolation, retry, reconnect와 process failure 증거로 H2 진입 여부 결정 |
-| 11a | [POV-039 Repair job status browser evidence fixture](tickets/POV-039-repair-job-status-browser-evidence-fixture.md) | Corrective test | POV-011, POV-012; blocks POV-013 | stale Playwright fixture를 current owner-scoped status schema와 일치 |
+| 11 | [POV-013 Conversation Core offline evidence gate](tickets/POV-013-conversation-core-offline-evidence-gate.md) | In Progress evidence gate — `fix` | POV-004~012; POV-039 completed; corrective POV-040 and full rerun | offline, owner isolation, retry, reconnect와 process failure 증거로 H2 진입 여부 결정 |
+| 11a | [POV-039 Repair job status browser evidence fixture](tickets/POV-039-repair-job-status-browser-evidence-fixture.md) | Completed corrective test — 2026-08-01; Chromium/unit/frontend PASS | POV-011, POV-012; unblocks POV-013 browser fixture remediation | stale Playwright fixture를 current owner-scoped status schema와 일치 |
 | 11b | [POV-040 Reconcile macOS raw filename validation](tickets/POV-040-reconcile-macos-raw-filename-validation.md) | Corrective platform validation | POV-007, POV-034; blocks POV-013/038 | process cleanup과 raw filename fail-closed evidence를 한 target-macOS baseline에서 통과 |
 | 12 | [POV-014 Temporary Blob lifecycle and privacy contract](tickets/POV-014-temporary-blob-lifecycle-and-privacy-contract.md) | Decision | POV-013 | 실제 voice intake 전에 encryption, retention, quota와 irreversible purge 경계를 확정 |
 | 13 | [POV-015 Authenticated idempotent voice intake](tickets/POV-015-authenticated-idempotent-voice-intake.md) | Delivery | POV-013, POV-014 | 큰 음성을 재시도해도 media와 job 하나만 만들고 즉시 접수 |

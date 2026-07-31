@@ -1,6 +1,6 @@
 # POV-013 Conversation Core Offline Evidence Gate
 
-Status: In Progress — `fix`; POV-039/040 and target-Chrome evidence required
+Status: In Progress — `fix`; POV-040, full rerun and target-Chrome evidence required
 
 Type: Evidence gate
 
@@ -132,6 +132,19 @@ Final decision: **fix**
   `Ready`로 유지합니다.
 - POV-014와 H2는 POV-039/040 수정과 POV-013 전체 재실행에서 `proceed`가 나오기 전까지
   열지 않습니다.
+
+### POV-039 Remediation Update — 2026-08-01
+
+- [POV-039](POV-039-repair-job-status-browser-evidence-fixture.md)는 Playwright `statusEvent`에
+  current schema의 canonical UUID v4 `conversation_id`와 `source_event_id`만 추가해
+  완료했습니다. Production parser, SSE/API schema와 runtime behavior는 변경하지 않았습니다.
+- Current worktree에서 browser `1/1`, Web unit `13/13`, frontend format/lint/typecheck/build,
+  `git diff --check`와 changed Markdown relative-link check가 PASS했습니다. Refresh handoff,
+  reconnect cursor, reload, malformed-linkage rejection과 bearer-token non-persistence assertion은
+  그대로 유지했습니다.
+- 이 remediation은 exact `70ad66146a7f47dde3157ed0089ef8316e81e8ee` matrix의 E04/E08
+  FAIL을 PASS로 덮어쓰지 않으며 POV-013 전체 재실행도 아닙니다. POV-040, full matrix rerun과
+  E10/E11 target-Chrome evidence가 남아 있으므로 final decision은 계속 **fix**입니다.
 
 ## Verification
 
