@@ -11,15 +11,15 @@ POV Story는 메모, 음성, 일정, 할 일, 작업일지와 장기 기억을 �
 - POV-012의 outbox scanner, single-slot generation worker, authenticated loopback provider,
   atomic assistant/provenance append와 진행·취소·오류 Web Chat 흐름은 2026-07-31
   구현·검증을 완료했습니다. LLM 환경변수가 모두 없으면 capture-only로 동작하고 일부
-  설정이나 artifact 검증이 실패해도 HTTP와 text capture는 유지합니다. MacBook production
-  runtime과 installed-browser evidence는 장비 확보 뒤
+  설정이나 artifact 검증이 실패해도 HTTP와 text capture는 유지합니다. Target MacBook은
+  확보됐지만 production runtime과 installed-browser evidence는 아직 실행 전이며
   [POV-038](docs/tickets/POV-038-macos-dogfood-runtime-and-installed-browser-evidence.md)에서
   실행하며 완료 전까지 macOS production 지원을 주장하지 않습니다.
 - H1 always-on backend와 dogfood runtime target은 MacBook의 macOS이며, Windows는 구현과
   cross-platform validation 환경으로 사용합니다. Native Windows production auth는 계속
   fail closed이고 POV-010의 선행 조건이 아닙니다.
 
-완료된 [POV-007 auth delivery](docs/deps/POV-007-local-login-refresh-and-session-revoke.md), [POV-008 conversation append](docs/deps/POV-008-idempotent-conversation-append-and-outbox.md), [POV-009 durable queue](docs/deps/POV-009-durable-single-slot-job-queue.md), [POV-010 local text chat](docs/tickets/POV-010-minimal-authenticated-local-text-chat.md), [POV-011 replayable status stream](docs/deps/POV-011-authenticated-replayable-job-status-stream.md)에 이어 [POV-012 LLM text round trip](docs/tickets/POV-012-loopback-llm-text-round-trip.md)도 Core/API/Web, fake provider와 명시적으로 pin한 actual local model 왕복을 검증해 완료했습니다. 이 model은 narrow candidate이며 release default나 품질 gate가 아닙니다. 다음 작업은 [POV-013 Conversation Core offline evidence gate](docs/tickets/POV-013-conversation-core-offline-evidence-gate.md)이고, MacBook production 실기 검증은 장비 확보 전까지 POV-038 backlog로 유지합니다. [POV-022 외부 사용자 discovery](docs/tickets/POV-022-first-segment-and-voice-wedge-discovery-gate.md)는 개인용 H1~H5 완성 뒤의 후순위 제품 검증 backlog이며 현재 delivery를 막지 않습니다.
+완료된 [POV-007 auth delivery](docs/deps/POV-007-local-login-refresh-and-session-revoke.md), [POV-008 conversation append](docs/deps/POV-008-idempotent-conversation-append-and-outbox.md), [POV-009 durable queue](docs/deps/POV-009-durable-single-slot-job-queue.md), [POV-010 local text chat](docs/tickets/POV-010-minimal-authenticated-local-text-chat.md), [POV-011 replayable status stream](docs/deps/POV-011-authenticated-replayable-job-status-stream.md)에 이어 [POV-012 LLM text round trip](docs/tickets/POV-012-loopback-llm-text-round-trip.md)도 Core/API/Web, fake provider와 명시적으로 pin한 actual local model 왕복을 검증해 완료했습니다. 이 model은 narrow candidate이며 release default나 품질 gate가 아닙니다. [POV-013 Conversation Core offline evidence gate](docs/tickets/POV-013-conversation-core-offline-evidence-gate.md)는 browser fixture와 target-macOS full baseline blocker로 `fix`를 판정했으며 [POV-039](docs/tickets/POV-039-repair-job-status-browser-evidence-fixture.md)와 [POV-040](docs/tickets/POV-040-reconcile-macos-raw-filename-validation.md) 뒤에 전체 재실행합니다. Target MacBook은 확보됐지만 production/Chrome 실기 증거는 POV-038에서 아직 실행하지 않았습니다. [POV-022 외부 사용자 discovery](docs/tickets/POV-022-first-segment-and-voice-wedge-discovery-gate.md)는 개인용 H1~H5 완성 뒤의 후순위 제품 검증 backlog이며 현재 delivery를 막지 않습니다.
 
 ## 빠른 실행
 

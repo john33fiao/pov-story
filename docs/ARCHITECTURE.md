@@ -66,9 +66,10 @@ Cloudflare는 외부 ingress만 담당합니다. local path는 Cloudflare와 인
 - [ADR-0006](decisions/0006-h1-development-and-dogfood-platform.md)에 따라 H1의 intended
   always-on backend와 dogfood runtime은 MacBook의 macOS입니다. Windows는 frontend와 Rust
   cross-platform development/validation 환경이지만 production auth maintenance/runtime을
-  활성화하지 않습니다. MacBook production runtime과 installed-browser activation evidence는
-  장비 확보 뒤 [POV-038](tickets/POV-038-macos-dogfood-runtime-and-installed-browser-evidence.md)이
-  소유하며 POV-010 implementation delivery의 완료 조건과 분리합니다.
+  활성화하지 않습니다. Target MacBook은 확보됐지만 production runtime과
+  installed-browser activation evidence는 아직 실행 전이며
+  [POV-038](tickets/POV-038-macos-dogfood-runtime-and-installed-browser-evidence.md)이 소유하고
+  POV-010 implementation delivery의 완료 조건과 분리합니다.
 - `/api/health`는 고정 상태만 반환하며 DB, model, filesystem 상태나 personal data를 읽지 않습니다.
 - unknown API path는 SPA로 fallback하지 않고, embedded asset key 밖의 path는 읽지 않습니다.
 - `pov-core` crate가 UUID-typed owner ID, 생성·rehydration 시 UUID v4를 검증하는 source/correlation ID, positive checked revision과 opaque verified-owner scope를 제공합니다. shared-receiver async backend-neutral repository port의 모든 read/create/revise operation은 이 scope를 요구하고 opaque backend failure를 표현할 수 있습니다. typed source-store marker는 associated domain을 노출하고 source/derivative 역할을 분리합니다. production owner scope는 `AuthRuntime::verify_access`가 검증한 JWT, active session과 credential version에서만 생성하며 synthetic constructor는 test build로 제한됩니다.

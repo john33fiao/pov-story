@@ -1,6 +1,6 @@
 # TODO
 
-Last updated: 2026-07-31
+Last updated: 2026-08-01
 
 Current phase: H6 follow-on direction accepted; H0 completed including Windows workspace validation baseline; H1 single-owner product delivery active; external POV-022 research deferred until the personal product is complete or explicitly reprioritized
 
@@ -28,6 +28,9 @@ production auth는 POV-010의 선행 조건이 아닙니다.
 | [POV-010 Minimal authenticated local text chat](tickets/POV-010-minimal-authenticated-local-text-chat.md) | Delivery | Completed — 2026-07-31; core/API/Web 및 pinned frontend/Rust baseline PASS | owner-scoped login/refresh/logout, text capture, durable receipt와 stored timeline을 Windows/WSL의 component·contract·repository evidence로 검증 |
 | [POV-011 Authenticated replayable job status stream](deps/POV-011-authenticated-replayable-job-status-stream.md) | Delivery | Completed — 2026-07-31; Core/API/Web/Chromium 및 actual macOS locked baseline PASS | token refresh와 reconnect 뒤에도 owner-scoped durable status cursor를 이어 보는 흐름; Linux runtime 사용은 제공하지 않으며 completion gate가 아님 |
 | [POV-012 Loopback LLM text round trip](tickets/POV-012-loopback-llm-text-round-trip.md) | Delivery | Completed — 2026-07-31; Core/API/Web, fake provider, actual local model과 locked baseline PASS | 저장→queue→authenticated loopback inference→atomic assistant/provenance append; model은 narrow candidate이고 production activation은 POV-038에 유지 |
+| [POV-013 Conversation Core offline evidence gate](tickets/POV-013-conversation-core-offline-evidence-gate.md) | Evidence gate | In Progress — `fix`; automated evidence run 2026-08-01 | clean/offline/frontend와 core invariants는 PASS; browser fixture와 target-macOS full baseline corrective work 뒤 전체 재실행 |
+| [POV-039 Repair job status browser evidence fixture](tickets/POV-039-repair-job-status-browser-evidence-fixture.md) | Corrective test | Planned — blocks POV-013 | owner-scoped event linkage가 빠진 stale Playwright fixture만 current schema와 맞춤 |
+| [POV-040 Reconcile macOS raw filename validation](tickets/POV-040-reconcile-macos-raw-filename-validation.md) | Corrective platform validation | Planned — blocks POV-013/038 | process cleanup과 raw non-UTF-8 fail-closed tests를 한 target-macOS full baseline에서 재현 |
 
 ## Auth Follow-ups — Not Initial H1 Gates
 
@@ -36,11 +39,11 @@ production auth는 POV-010의 선행 조건이 아닙니다.
 | [POV-035 Planned key rotation and retirement operator](tickets/POV-035-planned-key-rotation-and-retirement-operator.md) | Delivery | Planned — maintenance core implemented, production operator absent | 장기 key maintenance와 release claim 전 |
 | [POV-036 Auth key compromise and loss recovery](tickets/POV-036-auth-key-compromise-and-loss-recovery.md) | Delivery | Planned — ADR contract accepted, persisted transition/operator 미구현 | compromise/loss recovery 지원 claim 전 |
 | [POV-037 Auth platform and durability hardening](tickets/POV-037-auth-platform-and-durability-hardening.md) | Hardening evidence | Planned — explicit evidence backlog | 해당 platform, reference-device performance 또는 durability claim 전 |
-| [POV-038 macOS dogfood runtime and installed-browser evidence](tickets/POV-038-macos-dogfood-runtime-and-installed-browser-evidence.md) | Platform activation evidence | Backlog — target MacBook unavailable | MacBook을 확보한 뒤 macOS always-on/dogfood production 및 installed-browser 지원을 주장하기 전 |
+| [POV-038 macOS dogfood runtime and installed-browser evidence](tickets/POV-038-macos-dogfood-runtime-and-installed-browser-evidence.md) | Platform activation evidence | In Progress — target available; blocked by POV-040 and manual evidence pending | macOS always-on/dogfood production 및 installed-browser 지원을 주장하기 전 |
 
 POV-010은 자동화된 component·HTTP contract와 supported-Unix smoke로 구현 delivery를
-완료했습니다. MacBook production `auth init`, listener와 installed-browser
-login/refresh/logout·cookie/storage evidence는 장비 확보 뒤 POV-038에서 실행합니다.
+완료했습니다. Target MacBook은 확보됐지만 production `auth init`, listener와 installed-browser
+login/refresh/logout·cookie/storage evidence는 POV-040 뒤 POV-038에서 실행합니다.
 Native Windows auth maintenance/runtime은 현재 성공으로 주장하지 않으며, 중간
 개발·cross-platform validation에만 사용합니다.
 
@@ -49,7 +52,7 @@ Native Windows auth maintenance/runtime은 현재 성공으로 주장하지 않�
 | Horizon | Status | Outcome | Tickets |
 | --- | --- | --- | --- |
 | H0 — Reproducible local boundary | Completed including Windows validation repair | same-origin shell, source/store/auth와 process safety contract를 executable evidence로 재현 | [POV-001](deps/POV-001-local-offline-walking-skeleton.md), [POV-004](deps/POV-004-core-data-identity-and-store-boundaries.md), [POV-005](deps/POV-005-authentication-and-session-security-decision.md), [POV-006](deps/POV-006-provider-ports-and-safe-process-supervisor.md), [POV-034](deps/POV-034-restore-windows-workspace-validation-baseline.md) |
-| H1 — Trustworthy text capture | In Progress — POV-007~012 completed; continues with POV-013 evidence gate | 한 owner가 offline에서 text를 durable하게 남기고 retry·status·local inference failure를 신뢰 | [POV-007](deps/POV-007-local-login-refresh-and-session-revoke.md), [POV-008](deps/POV-008-idempotent-conversation-append-and-outbox.md), [POV-009](deps/POV-009-durable-single-slot-job-queue.md), [POV-010](tickets/POV-010-minimal-authenticated-local-text-chat.md), [POV-011](deps/POV-011-authenticated-replayable-job-status-stream.md), [POV-012](tickets/POV-012-loopback-llm-text-round-trip.md), [POV-013](tickets/POV-013-conversation-core-offline-evidence-gate.md) |
+| H1 — Trustworthy text capture | In Progress — POV-013 `fix`; POV-039/040 corrective work required | 한 owner가 offline에서 text를 durable하게 남기고 retry·status·local inference failure를 신뢰 | [POV-007](deps/POV-007-local-login-refresh-and-session-revoke.md), [POV-008](deps/POV-008-idempotent-conversation-append-and-outbox.md), [POV-009](deps/POV-009-durable-single-slot-job-queue.md), [POV-010](tickets/POV-010-minimal-authenticated-local-text-chat.md), [POV-011](deps/POV-011-authenticated-replayable-job-status-stream.md), [POV-012](tickets/POV-012-loopback-llm-text-round-trip.md), [POV-013](tickets/POV-013-conversation-core-offline-evidence-gate.md), [POV-039](tickets/POV-039-repair-job-status-browser-evidence-fixture.md), [POV-040](tickets/POV-040-reconcile-macos-raw-filename-validation.md) |
 | H2 — Correctable voice recall | Gated by POV-013 | 음성을 교정 가능한 current revision으로 만들고 근거와 함께 recall하며 raw audio를 policy대로 purge | [POV-002 epic](tickets/POV-002-voice-lifelog-round-trip.md), [POV-014](tickets/POV-014-temporary-blob-lifecycle-and-privacy-contract.md), [POV-015](tickets/POV-015-authenticated-idempotent-voice-intake.md), [POV-033](tickets/POV-033-windows-python-whisper-turbo-provider.md), [POV-016](tickets/POV-016-supervised-audio-normalization-and-transcription.md), [POV-017](tickets/POV-017-immutable-transcript-correction-revisions.md), [POV-018](tickets/POV-018-current-revision-hybrid-transcript-retrieval.md), [POV-019](tickets/POV-019-retry-safe-audio-purge.md), [POV-020](tickets/POV-020-evidence-grounded-next-day-recall.md), [POV-023](tickets/POV-023-source-derivative-reconciliation.md), [POV-021](tickets/POV-021-voice-round-trip-evidence-gate.md) |
 
 실행 순서, dependency와 horizon exit evidence는 [Outcome Roadmap And WBS](WBS.md)를 따릅니다.
@@ -88,8 +91,9 @@ H3~H5 상세 delivery ticket은 [POV-021](tickets/POV-021-voice-round-trip-evide
 - [x] [ADR-0006](decisions/0006-h1-development-and-dogfood-platform.md)에서 MacBook
   macOS를 H1 always-on/dogfood backend로, Windows를 development/cross-platform validation
   환경으로 결정
-- [ ] Target MacBook 확보 뒤 [POV-038](tickets/POV-038-macos-dogfood-runtime-and-installed-browser-evidence.md)에서
-  macOS production auth와 installed-browser dogfood evidence 실행
+- [ ] [POV-040](tickets/POV-040-reconcile-macos-raw-filename-validation.md) 뒤
+  [POV-038](tickets/POV-038-macos-dogfood-runtime-and-installed-browser-evidence.md)에서 target
+  MacBook production auth와 installed-browser dogfood evidence 실행
 - [ ] POV-014에서 temporary Blob encryption, retention, quota와 irreversible purge contract 결정
 - [ ] model/runtime artifact pinning과 versioned quality gate 결정
 - [ ] backup, export, restore와 explicit purge policy 결정

@@ -1,25 +1,31 @@
 # POV-038 macOS Dogfood Runtime And Installed-Browser Evidence
 
-Status: Backlog — activate when the target MacBook is available
+Status: In Progress — target available; blocked by POV-040 and manual evidence pending
 
 Type: Platform activation evidence
 
 Roadmap: H1 dogfood follow-up — not a POV-010 implementation delivery gate
 
-Depends on: POV-007, POV-010, target MacBook access
+Depends on: POV-007, POV-010, POV-040, target MacBook access
 
 ## Why
 
-H1의 intended always-on backend는 MacBook의 macOS이지만 현재 target 장비를 사용할 수
-없습니다. 실행할 수 없는 production auth와 installed-browser 검증을 POV-010의 완료
-차단 조건으로 두지 않고, 실제 장비를 확보한 시점에 별도 evidence slice로 활성화합니다.
+H1의 intended always-on backend는 MacBook의 macOS입니다. 장비가 없던 동안 production
+auth와 installed-browser 검증을 POV-010의 완료 차단 조건으로 두지 않았고, 현재 확보한
+target 장비에서 별도 evidence slice로 실행합니다.
 
 ## Activation Boundary
 
-- repository owner가 target MacBook에서 검증할 수 있는 시점에만 `Ready`로 전환합니다.
+- 2026-08-01 현재 target MacBook을 사용할 수 있어 `Ready`로 전환했습니다.
 - 실행 전 POV-007/010의 current code, accepted ADR과 documented commands를 다시 읽습니다.
 - 이 ticket이 완료되기 전에는 macOS production/dogfood 또는 installed-browser 지원을
   완료로 주장하지 않습니다.
+- 실행 조합은 macOS `26.5.2` (`25F84`, arm64)와 Google Chrome `150.0.7871.187`로
+  제한합니다. Password, recovery code, token, cookie value, KID, instance/model path와
+  artifact hash는 evidence에 기록하지 않습니다.
+- POV-013 fail-fast로 credential-bearing manual flow는 아직 실행하지 않았습니다.
+  [POV-040](POV-040-reconcile-macos-raw-filename-validation.md)의 target-macOS full baseline을
+  먼저 복구한 뒤 이 ticket의 production/browser evidence를 실행합니다.
 
 ## Scope
 
@@ -49,8 +55,8 @@ H1의 intended always-on backend는 MacBook의 macOS이지만 현재 target 장�
 ## Verification
 
 - README의 pinned frontend/Rust baseline
-- `python scripts/test_operator_pty.py`
-- `python scripts/test_production_auth_smoke.py`
+- Linux 전용 `python scripts/test_operator_pty.py`와
+  `python scripts/test_production_auth_smoke.py`는 macOS PASS 근거에서 제외
 - initialized owner-only instance의 `POV_INSTANCE_ROOT=/absolute/private/path sh scripts/smoke.sh`
 - installed-browser login/refresh/logout, duplicate submit, auth expiry와 durable readback
 - browser network/cookie/storage/cache inspection과 redacted evidence readback
@@ -73,6 +79,7 @@ POV-010의 이미 검증된 implementation delivery를 되돌리거나 macOS 실
 
 - [POV-007](../deps/POV-007-local-login-refresh-and-session-revoke.md)
 - [POV-010](POV-010-minimal-authenticated-local-text-chat.md)
+- [POV-040](POV-040-reconcile-macos-raw-filename-validation.md)
 - [ADR-0006](../decisions/0006-h1-development-and-dogfood-platform.md)
 - [Architecture](../ARCHITECTURE.md)
 - [TODO](../TODO.md)
