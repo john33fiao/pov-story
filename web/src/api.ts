@@ -21,6 +21,41 @@ export type ConversationTimeline = {
   conversation_id: string
   revision: number
   events: ConversationEvent[]
+  generation_jobs: GenerationJob[]
+}
+
+export type GenerationJobState =
+  | 'queued'
+  | 'leased'
+  | 'running'
+  | 'cancel_requested'
+  | 'retry_scheduled'
+  | 'waiting_confirmation'
+  | 'recovery_required'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+
+export type GenerationFailureKind =
+  | 'provider_unavailable'
+  | 'timeout'
+  | 'execution_failed'
+  | 'lease_expired'
+  | 'cleanup_uncertain'
+
+export type GenerationJob = {
+  job_id: string
+  source_outbox_id: string
+  conversation_id: string
+  source_event_id: string
+  kind: 'conversation_response_v1'
+  state: GenerationJobState
+  revision: number
+  attempts_started: number
+  max_attempts: number
+  queue_wait_micros: string
+  execution_micros: string
+  failure_kind: GenerationFailureKind | null
 }
 
 type ApiErrorPayload = {
@@ -133,4 +168,23 @@ export function appendUserEvent(
       }),
     },
   )
+}
+
+export function cancelGenerationJob(
+  accessToken: string,
+  jobId: string,
+  expectedRevision: number,
+  idempotencyKey: string,
+): Promise<{ job: GenerationJob; replayed: boolean }> {
+  return requestJson(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: 'POST',
+    headers: {
+      ...mutationHeaders,
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({
+      idempotency_key: idempotencyKey,
+      expected_revision: expectedRevision,
+    }),
+  })
 }

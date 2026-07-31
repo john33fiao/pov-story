@@ -10,15 +10,16 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    conversation::{IdempotencyKey, OutboxId},
+    conversation::{ConversationEventId, ConversationId, IdempotencyKey, OutboxId},
     identity::{CorrelationId, Revision, VerifiedAuthContext},
+    provider::{ArtifactRevision, BackendId, RuntimeBuildId, Sha256Digest},
     storage::{self, ConversationStore, SqliteStore},
 };
 
 const CONVERSATION_RESPONSE_MAX_ATTEMPTS: u16 = 3;
 const CONVERSATION_RESPONSE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const CONVERSATION_RESPONSE_LEASE_DURATION: Duration = Duration::from_secs(30);
-const CONVERSATION_RESPONSE_RETRY_BASE: Duration = Duration::from_secs(1);
+pub(crate) const CONVERSATION_RESPONSE_RETRY_BASE: Duration = Duration::from_secs(1);
 const MAX_DURABLE_MICROS: u64 = i64::MAX as u64;
 pub const JOB_EVENT_PAGE_SIZE: usize = 128;
 
@@ -729,6 +730,8 @@ pub struct JobEvent {
     pub(crate) execution_micros: Option<u64>,
     pub(crate) failure: Option<JobFailureKind>,
     pub(crate) correlation_id: CorrelationId,
+    pub(crate) conversation_id: ConversationId,
+    pub(crate) source_event_id: ConversationEventId,
 }
 
 impl JobEvent {
@@ -785,6 +788,16 @@ impl JobEvent {
     #[must_use]
     pub const fn correlation_id(&self) -> CorrelationId {
         self.correlation_id
+    }
+
+    #[must_use]
+    pub const fn conversation_id(&self) -> ConversationId {
+        self.conversation_id
+    }
+
+    #[must_use]
+    pub const fn source_event_id(&self) -> ConversationEventId {
+        self.source_event_id
     }
 }
 
@@ -884,6 +897,124 @@ pub struct EnqueueReceipt {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JobTransitionReceipt {
     pub job: JobSnapshot,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GenerationDispatchMode {
+    Disabled,
+    Enabled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GenerationDispatchReceipt {
+    Idle,
+    Advanced {
+        source_outbox_id: OutboxId,
+        job: Option<JobSnapshot>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenerationJobSummary {
+    pub(crate) conversation_id: ConversationId,
+    pub(crate) source_event_id: ConversationEventId,
+    pub(crate) job: JobSnapshot,
+    pub(crate) failure: Option<JobFailureKind>,
+}
+
+impl GenerationJobSummary {
+    #[must_use]
+    pub const fn conversation_id(&self) -> ConversationId {
+        self.conversation_id
+    }
+
+    #[must_use]
+    pub const fn source_event_id(&self) -> ConversationEventId {
+        self.source_event_id
+    }
+
+    #[must_use]
+    pub const fn job(&self) -> &JobSnapshot {
+        &self.job
+    }
+
+    #[must_use]
+    pub const fn failure(&self) -> Option<JobFailureKind> {
+        self.failure
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct GenerationSource {
+    pub(crate) conversation_id: ConversationId,
+    pub(crate) source_event_id: ConversationEventId,
+    pub(crate) content: String,
+}
+
+impl GenerationSource {
+    #[must_use]
+    pub const fn conversation_id(&self) -> ConversationId {
+        self.conversation_id
+    }
+
+    #[must_use]
+    pub const fn source_event_id(&self) -> ConversationEventId {
+        self.source_event_id
+    }
+
+    #[must_use]
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+}
+
+impl fmt::Debug for GenerationSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GenerationSource")
+            .field("conversation_id", &self.conversation_id)
+            .field("source_event_id", &self.source_event_id)
+            .field("content", &"<redacted>")
+            .field("content_bytes", &self.content.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct GenerationCompletion {
+    pub output: String,
+    pub provider_backend_id: BackendId,
+    pub runtime_build: RuntimeBuildId,
+    pub runtime_sha256: Sha256Digest,
+    pub model_revision: ArtifactRevision,
+    pub model_sha256: Sha256Digest,
+    pub canonical_input_sha256: Sha256Digest,
+    pub elapsed: Duration,
+}
+
+impl fmt::Debug for GenerationCompletion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GenerationCompletion")
+            .field("output", &"<redacted>")
+            .field("output_bytes", &self.output.len())
+            .field("provider_backend_id", &self.provider_backend_id)
+            .field("runtime_build", &self.runtime_build)
+            .field("runtime_sha256", &self.runtime_sha256)
+            .field("model_revision", &self.model_revision)
+            .field("model_sha256", &self.model_sha256)
+            .field("canonical_input_sha256", &self.canonical_input_sha256)
+            .field("elapsed", &self.elapsed)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenerationCompletionReceipt {
+    pub job: JobSnapshot,
+    pub assistant_event_id: ConversationEventId,
+    pub assistant_revision: Revision,
     pub replayed: bool,
 }
 
@@ -1219,6 +1350,22 @@ impl<'a> JobQueueRepository<'a> {
         storage::job_records::read_event_page(self.store, auth.clone(), after).await
     }
 
+    pub async fn read_generation_jobs(
+        &self,
+        auth: &VerifiedAuthContext,
+        conversation_id: ConversationId,
+    ) -> Result<Vec<GenerationJobSummary>, JobQueueError> {
+        storage::job_records::read_generation_jobs(self.store, auth.clone(), conversation_id).await
+    }
+
+    pub async fn dispatch_next_generation(
+        &self,
+        mode: GenerationDispatchMode,
+    ) -> Result<GenerationDispatchReceipt, JobQueueError> {
+        let now = self.clock.now()?;
+        storage::job_records::dispatch_next_generation(self.store, mode, now).await
+    }
+
     pub async fn request_cancel(
         &self,
         auth: &VerifiedAuthContext,
@@ -1301,6 +1448,34 @@ impl JobDispatcher<'_> {
     ) -> Result<JobTransitionReceipt, JobQueueError> {
         let now = self.clock.now()?;
         storage::job_records::finish(self.store, lease.clone(), outcome, now).await
+    }
+
+    pub async fn read_generation_source(
+        &self,
+        lease: &JobLease,
+    ) -> Result<GenerationSource, JobQueueError> {
+        storage::job_records::read_generation_source(self.store, lease.clone()).await
+    }
+
+    pub async fn cancel_requested(&self, lease: &JobLease) -> Result<bool, JobQueueError> {
+        storage::job_records::generation_cancel_requested(self.store, lease.clone()).await
+    }
+
+    pub async fn complete_generation(
+        &self,
+        lease: &JobLease,
+        completion: GenerationCompletion,
+    ) -> Result<GenerationCompletionReceipt, JobQueueError> {
+        let now = self.clock.now()?;
+        storage::job_records::complete_generation(self.store, lease.clone(), completion, now).await
+    }
+
+    pub async fn mark_cleanup_uncertain(
+        &self,
+        lease: &JobLease,
+    ) -> Result<RecoveryTicket, JobQueueError> {
+        let now = self.clock.now()?;
+        storage::job_records::mark_cleanup_uncertain(self.store, lease.clone(), now).await
     }
 
     pub async fn resolve_recovery(
@@ -1443,23 +1618,26 @@ mod tests {
             Arc,
             atomic::{AtomicU64, Ordering},
         },
-        time::Duration,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use tempfile::tempdir;
 
     use crate::{
         conversation::{
-            AppendUserEvent, ConversationId, ConversationRepository, IdempotencyKey, OutboxId,
+            AppendUserEvent, ConversationEventKind, ConversationId, ConversationRepository,
+            IdempotencyKey, OutboxId,
         },
         identity::{Revision, VerifiedAuthContext},
+        provider::{ArtifactRevision, BackendId, RuntimeBuildId, Sha256Digest},
         storage::StoreSet,
     };
 
     use super::{
-        CancelJob, ClaimResult, EnqueueFingerprint, EnqueueJob, JOB_EVENT_PAGE_SIZE,
-        JobAttemptState, JobClock, JobEnqueueKey, JobEventCursor, JobEventKind, JobFailureKind,
-        JobKind, JobLease, JobLeaseToken, JobMutationKey, JobOutcome, JobQueueError, JobQueueFault,
+        CancelJob, ClaimResult, EnqueueFingerprint, EnqueueJob, GenerationCompletion,
+        GenerationDispatchMode, GenerationDispatchReceipt, JOB_EVENT_PAGE_SIZE, JobAttemptState,
+        JobClock, JobEnqueueKey, JobEventCursor, JobEventKind, JobFailureKind, JobKind, JobLease,
+        JobLeaseToken, JobMutationKey, JobOutcome, JobQueueError, JobQueueFault,
         JobQueueRepository, JobState, JobTimestampMicros, RecoveryResolution, RecoveryTicket,
         ResumeJob,
     };
@@ -1584,6 +1762,190 @@ mod tests {
                 "{invalid:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn disabled_generation_advances_without_backfill() {
+        let directory = tempdir().expect("temporary directory");
+        let stores = StoreSet::open(directory.path().join("stores"))
+            .await
+            .expect("stores open");
+        let clock = Arc::new(ManualClock::new(START));
+        let queue = queue_with_clock(&stores, &clock);
+        let owner = VerifiedAuthContext::synthetic(1);
+        let source_outbox_id = append_outbox(&stores, &owner, "capture only").await;
+
+        let skipped = queue
+            .dispatch_next_generation(GenerationDispatchMode::Disabled)
+            .await
+            .expect("disabled dispatch advances");
+        assert_eq!(
+            skipped,
+            GenerationDispatchReceipt::Advanced {
+                source_outbox_id,
+                job: None,
+            }
+        );
+        assert_eq!(
+            queue
+                .dispatch_next_generation(GenerationDispatchMode::Enabled)
+                .await
+                .expect("later enabled scan"),
+            GenerationDispatchReceipt::Idle
+        );
+        assert_eq!(
+            queue
+                .read_job_by_source(&owner, source_outbox_id, JobKind::ConversationResponseV1)
+                .await,
+            Err(JobQueueError::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_dispatch_completion_is_atomic_idempotent_and_persistent() {
+        let directory = tempdir().expect("temporary directory");
+        let root = directory.path().join("stores");
+        let stores = StoreSet::open(&root).await.expect("stores open");
+        let clock = Arc::new(ManualClock::new(START));
+        let queue = queue_with_clock(&stores, &clock);
+        let owner = VerifiedAuthContext::synthetic(1);
+        let other_owner = VerifiedAuthContext::synthetic(2);
+        let conversation_id = ConversationId::new();
+        let append = ConversationRepository::new(&stores.conversation)
+            .append_user_event(
+                &owner,
+                AppendUserEvent {
+                    conversation_id,
+                    expected_revision: None,
+                    idempotency_key: IdempotencyKey::new(),
+                    content: "exact source prompt".to_owned(),
+                },
+            )
+            .await
+            .expect("source append");
+        clock.set(
+            u64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("current time")
+                    .as_micros(),
+            )
+            .expect("bounded current time"),
+        );
+
+        let dispatched = queue
+            .dispatch_next_generation(GenerationDispatchMode::Enabled)
+            .await
+            .expect("generation dispatch");
+        let job = match dispatched {
+            GenerationDispatchReceipt::Advanced {
+                source_outbox_id,
+                job: Some(job),
+            } => {
+                assert_eq!(source_outbox_id, append.outbox.id());
+                job
+            }
+            other => panic!("expected dispatched job, got {other:?}"),
+        };
+        assert_eq!(
+            queue
+                .dispatch_next_generation(GenerationDispatchMode::Enabled)
+                .await
+                .expect("scanner tail"),
+            GenerationDispatchReceipt::Idle
+        );
+        let summaries = queue
+            .read_generation_jobs(&owner, conversation_id)
+            .await
+            .expect("owner summaries");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].job().id(), job.id());
+        assert_eq!(summaries[0].source_event_id(), append.event.id());
+        assert!(
+            queue
+                .read_generation_jobs(&other_owner, conversation_id)
+                .await
+                .expect("foreign summaries are empty")
+                .is_empty()
+        );
+
+        let lease = claim_lease(&queue).await;
+        let running = queue
+            .dispatcher()
+            .mark_running(&lease)
+            .await
+            .expect("mark running");
+        let source = queue
+            .dispatcher()
+            .read_generation_source(&running)
+            .await
+            .expect("lease-bound source");
+        assert_eq!(source.conversation_id(), conversation_id);
+        assert_eq!(source.source_event_id(), append.event.id());
+        assert_eq!(source.content(), "exact source prompt");
+        let completion = GenerationCompletion {
+            output: "assistant response".to_owned(),
+            provider_backend_id: BackendId::try_new("llama.cpp").expect("backend id"),
+            runtime_build: RuntimeBuildId::try_new("test-build").expect("runtime build"),
+            runtime_sha256: Sha256Digest::of(b"runtime"),
+            model_revision: ArtifactRevision::try_new("test-model").expect("model revision"),
+            model_sha256: Sha256Digest::of(b"model"),
+            canonical_input_sha256: Sha256Digest::of(source.content().as_bytes()),
+            elapsed: Duration::from_millis(25),
+        };
+        clock.advance(SECOND);
+        let first = queue
+            .dispatcher()
+            .complete_generation(&running, completion.clone())
+            .await
+            .expect("atomic completion");
+        assert!(!first.replayed);
+        assert_eq!(first.job.state(), JobState::Succeeded);
+        let replay = queue
+            .dispatcher()
+            .complete_generation(&running, completion)
+            .await
+            .expect("completion replay");
+        assert!(replay.replayed);
+        assert_eq!(replay.assistant_event_id, first.assistant_event_id);
+        assert_eq!(replay.assistant_revision, first.assistant_revision);
+        crate::storage::job_records::test_generation_records_reject_mutation(
+            &stores.conversation,
+            owner.clone(),
+            first.assistant_event_id,
+        )
+        .await
+        .expect("generation ledger is immutable");
+
+        let timeline = ConversationRepository::new(&stores.conversation)
+            .read_timeline(&owner, conversation_id)
+            .await
+            .expect("terminal timeline");
+        assert_eq!(timeline.events().len(), 2);
+        assert_eq!(timeline.events()[0].kind(), ConversationEventKind::UserText);
+        assert_eq!(
+            timeline.events()[1].kind(),
+            ConversationEventKind::AssistantText
+        );
+        assert_eq!(timeline.events()[1].content(), "assistant response");
+        let events = queue
+            .read_event_page(&owner, JobEventCursor::START)
+            .await
+            .expect("enriched job events");
+        assert!(events.events().iter().all(|event| {
+            event.event().conversation_id() == conversation_id
+                && event.event().source_event_id() == append.event.id()
+        }));
+
+        drop(queue);
+        drop(stores);
+        let reopened = StoreSet::open(&root).await.expect("stores reopen");
+        let persisted = ConversationRepository::new(&reopened.conversation)
+            .read_timeline(&owner, conversation_id)
+            .await
+            .expect("persisted timeline");
+        assert_eq!(persisted.events().len(), 2);
+        assert_eq!(persisted.events()[1].content(), "assistant response");
     }
 
     #[tokio::test]
@@ -2096,6 +2458,58 @@ mod tests {
         let retried = claim_lease(&queue).await;
         assert_eq!(retried.job_id(), first_job.id());
         assert_eq!(retried.attempt_number(), 2);
+    }
+
+    #[tokio::test]
+    async fn cleanup_uncertainty_immediately_halts_the_queue_for_recovery() {
+        let directory = tempdir().expect("temporary directory");
+        let stores = StoreSet::open(directory.path().join("stores"))
+            .await
+            .expect("stores open");
+        let clock = Arc::new(ManualClock::new(START));
+        let queue = queue_with_clock(&stores, &clock);
+        let dispatcher = queue.dispatcher();
+        let owner = VerifiedAuthContext::synthetic(1);
+        let first_outbox = append_outbox(&stores, &owner, "cleanup uncertain").await;
+        let second_outbox = append_outbox(&stores, &owner, "blocked follower").await;
+        let first_job = queue
+            .enqueue(&owner, enqueue_command(first_outbox, JobEnqueueKey::new()))
+            .await
+            .expect("enqueue first")
+            .job;
+        let second_job = queue
+            .enqueue(&owner, enqueue_command(second_outbox, JobEnqueueKey::new()))
+            .await
+            .expect("enqueue second")
+            .job;
+        let lease = claim_lease(&queue).await;
+        let running = dispatcher.mark_running(&lease).await.expect("mark running");
+
+        let ticket = dispatcher
+            .mark_cleanup_uncertain(&running)
+            .await
+            .expect("mark cleanup uncertainty");
+        assert_eq!(ticket.job_id(), first_job.id());
+        assert_eq!(
+            queue
+                .read_job(&owner, first_job.id())
+                .await
+                .expect("recovery job")
+                .state(),
+            JobState::RecoveryRequired
+        );
+        assert_eq!(
+            queue
+                .read_job(&owner, second_job.id())
+                .await
+                .expect("blocked follower")
+                .state(),
+            JobState::Queued
+        );
+        assert_eq!(
+            dispatcher.claim_next().await.expect("queue remains halted"),
+            ClaimResult::RecoveryRequired(ticket)
+        );
     }
 
     #[tokio::test]

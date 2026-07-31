@@ -1,6 +1,6 @@
 # POV-012 Loopback LLM Text Round Trip
 
-Status: Planned
+Status: Completed — 2026-07-31
 
 Type: Delivery
 
@@ -44,15 +44,46 @@ stored user event에서 job을 만들고, loopback-only LLM provider를 호출�
 
 ## Verification
 
-- fake-provider round-trip tests
-- loopback binding and direct-access negative check
-- crash, timeout, cancel, restart and duplicate retry tests
-- offline local Web Chat smoke
-- actual repository validation commands and `git diff --check`
+- deterministic fake-provider가 authenticated round trip, unauthorized `401`, health/model
+  identity, restart, port collision, artifact mismatch, crash, timeout, cancel과 confirmed
+  process-group absence를 검증합니다.
+- Core persistence tests가 migration cursor, disabled-mode skip, scanner recovery, duplicate
+  enqueue/result replay, atomic assistant completion, reopen persistence, owner isolation,
+  immutable provenance와 `cleanup_uncertain` recovery halt를 검증합니다.
+- Web component/SSE tests가 저장 receipt와 generation 상태 분리, reconnect cursor,
+  authoritative terminal readback, cancel idempotency, malformed linkage 거부와
+  unavailable/timeout/crash/cancel/recovery UX를 검증합니다.
+- 현재 macOS의 명시적으로 pin한 Gemma GGUF narrow candidate와 llama.cpp runtime으로 source
+  저장부터 authenticated inference, assistant/provenance append, reasoning-off output,
+  unauthenticated inference 거부와 clean provider shutdown까지 자동화된 왕복을 통과했습니다.
+  이 증거는 release default, 품질 gate 또는 installed-browser production activation이 아닙니다.
+- frontend format/lint/typecheck/test/build, Rust format/locked workspace check/test,
+  KDF-serialized workspace test, `git diff --check`와 relative Markdown link check를
+  completion baseline으로 사용합니다.
+
+## Implementation Evidence
+
+- Conversation migration `0006`은 기존 outbox 최대 sequence에서 generation cursor를
+  시작하고 immutable generation result provenance를 추가합니다. 기존 migration은 변경하지
+  않았습니다.
+- background scanner와 single-slot worker는 요청 경로 enqueue 손실을 복구하고, generation
+  disabled 동안 cursor만 전진시켜 나중에 과거 기록을 backfill하지 않습니다.
+- provider 성공은 assistant event, provenance, job/attempt 성공을 한 SQLite transaction에
+  commit하며 같은 result key replay는 새 assistant event를 만들지 않습니다.
+- provider는 canonical absolute artifact와 SHA-256을 실행 직전에 확인하고 exact
+  `127.0.0.1`, single slot, 8K context, reasoning/tools/cache off, ephemeral API key로만
+  lazy-start합니다. browser와 Axum은 inference port를 route하지 않습니다.
+- same-origin timeline/append는 owner-scoped generation summary를 반환하고 SSE는
+  conversation/source linkage를 포함합니다. cancellation은 exact job revision과 UUID v4
+  idempotency key를 기존 durable queue contract로 처리합니다.
 
 ## Rollback
 
 generation capability를 비활성화해도 login, text capture, timeline과 durable job status는 계속 동작해야 합니다.
+
+필수 LLM 환경변수를 모두 제거하면 capture-only disabled mode가 되고, 일부만 있거나 artifact
+검증이 실패하면 HTTP와 text capture는 유지한 채 generation job이 `provider_unavailable`로
+종료됩니다. Schema rollback은 migration `0006` 적용 전 backup 복원으로만 수행합니다.
 
 ## Links
 

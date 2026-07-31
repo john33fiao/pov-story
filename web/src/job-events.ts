@@ -2,6 +2,8 @@ export type JobStatusEvent = {
   cursor: string
   event_id: string
   job_id: string
+  conversation_id: string
+  source_event_id: string
   job_revision: number
   kind: string
   state: string
@@ -49,6 +51,27 @@ const MAX_CURSOR = BigInt('9223372036854775807')
 const STREAM_BACKOFF_MS = [250, 500, 1000, 2000, 5000] as const
 const POLL_INTERVAL_MS = 1000
 const REFRESH_LEAD_MS = 5000
+const UUID_V4 =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const JOB_STATES = new Set([
+  'queued',
+  'leased',
+  'running',
+  'cancel_requested',
+  'retry_scheduled',
+  'waiting_confirmation',
+  'recovery_required',
+  'succeeded',
+  'failed',
+  'cancelled',
+])
+const JOB_FAILURES = new Set([
+  'provider_unavailable',
+  'timeout',
+  'execution_failed',
+  'lease_expired',
+  'cleanup_uncertain',
+])
 
 export function clearJobEventCursor() {
   window.sessionStorage.removeItem(CURSOR_STORAGE_KEY)
@@ -235,11 +258,56 @@ function parseJobStatusEvent(value: unknown): JobStatusEvent {
     typeof value !== 'object' ||
     value === null ||
     !('cursor' in value) ||
-    !isCanonicalCursor(value.cursor)
+    !isCanonicalCursor(value.cursor) ||
+    !('event_id' in value) ||
+    typeof value.event_id !== 'string' ||
+    !UUID_V4.test(value.event_id) ||
+    !('job_id' in value) ||
+    typeof value.job_id !== 'string' ||
+    !UUID_V4.test(value.job_id) ||
+    !('conversation_id' in value) ||
+    typeof value.conversation_id !== 'string' ||
+    !UUID_V4.test(value.conversation_id) ||
+    !('source_event_id' in value) ||
+    typeof value.source_event_id !== 'string' ||
+    !UUID_V4.test(value.source_event_id) ||
+    !('job_revision' in value) ||
+    typeof value.job_revision !== 'number' ||
+    !Number.isSafeInteger(value.job_revision) ||
+    value.job_revision < 1 ||
+    !('kind' in value) ||
+    typeof value.kind !== 'string' ||
+    !('state' in value) ||
+    typeof value.state !== 'string' ||
+    !JOB_STATES.has(value.state) ||
+    !('attempt_id' in value) ||
+    !(
+      value.attempt_id === null ||
+      (typeof value.attempt_id === 'string' && UUID_V4.test(value.attempt_id))
+    ) ||
+    !('happened_at_micros' in value) ||
+    !isCanonicalCursor(value.happened_at_micros) ||
+    !('queue_wait_micros' in value) ||
+    !isNullableCanonicalCursor(value.queue_wait_micros) ||
+    !('execution_micros' in value) ||
+    !isNullableCanonicalCursor(value.execution_micros) ||
+    !('failure_kind' in value) ||
+    !(
+      value.failure_kind === null ||
+      (typeof value.failure_kind === 'string' &&
+        JOB_FAILURES.has(value.failure_kind))
+    ) ||
+    !('correlation_id' in value) ||
+    typeof value.correlation_id !== 'string' ||
+    !UUID_V4.test(value.correlation_id)
   ) {
     throw new Error('invalid job status event')
   }
   return value as JobStatusEvent
+}
+
+function isNullableCanonicalCursor(value: unknown) {
+  return value === null || isCanonicalCursor(value)
 }
 
 function parseJobEventPage(value: unknown): JobEventPage {

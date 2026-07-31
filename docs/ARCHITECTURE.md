@@ -2,7 +2,7 @@
 
 Status: baseline for current lifelogging implementation
 
-Last reviewed: 2026-07-29
+Last reviewed: 2026-07-31
 
 ## Product Boundary
 
@@ -77,6 +77,13 @@ Cloudflare는 외부 ingress만 담당합니다. local path는 Cloudflare와 인
 - 새 append는 `BEGIN IMMEDIATE`에서 conversation revision CAS, immutable event, owner-scoped idempotency mapping, content-free audit와 content를 복제하지 않는 outbox pointer를 함께 commit합니다. event source revision은 immutable `1`, conversation ordinal은 별도 revision입니다. 성공은 commit 뒤 owner-scoped joined readback이 exact content 재해시, fingerprint, correlation, event/outbox/audit 1:1 관계와 `current_revision >= event ordinal`을 검증한 뒤에만 반환합니다. 따라서 commit과 readback 사이에 다음 revision이 commit되어도 첫 성공을 corruption으로 오인하지 않습니다. commit 뒤 response loss는 같은 key retry로 복구하고 rollback/commit state가 불명확한 connection은 autocommit 복구 전까지 재사용하지 않으며 복구 불확실성에는 queued report/backup을 포함한 store operation을 poison합니다. POV-010 delivery는 owner-scoped list/timeline read와 append를 `pov-api`에 wiring하고 production `VerifiedAuthContext`를 `AuthRuntime::verify_access`에서만 전달합니다. Repository acceptance fixture만 synthetic owner를 사용합니다.
 - Conversation migration `0003`과 typed queue repository/internal dispatcher surface는 immutable outbox row를 owner-scoped source pointer로 사용합니다. enqueue fingerprint와 ledger는 동일 retry를 같은 job으로 복구하고 다른 request 또는 같은 `(owner, outbox, kind)`의 중복 생성을 거부하며, exact owner/outbox/kind lookup은 enqueue key를 잃은 response-loss 복구 경로를 제공합니다. cancel/resume도 별도 typed mutation key와 immutable fingerprint ledger로 같은 결과를 replay합니다. 현재 policy는 `conversation_response_v1`, fixed normal priority와 durable enqueue sequence FIFO 하나이며 caller가 priority, timeout 또는 retry policy를 주입하지 않습니다.
 - durable queue singleton은 generation과 opaque lease token으로 system-wide active attempt를 fence하고 `leased`와 `running`을 구분합니다. job, attempt, cancellation, retry schedule, queue wait, execution duration과 content-free status event는 한 Conversation transaction에서 전이합니다. 입력 대기 상태는 다음 attempt budget이 남은 경우에만 attempt를 끝내고 슬롯을 반납하며, 마지막 attempt의 `waiting_confirmation`은 adapter와 SQL trigger가 함께 거부합니다. `finish` response loss는 같은 held capability와 outcome으로 committed result를 readback하고 stale capability는 mutation 없이 거부합니다. 반면 유실된 claim capability는 재구성하지 않으며 시작되지 않은 lease가 정확한 만료 시각까지 슬롯을 점유하고 attempt 하나를 소비한 뒤 retry 또는 terminal policy로 진행합니다. DB의 마지막 관측 wall-clock보다 뒤인 admission/mutation은 `ClockRegression`으로 fail closed하고 reads는 유지하며, 시간이 그 floor를 따라잡을 때만 재개되고 reset 경로는 없습니다.
+- Conversation forward migration `0006`은 적용 시점의 outbox 최대 sequence를 generation
+  cursor로 고정해 과거 source를 소급 생성하지 않습니다. capture-only mode도 새 outbox를
+  처리하지 않고 cursor만 전진시킵니다. enabled scanner는 요청 경로 enqueue 손실을 복구하며
+  `(owner, outbox, conversation_response_v1)`당 job 하나만 보존합니다. provider 성공은 source와
+  assistant event, job/attempt, backend/runtime/model revision과 SHA-256, canonical input/output
+  SHA-256 및 monotonic elapsed를 잇는 immutable result와 queue success를 하나의 Conversation
+  transaction에 commit합니다. result key replay는 같은 assistant event/readback으로 수렴합니다.
 - Conversation migration `0004`는 ADR-0004 local auth control plane을 exact `uninitialized` singleton에서 시작합니다. Account/credential/throttle/login-control은 한 owner만 허용하고, fixed one-hour marker와 version-bound outcome, profile별 8 active session, exact local/remote refresh deadline, generation `0..8191`, one-active-token family와 append-only audit를 SQL constraint와 trigger로 방어합니다. Append-only migration `0005`는 throttle row를 0에서 시작하게 하고 실패 횟수별 exact exponential/capped deadline, failure admission boundary, count 100 bound, password terminal state와 recovery 100 saturation을 강제하며 invalid legacy deadline/count에서는 migration 전체를 rollback합니다. Immutable row는 `INSERT OR REPLACE`로 교체할 수 없고 terminal refresh cleanup은 session delete에서 family/token으로 cascade합니다. Schema 자체는 listener나 production owner context를 활성화하지 않으며, 아래 key lifecycle, auth repository, JWT/session verifier와 fail-closed startup이 이를 소비합니다.
 - Unix auth instance primitive는 final instance root와 exact `stores/`, `secrets/` directory를 effective UID 소유 `0700`으로만 채택하고 기존 unsafe path를 chmod/chown하거나 symlink를 따라가지 않습니다. 새 root/child는 pinned parent descriptor 기준으로 만들고 parent/root basename 결합과 root/store/secret descriptor의 type, owner, mode, device/inode identity 및 close-on-exec를 lock 전후에 재검증합니다. `secrets/auth-maintenance.lock`은 persistent empty regular file 하나이며 owner-only `0600`, link count 1, no-follow, close-on-exec와 nonblocking exclusive OS lock을 강제합니다. 경쟁 process는 mutation 전에 실패하고 holder crash는 kernel unlock으로 복구되며 exec child는 lock descriptor를 상속하지 않습니다. Layout을 소비해 얻는 locked capability는 open 때 포착한 Conversation DB parent identity가 pinned `stores/` descriptor와 일치할 때만 유지보수 context로 전환되고, exact borrowed store를 explicit revalidation에 고정합니다. Cross-instance store와 같은 DB inode를 옮겨 둔 replacement directory를 거부하며 context가 살아 있는 동안 lock을 보존합니다. Actor admission은 이 context를 Storage만 mint하는 non-Clone binding으로 바꾸고, bounded mailbox를 `blocking_recv`하는 전용 OS thread 하나가 binding과 lock을 함께 소유합니다.
 - Typed read-only initialization reconciliation은 held-lock FD와 path identity를 포함한 context 재검증 뒤 bounded raw-basename secret snapshot A와 zeroizing metadata decode를 유지하며 exact bound store의 fresh read-only/private-cache typed initialization lifecycle/source observation A, retained filesystem B, 별도 typed observation B equality와 final filesystem revalidation을 순서대로 수행합니다. Clean DB snapshot은 current migration history와 exact 12-table auth manifest, canonical `uninitialized` singleton, 나머지 auth row와 `auth_audit` sequence residue 부재를 확인합니다. Canonical `initializing` revision/version `1` 또는 `active` revision `2` source는 account/password/recovery 각 1, two throttle, login-control, sole `auth_initialized` audit, marker/outcome/session/family/token 0개와 동일 owner/source timestamp/revision/state/null shape 및 independent verifier salt를 검증하며 `sqlite_sequence`는 `auth_audit` integer `1`에만 scoped합니다. Exact `uninitialized` filesystem은 clean과 여섯 pre-source phase로, metadata와 exact-match하는 sentinel 또는 legacy source 및 intact prepared reservation은 install-temp/active-key/final-lifecycle의 forward-only phase로 분류합니다. Final lifecycle CAS 뒤 exact active key와 intact transition reservation은 `AwaitingCleanupRename`이고, atomic rename 뒤 matching cleanup namespace는 deletion-only `AwaitingCleanupStagedRemoval|AwaitingCleanupPreparedRemoval|AwaitingCleanupMetadataRemoval|AwaitingCleanupDirectoryRemoval`로 재개합니다. Exact active revision `2`/keyring version `1`, canonical active key와 lock+active-key-only namespace는 `InitializationComplete`이지만 metadata가 이미 제거됐으므로 active lifecycle/KID/version/key/namespace만 확인하는 terminal protocol state이지 metadata-backed full mutable-source proof나 listener readiness가 아닙니다. Exact `no-blocklist-check-v1` sentinel의 linked complete pre-source만 resume-or-rollback candidate이고 모든 legacy pre-source는 rollback-only이며 exact legacy post-source는 rewrite 없이 forward-only입니다. Canonical metadata/DB provenance mismatch, unknown/noncanonical artifact, active+temp, mismatched cleanup과 unsupported lifecycle은 evidence를 보존한 blocked result이고 seed shape 손상, malformed lifecycle, unsafe artifact, typed initialization observation A/B 또는 final filesystem drift와 schema/identity/rollback/close 불확실성은 store와 actor를 poison합니다. Unsupported `Active|Transitioning`은 lifecycle facts만 비교한 뒤 block하며 그 state의 mutable auth row를 whole-DB snapshot으로 비교하지 않습니다. 기존 clean API는 `CleanUninitialized`만 `Clean`으로 map합니다.
@@ -122,14 +129,24 @@ Cloudflare는 외부 ingress만 담당합니다. local path는 Cloudflare와 인
 - generation과 embedding은 장기 실행 loopback `llama-server`
 - `ffprobe`, `ffmpeg`와 platform-selected Whisper adapter는 작업별 child process
 - core provider port는 backend/runtime build/artifact revision과 actual artifact/input byte SHA-256, monotonic elapsed를 결과 provenance로 보존하며 deterministic synthetic fake로 model-independent contract test를 제공합니다.
-- long-running provider endpoint contract는 assigned exact IPv4 `127.0.0.1`만 허용합니다. provider port를 Axum, LAN 또는 Tunnel route로 직접 공개하지 않으며 실제 readiness identity와 restart lifecycle은 POV-012에서 구현합니다.
+- long-running generation provider는 첫 job에서 canonical executable/model과 actual SHA-256을
+  다시 확인한 뒤 exact IPv4 `127.0.0.1`, single slot, 8K context, reasoning/tools/prompt-cache
+  off와 매 실행 ephemeral API key로 lazy-start합니다. Health와 exact single model identity가
+  일치해야 readiness가 되고 port collision이나 foreign identity는 채택하지 않습니다.
+  provider port를 Axum, browser, LAN 또는 Tunnel route로 직접 공개하지 않습니다.
 - one-shot process는 typed registry의 pinned native executable과 fixed argument array만 사용하고 runtime request에는 path, cwd, environment 또는 stdio 선택을 노출하지 않음
 - cleared environment, owner-only attempt, bounded dual-pipe drain, timeout/cancellation, final process-group kill/absence, exit status와 executable hash를 typed report로 기록
-- process-local permit은 live runtime의 child 실행 겹침을 막습니다. POV-009에서 완료된 Conversation DB queue persistence가 crash-recoverable FIFO, fenced lease와 durable system-wide admission state를 보존하지만, 이 state를 `ProcessSupervisor` 또는 provider와 연결해 계속 실행하는 runtime loop는 POV-011~012 통합 전까지 없습니다.
-- worker는 source DB에 직접 연결하지 않음
+- POV-012 background worker는 Conversation DB scanner와 fenced single-slot dispatcher를 long-running
+  provider에 연결합니다. lease renew와 cancel을 polling하고 crash/timeout/unavailable을 durable
+  retry/terminal state로 기록합니다. cancel, timeout 또는 crash 뒤 process-group absence를 확인한
+  뒤에만 다음 실행을 허용하며 확인할 수 없으면 `cleanup_uncertain`/`recovery_required`로 전체
+  queue를 중단합니다. graceful shutdown은 worker/provider join 뒤 store를 닫습니다.
+- worker는 typed queue/source repository만 사용하고 request payload나 model output에서 owner
+  authority를 만들지 않습니다.
 
-Gemma 4 E2B, KURE-v1과 platform별 Whisper multilingual runtime/model은 benchmark 대상인
-versioned MVP 후보입니다. Windows의 Python OpenAI Whisper `large-v3-turbo.pt` 경로는
+Gemma GGUF, KURE-v1과 platform별 Whisper multilingual runtime/model은 benchmark 대상인
+versioned narrow 후보입니다. POV-012 actual-model 왕복은 한 Gemma 후보의 protocol/runtime
+compatibility만 증명하며 release default나 품질 gate를 결정하지 않습니다. Windows의 Python OpenAI Whisper `large-v3-turbo.pt` 경로는
 POV-033이 검증할 compatibility 후보이며, 품질·메모리·latency gate 전에는 release
 invariant가 아닙니다.
 

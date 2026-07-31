@@ -366,6 +366,23 @@ p {
   white-space: pre-wrap;
 }
 
+.generation-status {
+  display: flex;
+  width: min(100%, 42rem);
+  padding: 0.55rem 0.8rem;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  border-left: 2px solid #5d9b76;
+  color: #9fbaaa;
+  font-size: 0.78rem;
+}
+
+.generation-status .quiet-button {
+  min-height: 2rem;
+  flex: 0 0 auto;
+}
+
 .event-meta {
   color: #82a08f;
   font-size: 0.72rem;

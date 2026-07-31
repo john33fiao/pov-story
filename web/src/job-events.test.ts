@@ -19,6 +19,8 @@ function event(cursor: string): JobStatusEvent {
     cursor,
     event_id: '11111111-1111-4111-8111-111111111111',
     job_id: '22222222-2222-4222-8222-222222222222',
+    conversation_id: '44444444-4444-4444-8444-444444444444',
+    source_event_id: '55555555-5555-4555-8555-555555555555',
     job_revision: Number(cursor),
     kind: 'succeeded',
     state: 'succeeded',
@@ -143,6 +145,27 @@ describe('job event streaming client', () => {
     vi.stubGlobal(
       'fetch',
       vi.fn().mockResolvedValue(new Response(streamFrom([mismatched]))),
+    )
+
+    await runJobEventFeed(options)
+
+    expect(options.onEvent).not.toHaveBeenCalled()
+    expect(options.onError).toHaveBeenCalled()
+    expect(readJobEventCursor()).toBe('0')
+  })
+
+  it('rejects status events without owner-scoped conversation linkage', async () => {
+    const controller = new AbortController()
+    const options = feedOptions(controller.signal)
+    options.onState.mockImplementation((state) => {
+      if (state === 'reconnecting') controller.abort()
+    })
+    const malformed = event('17') as Partial<JobStatusEvent>
+    delete malformed.conversation_id
+    const frame = `event: job_status\nid: 17\ndata: ${JSON.stringify(malformed)}\n\n`
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(new Response(streamFrom([frame]))),
     )
 
     await runJobEventFeed(options)

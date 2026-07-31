@@ -1656,7 +1656,7 @@ struct Migration {
     sql: &'static str,
 }
 
-const CONVERSATION_MIGRATIONS: [Migration; 5] = [
+const CONVERSATION_MIGRATIONS: [Migration; 6] = [
     Migration {
         version: 1,
         name: "store-contract",
@@ -1681,6 +1681,11 @@ const CONVERSATION_MIGRATIONS: [Migration; 5] = [
         version: 5,
         name: "auth-throttle-bounds",
         sql: include_str!("../migrations/sqlite/conversation/0005_auth_throttle_bounds.sql"),
+    },
+    Migration {
+        version: 6,
+        name: "loopback-llm-round-trip",
+        sql: include_str!("../migrations/sqlite/conversation/0006_loopback_llm_round_trip.sql"),
     },
 ];
 const KNOWLEDGE_MIGRATIONS: [Migration; 1] = [Migration {
@@ -2907,6 +2912,74 @@ mod tests {
         )
     }
 
+    #[test]
+    fn generation_migration_starts_after_existing_outbox_records() {
+        let connection = RawConnection::open_in_memory().expect("in-memory SQLite");
+        connection
+            .execute_batch(super::CONVERSATION_MIGRATIONS[0].sql)
+            .expect("store contract migration");
+        connection
+            .execute_batch(super::CONVERSATION_MIGRATIONS[1].sql)
+            .expect("conversation migration");
+        connection
+            .execute_batch(
+                "INSERT INTO conversations(
+                    owner_id, conversation_id, current_revision,
+                    created_at_micros, updated_at_micros
+                 ) VALUES (
+                    X'11111111111141118111111111111111',
+                    X'22222222222242228222222222222222', 1, 1, 1
+                 );
+                 INSERT INTO conversation_events(
+                    owner_id, event_id, conversation_id, conversation_revision,
+                    event_kind, content, content_bytes, content_sha256,
+                    correlation_id, created_at_micros
+                 ) VALUES (
+                    X'11111111111141118111111111111111',
+                    X'33333333333343338333333333333333',
+                    X'22222222222242228222222222222222', 1,
+                    'user_text', 'old', 3, zeroblob(32),
+                    X'44444444444444448444444444444444', 1
+                 );
+                 INSERT INTO conversation_outbox(
+                    owner_id, outbox_id, event_id, conversation_id,
+                    conversation_revision, source_revision, event_kind,
+                    topic, content_sha256, correlation_id, created_at_micros
+                 ) VALUES (
+                    X'11111111111141118111111111111111',
+                    X'55555555555545558555555555555555',
+                    X'33333333333343338333333333333333',
+                    X'22222222222242228222222222222222',
+                    1, 1, 'user_text', 'conversation.user-appended.v1',
+                    zeroblob(32), X'44444444444444448444444444444444', 1
+                 );",
+            )
+            .expect("pre-migration outbox record");
+        for migration in &super::CONVERSATION_MIGRATIONS[2..] {
+            connection
+                .execute_batch(migration.sql)
+                .expect("later conversation migration");
+        }
+        let cursor: i64 = connection
+            .query_row(
+                "SELECT last_outbox_sequence
+                 FROM conversation_generation_dispatch_control
+                 WHERE control_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("generation cursor");
+        let maximum: i64 = connection
+            .query_row(
+                "SELECT max(dispatch_sequence) FROM conversation_outbox",
+                [],
+                |row| row.get(0),
+            )
+            .expect("outbox maximum");
+        assert_eq!(cursor, maximum);
+        assert_eq!(cursor, 1);
+    }
+
     async fn worker_thread<S: super::StoreBoundary>(store: &SqliteStore<S>) -> ThreadId {
         store
             .connection
@@ -3362,7 +3435,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec![1, 2, 3, 4, 5]
+            vec![1, 2, 3, 4, 5, 6]
         );
         assert!(!marker.exists());
         store.close().await.expect("recovered store closes");
@@ -3392,6 +3465,7 @@ mod tests {
                 (3, "durable-job-queue"),
                 (4, "local-auth-control-plane"),
                 (5, "auth-throttle-bounds"),
+                (6, "loopback-llm-round-trip"),
             ]
         );
 

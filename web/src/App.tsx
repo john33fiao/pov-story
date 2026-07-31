@@ -1,8 +1,16 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+} from 'react'
 
 import {
   ApiError,
   appendUserEvent,
+  cancelGenerationJob,
   listConversations,
   login,
   logout,
@@ -10,12 +18,14 @@ import {
   refreshSession,
   type ConversationSummary,
   type ConversationTimeline,
+  type GenerationJob,
   type Session,
 } from './api.ts'
 import {
   clearJobEventCursor,
   runJobEventFeed,
   type JobEventConnectionState,
+  type JobStatusEvent,
 } from './job-events.ts'
 
 type Phase = 'booting' | 'anonymous' | 'authenticated'
@@ -62,6 +72,50 @@ function shortId(value: string) {
   return value.slice(0, 8)
 }
 
+function generationStatus(job: GenerationJob) {
+  if (job.state === 'succeeded') return '로컬 응답이 완료되었습니다.'
+  if (job.state === 'cancelled') return '로컬 응답 생성을 취소했습니다.'
+  if (job.state === 'recovery_required') {
+    return 'provider 종료를 확인해야 합니다. 생성 queue를 중단했습니다.'
+  }
+  if (job.state === 'failed') {
+    switch (job.failure_kind) {
+      case 'provider_unavailable':
+        return '로컬 모델을 사용할 수 없어 응답을 만들지 못했습니다.'
+      case 'timeout':
+        return '로컬 응답 시간이 초과되었습니다.'
+      case 'execution_failed':
+        return '로컬 provider가 중단되어 응답을 만들지 못했습니다.'
+      case 'cleanup_uncertain':
+        return 'provider 종료 여부를 확인하지 못했습니다.'
+      default:
+        return '로컬 응답 생성에 실패했습니다.'
+    }
+  }
+  if (job.state === 'retry_scheduled') {
+    switch (job.failure_kind) {
+      case 'provider_unavailable':
+        return '로컬 모델을 기다린 뒤 다시 시도합니다.'
+      case 'timeout':
+        return '응답 시간이 초과되어 다시 시도합니다.'
+      case 'execution_failed':
+        return 'provider가 중단되어 다시 시작합니다.'
+      default:
+        return '로컬 응답을 다시 시도합니다.'
+    }
+  }
+  if (job.state === 'cancel_requested') return '로컬 응답을 취소하고 있습니다.'
+  if (job.state === 'running') return '로컬 모델이 응답을 만들고 있습니다.'
+  if (job.state === 'leased') return '로컬 응답 작업을 시작하고 있습니다.'
+  return '기록은 저장됐고 로컬 응답을 기다리고 있습니다.'
+}
+
+function jobIsCancellable(job: GenerationJob) {
+  return !['succeeded', 'failed', 'cancelled', 'recovery_required'].includes(
+    job.state,
+  )
+}
+
 export default function App() {
   const [phase, setPhase] = useState<Phase>('booting')
   const [loginId, setLoginId] = useState('')
@@ -74,6 +128,7 @@ export default function App() {
   const [connectionStatus, setConnectionStatus] = useState('상태 연결 준비 중')
   const [busy, setBusy] = useState(false)
   const accessToken = useRef('')
+  const timelineRef = useRef<ConversationTimeline | undefined>(undefined)
   const sessionRef = useRef<Session | undefined>(undefined)
   const refreshInFlight = useRef<Promise<Session> | undefined>(undefined)
 
@@ -154,6 +209,50 @@ export default function App() {
   }, [withAccess])
 
   useEffect(() => {
+    timelineRef.current = timeline
+  }, [timeline])
+
+  const applyJobEvent = useCallback(
+    (event: JobStatusEvent) => {
+      if (timelineRef.current?.conversation_id !== event.conversation_id) return
+      setTimeline((current) => {
+        if (!current || current.conversation_id !== event.conversation_id) {
+          return current
+        }
+        return {
+          ...current,
+          generation_jobs: current.generation_jobs.map((job) =>
+            job.job_id === event.job_id
+              ? {
+                  ...job,
+                  state: event.state as GenerationJob['state'],
+                  revision: event.job_revision,
+                  failure_kind:
+                    event.failure_kind as GenerationJob['failure_kind'],
+                }
+              : job,
+          ),
+        }
+      })
+      if (event.state === 'succeeded') {
+        void withAccess((token) =>
+          readConversation(token, event.conversation_id),
+        )
+          .then((authoritative) => {
+            if (
+              timelineRef.current?.conversation_id === event.conversation_id
+            ) {
+              setTimeline(authoritative)
+              setStatus('로컬 응답을 authoritative timeline에서 확인했습니다.')
+            }
+          })
+          .catch((readError) => setError(messageFor(readError)))
+      }
+    },
+    [withAccess],
+  )
+
+  useEffect(() => {
     if (phase !== 'authenticated') return
     let active = true
     void loadConversations()
@@ -192,7 +291,7 @@ export default function App() {
       },
       refreshSession: refreshAccess,
       onAuthenticationLost: endSession,
-      onEvent: () => {},
+      onEvent: applyJobEvent,
       onState: (nextState) => setConnectionStatus(stateText[nextState]),
       onError: (message) => setConnectionStatus(message),
     }).catch(() => {
@@ -203,7 +302,7 @@ export default function App() {
     return () => {
       controller.abort()
     }
-  }, [endSession, phase, refreshAccess])
+  }, [applyJobEvent, endSession, phase, refreshAccess])
 
   async function handleLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -261,7 +360,12 @@ export default function App() {
 
   function startConversation() {
     const conversationId = crypto.randomUUID()
-    setTimeline({ conversation_id: conversationId, revision: 0, events: [] })
+    setTimeline({
+      conversation_id: conversationId,
+      revision: 0,
+      events: [],
+      generation_jobs: [],
+    })
     setDraft('')
     setError('')
     setStatus('새 기록입니다. 첫 문장을 남겨 보세요.')
@@ -294,12 +398,42 @@ export default function App() {
       setTimeline(updated)
       setDraft('')
       await loadConversations()
-      setStatus(`리비전 ${updated.revision}까지 안전하게 기록했습니다.`)
+      const latestJob = updated.generation_jobs.at(-1)
+      setStatus(
+        latestJob
+          ? `리비전 ${updated.revision}까지 저장했습니다. ${generationStatus(latestJob)}`
+          : `리비전 ${updated.revision}까지 안전하게 기록했습니다. 응답 생성은 비활성 상태입니다.`,
+      )
     } catch (appendError) {
       setError(messageFor(appendError))
       setStatus('기록을 저장하지 못했습니다.')
     } finally {
       setBusy(false)
+    }
+  }
+
+  async function handleCancel(job: GenerationJob) {
+    setError('')
+    const idempotencyKey = crypto.randomUUID()
+    try {
+      const cancelled = await withAccess((token) =>
+        cancelGenerationJob(token, job.job_id, job.revision, idempotencyKey),
+      )
+      setTimeline((current) =>
+        current
+          ? {
+              ...current,
+              generation_jobs: current.generation_jobs.map((candidate) =>
+                candidate.job_id === job.job_id
+                  ? { ...candidate, ...cancelled.job }
+                  : candidate,
+              ),
+            }
+          : current,
+      )
+      setStatus('로컬 응답 취소 요청을 저장했습니다.')
+    } catch (cancelError) {
+      setError(messageFor(cancelError))
     }
   }
 
@@ -471,17 +605,42 @@ export default function App() {
                   첫 문장이 이 기록의 시작점이 됩니다.
                 </p>
               ) : (
-                timeline.events.map((item) => (
-                  <article className="event-card" key={item.event_id}>
-                    <div className="event-meta">
-                      <span>
-                        {item.kind === 'user_text' ? '나의 기록' : item.kind}
-                      </span>
-                      <span>#{item.revision}</span>
-                    </div>
-                    <p>{item.content}</p>
-                  </article>
-                ))
+                timeline.events.map((item) => {
+                  const job = timeline.generation_jobs.find(
+                    (candidate) => candidate.source_event_id === item.event_id,
+                  )
+                  return (
+                    <Fragment key={item.event_id}>
+                      <article className="event-card">
+                        <div className="event-meta">
+                          <span>
+                            {item.kind === 'user_text'
+                              ? '나의 기록'
+                              : item.kind === 'assistant_text'
+                                ? '로컬 응답'
+                                : item.kind}
+                          </span>
+                          <span>#{item.revision}</span>
+                        </div>
+                        <p>{item.content}</p>
+                      </article>
+                      {job && (
+                        <aside className="generation-status" aria-live="polite">
+                          <span>{generationStatus(job)}</span>
+                          {jobIsCancellable(job) && (
+                            <button
+                              className="quiet-button"
+                              type="button"
+                              onClick={() => void handleCancel(job)}
+                            >
+                              응답 취소
+                            </button>
+                          )}
+                        </aside>
+                      )}
+                    </Fragment>
+                  )
+                })
               )}
             </div>
 

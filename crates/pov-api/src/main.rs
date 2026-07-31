@@ -4,10 +4,12 @@ use std::{error::Error, io, path::PathBuf};
 use std::{sync::Arc, time::SystemTime};
 
 #[cfg(unix)]
-use pov_api::{DEFAULT_BIND_ADDRESS, app_with_auth};
+use pov_api::{ApiGeneration, DEFAULT_BIND_ADDRESS, app_with_generation};
 #[cfg(unix)]
 use pov_core::{
     auth::{AuthRuntime, complete_operator_init, prepare_operator_init},
+    generation_worker::spawn_generation_worker,
+    loopback_llm::LoopbackLlmRuntime,
     storage::StoreSet,
 };
 #[cfg(unix)]
@@ -47,16 +49,49 @@ async fn serve(instance_root: PathBuf) -> Result<(), Box<dyn Error>> {
     let now_micros = current_time_micros()?;
     let runtime = Arc::new(AuthRuntime::open(&instance_root, stores.as_ref(), now_micros).await?);
     let listener = TcpListener::bind(DEFAULT_BIND_ADDRESS).await?;
-    axum::serve(
+    let generation_runtime = Arc::new(LoopbackLlmRuntime::from_environment(
+        instance_root.join("runtime").join("llm"),
+    ));
+    let (generation_signal, generation_worker) =
+        spawn_generation_worker(Arc::clone(&stores), Arc::clone(&generation_runtime));
+    let server_result = axum::serve(
         listener,
-        app_with_auth(Arc::clone(&runtime), Arc::clone(&stores)),
+        app_with_generation(
+            Arc::clone(&runtime),
+            Arc::clone(&stores),
+            ApiGeneration::new(Arc::clone(&generation_runtime), generation_signal),
+        ),
     )
-    .await?;
+    .with_graceful_shutdown(shutdown_signal())
+    .await;
+    let worker_result = generation_worker.shutdown().await;
+    server_result?;
+    worker_result?;
+    drop(generation_runtime);
     drop(runtime);
     let stores = Arc::try_unwrap(stores)
         .map_err(|_| io::Error::other("store references remain after server shutdown"))?;
     stores.close().await?;
     Ok(())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    let interrupt = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        () = interrupt => {}
+        () = terminate => {}
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]

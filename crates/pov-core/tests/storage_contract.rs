@@ -9,7 +9,7 @@ use tokio_rusqlite::rusqlite::{Connection as RawConnection, params};
 
 fn expected_migration_count(kind: StoreKind) -> usize {
     match kind {
-        StoreKind::Conversation => 5,
+        StoreKind::Conversation => 6,
         StoreKind::Knowledge | StoreKind::Calendar | StoreKind::Embedding => 1,
     }
 }

@@ -36,8 +36,14 @@ use pov_core::{
         AppendUserEvent, ConversationError, ConversationId, ConversationRepository,
         ConversationTimeline, IdempotencyKey, MAX_USER_EVENT_CONTENT_BYTES,
     },
+    generation_worker::GenerationWorkerSignal,
     identity::{Revision, VerifiedAuthContext},
-    job::{JobEventCursor, JobEventPage, JobQueueError, JobQueueRepository, SequencedJobEvent},
+    job::{
+        CancelJob, EnqueueJob, GenerationDispatchMode, GenerationJobSummary, JobEnqueueKey,
+        JobEventCursor, JobEventPage, JobId, JobKind, JobMutationKey, JobQueueError,
+        JobQueueRepository, JobSnapshot, SequencedJobEvent,
+    },
+    loopback_llm::LoopbackLlmRuntime,
     storage::StoreSet,
 };
 use rust_embed::Embed;
@@ -68,6 +74,8 @@ struct WebAssets;
 const MAX_AUTH_REQUEST_BYTES: usize = 4096;
 #[cfg(unix)]
 const MAX_CONVERSATION_REQUEST_BYTES: usize = MAX_USER_EVENT_CONTENT_BYTES + 4096;
+#[cfg(unix)]
+const MAX_JOB_MUTATION_REQUEST_BYTES: usize = 1024;
 #[cfg(unix)]
 const LOCAL_ORIGIN: &str = "http://127.0.0.1:8080";
 #[cfg(unix)]
@@ -102,11 +110,48 @@ pub fn app() -> Router {
 struct ApiState {
     runtime: Arc<AuthRuntime>,
     stores: Arc<StoreSet>,
+    generation: Option<ApiGeneration>,
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+pub struct ApiGeneration {
+    runtime: Arc<LoopbackLlmRuntime>,
+    signal: GenerationWorkerSignal,
+}
+
+#[cfg(unix)]
+impl ApiGeneration {
+    #[must_use]
+    pub const fn new(runtime: Arc<LoopbackLlmRuntime>, signal: GenerationWorkerSignal) -> Self {
+        Self { runtime, signal }
+    }
 }
 
 #[cfg(unix)]
 pub fn app_with_auth(runtime: Arc<AuthRuntime>, stores: Arc<StoreSet>) -> Router {
-    let state = ApiState { runtime, stores };
+    app_with_state(ApiState {
+        runtime,
+        stores,
+        generation: None,
+    })
+}
+
+#[cfg(unix)]
+pub fn app_with_generation(
+    runtime: Arc<AuthRuntime>,
+    stores: Arc<StoreSet>,
+    generation: ApiGeneration,
+) -> Router {
+    app_with_state(ApiState {
+        runtime,
+        stores,
+        generation: Some(generation),
+    })
+}
+
+#[cfg(unix)]
+fn app_with_state(state: ApiState) -> Router {
     let auth = Router::new()
         .route("/login", post(login))
         .route("/refresh", post(refresh))
@@ -125,7 +170,9 @@ pub fn app_with_auth(runtime: Arc<AuthRuntime>, stores: Arc<StoreSet>) -> Router
         .layer(DefaultBodyLimit::max(MAX_CONVERSATION_REQUEST_BYTES));
     let jobs = Router::new()
         .route("/jobs/events", get(poll_job_events))
-        .route("/jobs/events/stream", get(stream_job_events));
+        .route("/jobs/events/stream", get(stream_job_events))
+        .route("/jobs/{job_id}/cancel", post(cancel_job))
+        .layer(DefaultBodyLimit::max(MAX_JOB_MUTATION_REQUEST_BYTES));
     let api = Router::new()
         .route("/health", get(health))
         .nest("/auth", auth)
@@ -158,6 +205,12 @@ struct AppendEventPayload {
     idempotency_key: String,
     expected_revision: Option<u64>,
     content: String,
+}
+
+#[cfg(any(unix, test))]
+struct CancelJobPayload {
+    idempotency_key: String,
+    expected_revision: u64,
 }
 
 #[cfg(unix)]
@@ -349,6 +402,56 @@ impl<'de> Deserialize<'de> for AppendEventPayload {
         }
 
         deserializer.deserialize_map(AppendEventVisitor)
+    }
+}
+
+#[cfg(any(unix, test))]
+impl<'de> Deserialize<'de> for CancelJobPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CancelJobVisitor;
+
+        impl<'de> Visitor<'de> for CancelJobVisitor {
+            type Value = CancelJobPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an exact job cancellation object")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut key = None;
+                let mut expected = None;
+                while let Some(field) = map.next_key::<String>()? {
+                    match field.as_str() {
+                        "idempotency_key" if key.is_none() => {
+                            key = Some(map.next_value()?);
+                        }
+                        "expected_revision" if expected.is_none() => {
+                            expected = Some(map.next_value()?);
+                        }
+                        "idempotency_key" | "expected_revision" => {
+                            return Err(de::Error::duplicate_field("job cancellation field"));
+                        }
+                        _ => {
+                            return Err(de::Error::unknown_field("job cancellation field", &[]));
+                        }
+                    }
+                }
+                Ok(CancelJobPayload {
+                    idempotency_key: key
+                        .ok_or_else(|| de::Error::missing_field("idempotency_key"))?,
+                    expected_revision: expected
+                        .ok_or_else(|| de::Error::missing_field("expected_revision"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(CancelJobVisitor)
     }
 }
 
@@ -807,6 +910,8 @@ fn job_event_value(sequenced: &SequencedJobEvent) -> serde_json::Value {
         "cursor": sequenced.cursor().to_string(),
         "event_id": event.id().to_string(),
         "job_id": event.job_id().to_string(),
+        "conversation_id": event.conversation_id().to_string(),
+        "source_event_id": event.source_event_id().to_string(),
         "job_revision": event.job_revision().get(),
         "kind": event.kind().as_str(),
         "state": event.state().as_str(),
@@ -898,7 +1003,9 @@ async fn read_conversation(
     };
     let repository = ConversationRepository::new(&state.stores.conversation);
     match repository.read_timeline(&auth, conversation_id).await {
-        Ok(timeline) => conversation_timeline_response(&timeline),
+        Ok(timeline) => {
+            conversation_timeline_response(state.stores.as_ref(), &auth, &timeline).await
+        }
         Err(error) => conversation_error(error),
     }
 }
@@ -946,11 +1053,92 @@ async fn append_conversation_event(
         content: payload.content,
     };
     match repository.append_user_event(&auth, command).await {
-        Ok(_) => match repository.read_timeline(&auth, conversation_id).await {
-            Ok(timeline) => conversation_timeline_response(&timeline),
-            Err(error) => conversation_error(error),
-        },
+        Ok(receipt) => {
+            if let Some(generation) = &state.generation {
+                if generation.runtime.mode().dispatch_mode() == GenerationDispatchMode::Enabled {
+                    let queue = JobQueueRepository::new(&state.stores.conversation);
+                    let _ = queue
+                        .enqueue(
+                            &auth,
+                            EnqueueJob {
+                                source_outbox_id: receipt.outbox.id(),
+                                kind: JobKind::ConversationResponseV1,
+                                idempotency_key: JobEnqueueKey::new(),
+                            },
+                        )
+                        .await;
+                }
+                generation.signal.wake();
+            }
+            match repository.read_timeline(&auth, conversation_id).await {
+                Ok(timeline) => {
+                    conversation_timeline_response(state.stores.as_ref(), &auth, &timeline).await
+                }
+                Err(error) => conversation_error(error),
+            }
+        }
         Err(error) => conversation_error(error),
+    }
+}
+
+#[cfg(unix)]
+async fn cancel_job(
+    State(state): State<ApiState>,
+    Path(job_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let auth = match verified_api_auth(&state, &headers, true).await {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+    let job_id = match job_id.parse().ok().and_then(JobId::from_uuid) {
+        Some(job_id) => job_id,
+        None => return auth_error(StatusCode::BAD_REQUEST, "invalid_request"),
+    };
+    let payload: CancelJobPayload = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(_) => return auth_error(StatusCode::BAD_REQUEST, "invalid_request"),
+    };
+    let idempotency_key = match payload
+        .idempotency_key
+        .parse()
+        .ok()
+        .and_then(JobMutationKey::from_uuid)
+    {
+        Some(key) => key,
+        None => return auth_error(StatusCode::BAD_REQUEST, "invalid_request"),
+    };
+    let expected_revision = match Revision::new(payload.expected_revision) {
+        Some(revision) => revision,
+        None => return auth_error(StatusCode::BAD_REQUEST, "invalid_request"),
+    };
+    let queue = JobQueueRepository::new(&state.stores.conversation);
+    match queue
+        .request_cancel(
+            &auth,
+            CancelJob {
+                job_id,
+                expected_revision,
+                idempotency_key,
+            },
+        )
+        .await
+    {
+        Ok(receipt) => {
+            if let Some(generation) = &state.generation {
+                generation.signal.wake();
+            }
+            auth_json(
+                StatusCode::OK,
+                serde_json::json!({
+                    "job": job_snapshot_value(&receipt.job),
+                    "replayed": receipt.replayed,
+                }),
+                None,
+            )
+        }
+        Err(error) => job_mutation_error(error),
     }
 }
 
@@ -1023,7 +1211,11 @@ fn parse_conversation_id(value: &str) -> Option<ConversationId> {
 }
 
 #[cfg(unix)]
-fn conversation_timeline_response(timeline: &ConversationTimeline) -> Response {
+async fn conversation_timeline_response(
+    stores: &StoreSet,
+    auth: &VerifiedAuthContext,
+    timeline: &ConversationTimeline,
+) -> Response {
     let events = timeline
         .events()
         .iter()
@@ -1037,15 +1229,62 @@ fn conversation_timeline_response(timeline: &ConversationTimeline) -> Response {
             })
         })
         .collect::<Vec<_>>();
+    let generation_jobs = match JobQueueRepository::new(&stores.conversation)
+        .read_generation_jobs(auth, timeline.conversation().id())
+        .await
+    {
+        Ok(jobs) => jobs.iter().map(generation_job_value).collect::<Vec<_>>(),
+        Err(error) => return job_event_error(error),
+    };
     auth_json(
         StatusCode::OK,
         serde_json::json!({
             "conversation_id": timeline.conversation().id().to_string(),
             "revision": timeline.conversation().source().revision().get(),
             "events": events,
+            "generation_jobs": generation_jobs,
         }),
         None,
     )
+}
+
+#[cfg(unix)]
+fn job_snapshot_value(job: &JobSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "job_id": job.id().to_string(),
+        "source_outbox_id": job.source_outbox_id().to_string(),
+        "kind": "conversation_response_v1",
+        "state": job.state().as_str(),
+        "revision": job.revision().get(),
+        "attempts_started": job.attempts_started(),
+        "max_attempts": job.max_attempts(),
+        "queue_wait_micros": job.queue_wait_micros().to_string(),
+        "execution_micros": job.execution_micros().to_string(),
+    })
+}
+
+#[cfg(unix)]
+fn generation_job_value(summary: &GenerationJobSummary) -> serde_json::Value {
+    let mut value = job_snapshot_value(summary.job());
+    let object = value
+        .as_object_mut()
+        .expect("job snapshot JSON is an object");
+    object.insert(
+        "conversation_id".to_owned(),
+        serde_json::Value::String(summary.conversation_id().to_string()),
+    );
+    object.insert(
+        "source_event_id".to_owned(),
+        serde_json::Value::String(summary.source_event_id().to_string()),
+    );
+    object.insert(
+        "failure_kind".to_owned(),
+        summary
+            .failure()
+            .map(|failure| serde_json::Value::String(failure.as_str().to_owned()))
+            .unwrap_or(serde_json::Value::Null),
+    );
+    value
 }
 
 #[cfg(unix)]
@@ -1068,6 +1307,22 @@ fn conversation_error(error: ConversationError) -> Response {
         ConversationError::CorruptStoredState | ConversationError::BackendFailure => {
             auth_error(StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable")
         }
+    }
+}
+
+#[cfg(unix)]
+fn job_mutation_error(error: JobQueueError) -> Response {
+    match error {
+        JobQueueError::NotFound => auth_error(StatusCode::NOT_FOUND, "not_found"),
+        JobQueueError::IdempotencyConflict => {
+            auth_error(StatusCode::CONFLICT, "idempotency_conflict")
+        }
+        JobQueueError::RevisionConflict => auth_error(StatusCode::CONFLICT, "revision_conflict"),
+        JobQueueError::InvalidTransition => auth_error(StatusCode::CONFLICT, "invalid_transition"),
+        JobQueueError::CorruptStoredState | JobQueueError::BackendFailure => {
+            auth_error(StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable")
+        }
+        _ => auth_error(StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable"),
     }
 }
 
@@ -1367,7 +1622,7 @@ fn embedded_asset_response(path: &str) -> Response {
 
 #[cfg(test)]
 mod conversation_contract_tests {
-    use super::AppendEventPayload;
+    use super::{AppendEventPayload, CancelJobPayload};
 
     #[test]
     fn append_payload_requires_exact_fields_and_absent_or_numeric_revision() {
@@ -1402,6 +1657,26 @@ mod conversation_contract_tests {
             r#"{"idempotency_key":"x"}"#,
         ] {
             assert!(serde_json::from_str::<AppendEventPayload>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn cancel_payload_requires_exact_idempotency_key_and_revision() {
+        let exact: CancelJobPayload = serde_json::from_str(
+            r#"{
+                "idempotency_key":"a1b06fd4-39a2-4210-940c-ace9d47a610b",
+                "expected_revision":7
+            }"#,
+        )
+        .expect("exact cancel payload");
+        assert_eq!(exact.expected_revision, 7);
+        for invalid in [
+            r#"{"idempotency_key":"x"}"#,
+            r#"{"expected_revision":7}"#,
+            r#"{"idempotency_key":"x","expected_revision":7,"owner_id":"forged"}"#,
+            r#"{"idempotency_key":"x","idempotency_key":"y","expected_revision":7}"#,
+        ] {
+            assert!(serde_json::from_str::<CancelJobPayload>(invalid).is_err());
         }
     }
 }

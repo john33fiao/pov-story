@@ -40,6 +40,10 @@ impl Sha256Digest {
         &self.0
     }
 
+    pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     #[must_use]
     pub fn to_hex(self) -> String {
         const HEX: &[u8; 16] = b"0123456789abcdef";

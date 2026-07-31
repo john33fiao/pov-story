@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use sha2::{Digest, Sha256};
 use tokio_rusqlite::{
     Error as ExecutorError,
     rusqlite::{
@@ -16,17 +17,22 @@ use tokio_rusqlite::{
 use uuid::Uuid;
 
 use crate::{
-    conversation::{IdempotencyKey, OutboxId},
+    conversation::{
+        ConversationEventId, ConversationId, IdempotencyKey, MAX_USER_EVENT_CONTENT_BYTES, OutboxId,
+    },
     identity::{CorrelationId, Revision, VerifiedAuthContext},
     job::{
-        ClaimResult, EnqueueFingerprint, EnqueueReceipt, JOB_EVENT_PAGE_SIZE, JobAttemptId,
-        JobAttemptSnapshot, JobAttemptState, JobEvent, JobEventCursor, JobEventId, JobEventKind,
-        JobEventPage, JobFailureKind, JobId, JobKind, JobLease, JobLeaseToken,
+        CONVERSATION_RESPONSE_RETRY_BASE, ClaimResult, EnqueueFingerprint, EnqueueReceipt,
+        GenerationCompletion, GenerationCompletionReceipt, GenerationDispatchMode,
+        GenerationDispatchReceipt, GenerationJobSummary, GenerationSource, JOB_EVENT_PAGE_SIZE,
+        JobAttemptId, JobAttemptSnapshot, JobAttemptState, JobEvent, JobEventCursor, JobEventId,
+        JobEventKind, JobEventPage, JobFailureKind, JobId, JobKind, JobLease, JobLeaseToken,
         JobMutationFingerprint, JobOutcome, JobOwnerMutationOperation, JobPriority, JobQueueError,
         JobQueueFault, JobSnapshot, JobState, JobTimestampMicros, JobTransitionReceipt,
         PreparedEnqueue, PreparedJobOwnerMutation, RecoveryResolution, RecoveryTicket,
         SequencedJobEvent, duration_micros,
     },
+    provider::Sha256Digest,
 };
 
 use super::{ConversationStore, SqliteStore};
@@ -82,6 +88,8 @@ struct EventRow {
     execution_micros: Option<i64>,
     failure_kind: Option<String>,
     correlation_id: Vec<u8>,
+    conversation_id: Vec<u8>,
+    source_event_id: Vec<u8>,
 }
 
 struct EnqueueLinkageRow {
@@ -610,20 +618,28 @@ pub(crate) async fn read_events(
             let mut statement = connection
                 .prepare(
                     "SELECT
-                        event_id,
-                        job_id,
-                        job_revision,
-                        event_kind,
-                        state,
-                        attempt_id,
-                        happened_at_micros,
-                        queue_wait_micros,
-                        execution_micros,
-                        failure_kind,
-                        correlation_id
-                     FROM conversation_job_events
-                     WHERE owner_id = ?1 AND job_id = ?2
-                     ORDER BY job_revision",
+                        event.event_id,
+                        event.job_id,
+                        event.job_revision,
+                        event.event_kind,
+                        event.state,
+                        event.attempt_id,
+                        event.happened_at_micros,
+                        event.queue_wait_micros,
+                        event.execution_micros,
+                        event.failure_kind,
+                        event.correlation_id,
+                        outbox.conversation_id,
+                        outbox.event_id
+                     FROM conversation_job_events AS event
+                     JOIN conversation_jobs AS job
+                       ON job.owner_id = event.owner_id
+                      AND job.job_id = event.job_id
+                     JOIN conversation_outbox AS outbox
+                       ON outbox.owner_id = job.owner_id
+                      AND outbox.outbox_id = job.source_outbox_id
+                     WHERE event.owner_id = ?1 AND event.job_id = ?2
+                     ORDER BY event.job_revision",
                 )
                 .map_err(backend)?;
             let rows = statement
@@ -674,21 +690,29 @@ pub(crate) async fn read_event_page(
             let mut statement = connection
                 .prepare(
                     "SELECT
-                        event_sequence,
-                        event_id,
-                        job_id,
-                        job_revision,
-                        event_kind,
-                        state,
-                        attempt_id,
-                        happened_at_micros,
-                        queue_wait_micros,
-                        execution_micros,
-                        failure_kind,
-                        correlation_id
-                     FROM conversation_job_events
-                     WHERE owner_id = ?1 AND event_sequence > ?2
-                     ORDER BY event_sequence
+                        event.event_sequence,
+                        event.event_id,
+                        event.job_id,
+                        event.job_revision,
+                        event.event_kind,
+                        event.state,
+                        event.attempt_id,
+                        event.happened_at_micros,
+                        event.queue_wait_micros,
+                        event.execution_micros,
+                        event.failure_kind,
+                        event.correlation_id,
+                        outbox.conversation_id,
+                        outbox.event_id
+                     FROM conversation_job_events AS event
+                     JOIN conversation_jobs AS job
+                       ON job.owner_id = event.owner_id
+                      AND job.job_id = event.job_id
+                     JOIN conversation_outbox AS outbox
+                       ON outbox.owner_id = job.owner_id
+                      AND outbox.outbox_id = job.source_outbox_id
+                     WHERE event.owner_id = ?1 AND event.event_sequence > ?2
+                     ORDER BY event.event_sequence
                      LIMIT ?3",
                 )
                 .map_err(backend)?;
@@ -729,6 +753,366 @@ pub(crate) async fn read_event_page(
         })
         .await
         .map_err(map_executor_error)
+}
+
+pub(crate) async fn read_generation_jobs(
+    store: &SqliteStore<ConversationStore>,
+    auth: VerifiedAuthContext,
+    conversation_id: ConversationId,
+) -> Result<Vec<GenerationJobSummary>, JobQueueError> {
+    ensure_store_healthy(store)?;
+    let poison = Arc::clone(&store.operation_poisoned);
+    store
+        .connection
+        .call(move |connection| {
+            ensure_not_poisoned(&poison)?;
+            let owner_id = auth.owner_id().as_uuid();
+            let mut statement = connection
+                .prepare(
+                    "SELECT
+                        job.job_id,
+                        job.source_outbox_id,
+                        job.job_kind,
+                        job.priority,
+                        job.state,
+                        job.state_revision,
+                        job.attempts_started,
+                        job.max_attempts,
+                        job.enqueued_at_micros,
+                        job.ready_at_micros,
+                        job.first_started_at_micros,
+                        job.terminal_at_micros,
+                        job.queue_wait_micros,
+                        job.execution_micros,
+                        job.correlation_id,
+                        outbox.conversation_id,
+                        outbox.event_id,
+                        (
+                            SELECT attempt.failure_kind
+                            FROM conversation_job_attempts AS attempt
+                            WHERE attempt.owner_id = job.owner_id
+                              AND attempt.job_id = job.job_id
+                            ORDER BY attempt.attempt_number DESC
+                            LIMIT 1
+                        )
+                     FROM conversation_jobs AS job
+                     JOIN conversation_outbox AS outbox
+                       ON outbox.owner_id = job.owner_id
+                      AND outbox.outbox_id = job.source_outbox_id
+                     WHERE job.owner_id = ?1
+                       AND outbox.conversation_id = ?2
+                     ORDER BY outbox.conversation_revision",
+                )
+                .map_err(backend)?;
+            let rows = statement
+                .query_map(
+                    params![
+                        owner_id.as_bytes().as_slice(),
+                        conversation_id.as_uuid().as_bytes().as_slice()
+                    ],
+                    |row| {
+                        Ok((
+                            JobRow {
+                                job_id: row.get(0)?,
+                                source_outbox_id: row.get(1)?,
+                                job_kind: row.get(2)?,
+                                priority: row.get(3)?,
+                                state: row.get(4)?,
+                                state_revision: row.get(5)?,
+                                attempts_started: row.get(6)?,
+                                max_attempts: row.get(7)?,
+                                enqueued_at_micros: row.get(8)?,
+                                ready_at_micros: row.get(9)?,
+                                first_started_at_micros: row.get(10)?,
+                                terminal_at_micros: row.get(11)?,
+                                queue_wait_micros: row.get(12)?,
+                                execution_micros: row.get(13)?,
+                                correlation_id: row.get(14)?,
+                            },
+                            row.get::<_, Vec<u8>>(15)?,
+                            row.get::<_, Vec<u8>>(16)?,
+                            row.get::<_, Option<String>>(17)?,
+                        ))
+                    },
+                )
+                .map_err(backend)?;
+            rows.map(|row| {
+                let (job, stored_conversation_id, source_event_id, failure) =
+                    row.map_err(backend)?;
+                let stored_conversation_id = decode_conversation_id(&stored_conversation_id)?;
+                if stored_conversation_id != conversation_id {
+                    return Err(JobQueueError::CorruptStoredState);
+                }
+                Ok(GenerationJobSummary {
+                    conversation_id: stored_conversation_id,
+                    source_event_id: decode_conversation_event_id(&source_event_id)?,
+                    job: job_from_row(job)?,
+                    failure: failure
+                        .as_deref()
+                        .map(|value| {
+                            JobFailureKind::from_str(value).ok_or(JobQueueError::CorruptStoredState)
+                        })
+                        .transpose()?,
+                })
+            })
+            .collect()
+        })
+        .await
+        .map_err(map_executor_error)
+}
+
+pub(crate) async fn dispatch_next_generation(
+    store: &SqliteStore<ConversationStore>,
+    mode: GenerationDispatchMode,
+    now: JobTimestampMicros,
+) -> Result<GenerationDispatchReceipt, JobQueueError> {
+    ensure_store_healthy(store)?;
+    let poison = Arc::clone(&store.operation_poisoned);
+    store
+        .connection
+        .call(move |connection| {
+            ensure_not_poisoned(&poison)?;
+            let transaction = begin_immediate(connection)?;
+            let result = dispatch_next_generation_in_transaction(&transaction, mode, now);
+            let result = match result {
+                Ok(result) => {
+                    commit_or_poison(transaction, &poison)?;
+                    ensure_autocommit(connection, &poison)?;
+                    result
+                }
+                Err(error) => {
+                    rollback_or_poison(transaction, &poison)?;
+                    ensure_autocommit(connection, &poison)?;
+                    return Err(error);
+                }
+            };
+            match result {
+                DispatchWriteResult::Idle => Ok(GenerationDispatchReceipt::Idle),
+                DispatchWriteResult::Advanced {
+                    source_outbox_id,
+                    owner_id,
+                    job_id,
+                } => {
+                    let job = job_id
+                        .map(|job_id| read_job_snapshot(connection, &owner_id, job_id))
+                        .transpose()?;
+                    Ok(GenerationDispatchReceipt::Advanced {
+                        source_outbox_id,
+                        job,
+                    })
+                }
+            }
+        })
+        .await
+        .map_err(map_executor_error)
+}
+
+enum DispatchWriteResult {
+    Idle,
+    Advanced {
+        source_outbox_id: OutboxId,
+        owner_id: Vec<u8>,
+        job_id: Option<JobId>,
+    },
+}
+
+fn dispatch_next_generation_in_transaction(
+    transaction: &Transaction<'_>,
+    mode: GenerationDispatchMode,
+    now: JobTimestampMicros,
+) -> Result<DispatchWriteResult, JobQueueError> {
+    let cursor: i64 = transaction
+        .query_row(
+            "SELECT last_outbox_sequence
+             FROM conversation_generation_dispatch_control
+             WHERE control_id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(backend)?;
+    let next: Option<(i64, Vec<u8>, Vec<u8>, Vec<u8>)> = transaction
+        .query_row(
+            "SELECT dispatch_sequence, owner_id, outbox_id, correlation_id
+             FROM conversation_outbox
+             WHERE dispatch_sequence > ?1
+             ORDER BY dispatch_sequence
+             LIMIT 1",
+            [cursor],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(backend)?;
+    let Some((sequence, owner_id, outbox_id, correlation_id)) = next else {
+        return Ok(DispatchWriteResult::Idle);
+    };
+    let source_outbox_id = decode_outbox_id(&outbox_id)?;
+    let job_id = match mode {
+        GenerationDispatchMode::Disabled => None,
+        GenerationDispatchMode::Enabled => Some(ensure_generation_job(
+            transaction,
+            &owner_id,
+            source_outbox_id,
+            decode_correlation_id(&correlation_id)?,
+            now,
+        )?),
+    };
+    let updated = transaction
+        .execute(
+            "UPDATE conversation_generation_dispatch_control
+             SET last_outbox_sequence = ?2
+             WHERE control_id = 1 AND last_outbox_sequence = ?1",
+            params![cursor, sequence],
+        )
+        .map_err(backend)?;
+    if updated != 1 {
+        return Err(JobQueueError::CorruptStoredState);
+    }
+    Ok(DispatchWriteResult::Advanced {
+        source_outbox_id,
+        owner_id,
+        job_id,
+    })
+}
+
+fn ensure_generation_job(
+    transaction: &Transaction<'_>,
+    owner_id: &[u8],
+    source_outbox_id: OutboxId,
+    correlation_id: CorrelationId,
+    now: JobTimestampMicros,
+) -> Result<JobId, JobQueueError> {
+    let existing: Option<Vec<u8>> = transaction
+        .query_row(
+            "SELECT job_id
+             FROM conversation_jobs
+             WHERE owner_id = ?1
+               AND source_outbox_id = ?2
+               AND job_kind = 'conversation_response_v1'",
+            params![owner_id, source_outbox_id.as_uuid().as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(backend)?;
+    if let Some(job_id) = existing {
+        return decode_job_id(&job_id);
+    }
+
+    observe_clock(transaction, now)?;
+    let kind = JobKind::ConversationResponseV1;
+    let job_id = JobId::new();
+    let enqueue_key = crate::job::JobEnqueueKey::new();
+    let result_idempotency_key = IdempotencyKey::new();
+    let priority = kind.priority();
+    let max_attempts = kind.max_attempts();
+    let attempt_timeout_micros =
+        duration_micros(kind.attempt_timeout()).ok_or(JobQueueError::TimeOverflow)?;
+    let retry_base_micros =
+        duration_micros(CONVERSATION_RESPONSE_RETRY_BASE).ok_or(JobQueueError::TimeOverflow)?;
+    let fingerprint = generation_enqueue_fingerprint(owner_id, source_outbox_id, kind);
+    let now_i64 = timestamp_i64(now)?;
+    transaction
+        .execute(
+            "INSERT INTO conversation_jobs(
+                owner_id, job_id, source_outbox_id, job_kind, priority, state,
+                state_revision, max_attempts, attempts_started, attempt_timeout_micros,
+                retry_base_micros, result_idempotency_key, cancel_requested,
+                enqueued_at_micros, ready_at_micros, first_started_at_micros,
+                terminal_at_micros, queue_wait_micros, execution_micros,
+                correlation_id, updated_at_micros
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, 'queued', 1, ?6, 0, ?7, ?8, ?9, 0,
+                ?10, ?10, NULL, NULL, 0, 0, ?11, ?10
+             )",
+            params![
+                owner_id,
+                job_id.as_uuid().as_bytes().as_slice(),
+                source_outbox_id.as_uuid().as_bytes().as_slice(),
+                kind.as_str(),
+                priority.as_i64(),
+                i64::from(max_attempts),
+                micros_i64(attempt_timeout_micros)?,
+                micros_i64(retry_base_micros)?,
+                result_idempotency_key.as_uuid().as_bytes().as_slice(),
+                now_i64,
+                correlation_id.as_uuid().as_bytes().as_slice()
+            ],
+        )
+        .map_err(backend)?;
+    transaction
+        .execute(
+            "INSERT INTO conversation_job_enqueue_idempotency(
+                owner_id, idempotency_key, operation, request_fingerprint,
+                job_id, source_outbox_id, job_kind, created_at_micros
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                owner_id,
+                enqueue_key.as_uuid().as_bytes().as_slice(),
+                ENQUEUE_OPERATION,
+                fingerprint.as_slice(),
+                job_id.as_uuid().as_bytes().as_slice(),
+                source_outbox_id.as_uuid().as_bytes().as_slice(),
+                kind.as_str(),
+                now_i64
+            ],
+        )
+        .map_err(backend)?;
+    insert_event(
+        transaction,
+        owner_id,
+        job_id,
+        Revision::INITIAL,
+        JobEventKind::Enqueued,
+        JobState::Queued,
+        None,
+        now,
+        None,
+        None,
+        None,
+        correlation_id,
+    )?;
+    Ok(job_id)
+}
+
+fn generation_enqueue_fingerprint(
+    owner_id: &[u8],
+    source_outbox_id: OutboxId,
+    kind: JobKind,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"POV_JOB_ENQUEUE_REQUEST");
+    hasher.update([0, 1]);
+    update_hash_field(&mut hasher, b"owner", owner_id);
+    update_hash_field(
+        &mut hasher,
+        b"source-outbox",
+        source_outbox_id.as_uuid().as_bytes(),
+    );
+    update_hash_field(&mut hasher, b"job-kind", kind.as_str().as_bytes());
+    update_hash_field(
+        &mut hasher,
+        b"priority",
+        &kind.priority().as_i64().to_be_bytes(),
+    );
+    update_hash_field(
+        &mut hasher,
+        b"max-attempts",
+        &kind.max_attempts().to_be_bytes(),
+    );
+    update_hash_field(
+        &mut hasher,
+        b"attempt-timeout-micros",
+        &duration_micros(kind.attempt_timeout())
+            .unwrap_or(i64::MAX as u64)
+            .to_be_bytes(),
+    );
+    update_hash_field(
+        &mut hasher,
+        b"retry-base-micros",
+        &duration_micros(CONVERSATION_RESPONSE_RETRY_BASE)
+            .unwrap_or(i64::MAX as u64)
+            .to_be_bytes(),
+    );
+    hasher.finalize().into()
 }
 
 pub(crate) async fn claim_next(
@@ -1188,6 +1572,161 @@ fn mark_recovery_required(
     }))
 }
 
+pub(crate) async fn mark_cleanup_uncertain(
+    store: &SqliteStore<ConversationStore>,
+    lease: JobLease,
+    now: JobTimestampMicros,
+) -> Result<RecoveryTicket, JobQueueError> {
+    ensure_store_healthy(store)?;
+    let poison = Arc::clone(&store.operation_poisoned);
+    store
+        .connection
+        .call(move |connection| {
+            ensure_not_poisoned(&poison)?;
+            let transaction = begin_immediate(connection)?;
+            let result = mark_cleanup_uncertain_in_transaction(&transaction, &lease, now);
+            let ticket = match result {
+                Ok(ticket) => {
+                    commit_or_poison(transaction, &poison)?;
+                    ensure_autocommit(connection, &poison)?;
+                    ticket
+                }
+                Err(error) => {
+                    rollback_or_poison(transaction, &poison)?;
+                    ensure_autocommit(connection, &poison)?;
+                    return Err(error);
+                }
+            };
+            read_recovery_ticket(connection, &ticket)
+        })
+        .await
+        .map_err(map_executor_error)
+}
+
+fn mark_cleanup_uncertain_in_transaction(
+    transaction: &Transaction<'_>,
+    lease: &JobLease,
+    now: JobTimestampMicros,
+) -> Result<RecoveryTicket, JobQueueError> {
+    let stored =
+        find_attempt_by_capability(transaction, lease)?.ok_or(JobQueueError::StaleLease)?;
+    if !matches!(
+        stored.state,
+        JobAttemptState::Running | JobAttemptState::CancelRequested
+    ) {
+        return Err(JobQueueError::InvalidTransition);
+    }
+    let active = active_control_from_row(&read_control(transaction)?)?;
+    if active.status != "leased"
+        || active.job_id != lease.job_id
+        || active.attempt_id != lease.attempt_id
+        || active.attempt_number != lease.attempt_number
+        || active.generation != lease.generation
+        || active.token != lease.token
+        || active.owner_id != stored.owner_id
+    {
+        return Err(JobQueueError::StaleLease);
+    }
+    observe_clock(transaction, now)?;
+    let attempt = read_attempt_snapshot(
+        transaction,
+        &stored.owner_id,
+        lease.job_id,
+        lease.attempt_id,
+    )?;
+    let started_at = attempt
+        .started_at
+        .ok_or(JobQueueError::CorruptStoredState)?;
+    let execution = now
+        .checked_duration_since(started_at)
+        .ok_or(JobQueueError::ClockRegression)?;
+    let job = read_internal_job(transaction, &stored.owner_id, lease.job_id)?;
+    let expected_job_state = if stored.state == JobAttemptState::CancelRequested {
+        JobState::CancelRequested
+    } else {
+        JobState::Running
+    };
+    if job.snapshot.state != expected_job_state {
+        return Err(JobQueueError::CorruptStoredState);
+    }
+    let next_revision = job
+        .snapshot
+        .revision
+        .checked_next()
+        .ok_or(JobQueueError::CorruptStoredState)?;
+    let updated_attempt = transaction
+        .execute(
+            "UPDATE conversation_job_attempts
+             SET state = 'recovery_required',
+                 execution_micros = ?5,
+                 failure_kind = 'cleanup_uncertain'
+             WHERE owner_id = ?1
+               AND job_id = ?2
+               AND attempt_id = ?3
+               AND lease_token = ?4
+               AND state = ?6",
+            params![
+                stored.owner_id,
+                lease.job_id.as_uuid().as_bytes().as_slice(),
+                lease.attempt_id.as_uuid().as_bytes().as_slice(),
+                lease.token.as_uuid().as_bytes().as_slice(),
+                micros_i64(execution)?,
+                stored.state.as_str()
+            ],
+        )
+        .map_err(backend)?;
+    if updated_attempt != 1 {
+        return Err(JobQueueError::StaleLease);
+    }
+    let updated_job = transaction
+        .execute(
+            "UPDATE conversation_jobs
+             SET state = 'recovery_required',
+                 state_revision = ?3,
+                 execution_micros = execution_micros + ?4,
+                 updated_at_micros = ?5
+             WHERE owner_id = ?1
+               AND job_id = ?2
+               AND state = ?6
+               AND state_revision = ?7",
+            params![
+                stored.owner_id,
+                lease.job_id.as_uuid().as_bytes().as_slice(),
+                revision_i64(next_revision)?,
+                micros_i64(execution)?,
+                timestamp_i64(now)?,
+                expected_job_state.as_str(),
+                revision_i64(job.snapshot.revision)?
+            ],
+        )
+        .map_err(backend)?;
+    if updated_job != 1 {
+        return Err(JobQueueError::CorruptStoredState);
+    }
+    set_control_status(transaction, "recovery_required", active.generation)?;
+    insert_event(
+        transaction,
+        &stored.owner_id,
+        lease.job_id,
+        next_revision,
+        JobEventKind::RecoveryRequired,
+        JobState::RecoveryRequired,
+        Some(lease.attempt_id),
+        now,
+        None,
+        Some(execution),
+        Some(JobFailureKind::CleanupUncertain),
+        job.snapshot.correlation_id,
+    )?;
+    Ok(RecoveryTicket {
+        job_id: lease.job_id,
+        attempt_id: lease.attempt_id,
+        attempt_number: lease.attempt_number,
+        generation: lease.generation,
+        token: lease.token,
+    })
+}
+
 pub(crate) async fn mark_running(
     store: &SqliteStore<ConversationStore>,
     lease: JobLease,
@@ -1418,6 +1957,426 @@ fn renew_in_transaction(
         return Err(JobQueueError::StaleLease);
     }
     Ok(())
+}
+
+pub(crate) async fn read_generation_source(
+    store: &SqliteStore<ConversationStore>,
+    lease: JobLease,
+) -> Result<GenerationSource, JobQueueError> {
+    ensure_store_healthy(store)?;
+    let poison = Arc::clone(&store.operation_poisoned);
+    store
+        .connection
+        .call(move |connection| {
+            ensure_not_poisoned(&poison)?;
+            let stored =
+                find_attempt_by_capability(connection, &lease)?.ok_or(JobQueueError::StaleLease)?;
+            if !matches!(
+                stored.state,
+                JobAttemptState::Running | JobAttemptState::CancelRequested
+            ) {
+                return Err(JobQueueError::InvalidTransition);
+            }
+            read_generation_source_for_owner(connection, &stored.owner_id, &lease)
+        })
+        .await
+        .map_err(map_executor_error)
+}
+
+fn read_generation_source_for_owner(
+    connection: &RawConnection,
+    owner_id: &[u8],
+    lease: &JobLease,
+) -> Result<GenerationSource, JobQueueError> {
+    let row: Option<(Vec<u8>, Vec<u8>, String, i64, Vec<u8>)> = connection
+        .query_row(
+            "SELECT
+                outbox.conversation_id,
+                outbox.event_id,
+                source.content,
+                source.content_bytes,
+                source.content_sha256
+             FROM conversation_jobs AS job
+             JOIN conversation_outbox AS outbox
+               ON outbox.owner_id = job.owner_id
+              AND outbox.outbox_id = job.source_outbox_id
+             JOIN conversation_events AS source
+               ON source.owner_id = outbox.owner_id
+              AND source.event_id = outbox.event_id
+              AND source.conversation_id = outbox.conversation_id
+              AND source.conversation_revision = outbox.conversation_revision
+             WHERE job.owner_id = ?1
+               AND job.job_id = ?2
+               AND job.source_outbox_id = ?3
+               AND job.job_kind = 'conversation_response_v1'
+               AND source.event_kind = 'user_text'",
+            params![
+                owner_id,
+                lease.job_id.as_uuid().as_bytes().as_slice(),
+                lease.source_outbox_id.as_uuid().as_bytes().as_slice()
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(backend)?;
+    let Some((conversation_id, source_event_id, content, content_bytes, content_sha256)) = row
+    else {
+        return Err(JobQueueError::CorruptStoredState);
+    };
+    let content_len =
+        i64::try_from(content.len()).map_err(|_| JobQueueError::CorruptStoredState)?;
+    if content_bytes != content_len
+        || decode_sha256(&content_sha256)? != Sha256Digest::of(content.as_bytes())
+    {
+        return Err(JobQueueError::CorruptStoredState);
+    }
+    Ok(GenerationSource {
+        conversation_id: decode_conversation_id(&conversation_id)?,
+        source_event_id: decode_conversation_event_id(&source_event_id)?,
+        content,
+    })
+}
+
+pub(crate) async fn generation_cancel_requested(
+    store: &SqliteStore<ConversationStore>,
+    lease: JobLease,
+) -> Result<bool, JobQueueError> {
+    ensure_store_healthy(store)?;
+    let poison = Arc::clone(&store.operation_poisoned);
+    store
+        .connection
+        .call(move |connection| {
+            ensure_not_poisoned(&poison)?;
+            let stored =
+                find_attempt_by_capability(connection, &lease)?.ok_or(JobQueueError::StaleLease)?;
+            let job = read_internal_job(connection, &stored.owner_id, lease.job_id)?;
+            if job.snapshot.source_outbox_id != lease.source_outbox_id {
+                return Err(JobQueueError::CorruptStoredState);
+            }
+            Ok(stored.state == JobAttemptState::CancelRequested || job.cancel_requested)
+        })
+        .await
+        .map_err(map_executor_error)
+}
+
+struct GenerationWriteResult {
+    owner_id: Vec<u8>,
+    job_id: JobId,
+    assistant_event_id: ConversationEventId,
+    assistant_revision: Revision,
+    replayed: bool,
+}
+
+pub(crate) async fn complete_generation(
+    store: &SqliteStore<ConversationStore>,
+    lease: JobLease,
+    completion: GenerationCompletion,
+    now: JobTimestampMicros,
+) -> Result<GenerationCompletionReceipt, JobQueueError> {
+    ensure_store_healthy(store)?;
+    if completion.output.is_empty() || completion.output.len() > MAX_USER_EVENT_CONTENT_BYTES {
+        return Err(JobQueueError::CorruptStoredState);
+    }
+    let poison = Arc::clone(&store.operation_poisoned);
+    store
+        .connection
+        .call(move |connection| {
+            ensure_not_poisoned(&poison)?;
+            let transaction = begin_immediate(connection)?;
+            let result = complete_generation_in_transaction(&transaction, &lease, &completion, now);
+            let result = match result {
+                Ok(result) => {
+                    commit_or_poison(transaction, &poison)?;
+                    ensure_autocommit(connection, &poison)?;
+                    result
+                }
+                Err(error) => {
+                    rollback_or_poison(transaction, &poison)?;
+                    ensure_autocommit(connection, &poison)?;
+                    return Err(error);
+                }
+            };
+            Ok(GenerationCompletionReceipt {
+                job: read_job_snapshot(connection, &result.owner_id, result.job_id)?,
+                assistant_event_id: result.assistant_event_id,
+                assistant_revision: result.assistant_revision,
+                replayed: result.replayed,
+            })
+        })
+        .await
+        .map_err(map_executor_error)
+}
+
+fn complete_generation_in_transaction(
+    transaction: &Transaction<'_>,
+    lease: &JobLease,
+    completion: &GenerationCompletion,
+    now: JobTimestampMicros,
+) -> Result<GenerationWriteResult, JobQueueError> {
+    let elapsed_micros = duration_micros(completion.elapsed).ok_or(JobQueueError::TimeOverflow)?;
+    let output_sha256 = Sha256Digest::of(completion.output.as_bytes());
+    let fingerprint =
+        generation_result_fingerprint(lease, completion, output_sha256, elapsed_micros);
+    let stored =
+        find_attempt_by_capability(transaction, lease)?.ok_or(JobQueueError::StaleLease)?;
+    let existing: Option<(Vec<u8>, Vec<u8>, i64, Vec<u8>, String)> = transaction
+        .query_row(
+            "SELECT
+                result.result_fingerprint,
+                result.assistant_event_id,
+                result.assistant_revision,
+                result.canonical_output_sha256,
+                assistant.content
+             FROM conversation_generation_results AS result
+             JOIN conversation_events AS assistant
+               ON assistant.owner_id = result.owner_id
+              AND assistant.event_id = result.assistant_event_id
+             WHERE result.owner_id = ?1
+               AND result.result_idempotency_key = ?2",
+            params![
+                stored.owner_id,
+                lease.result_idempotency_key.as_uuid().as_bytes().as_slice()
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(backend)?;
+    if let Some((
+        stored_fingerprint,
+        assistant_event_id,
+        assistant_revision,
+        stored_hash,
+        content,
+    )) = existing
+    {
+        if stored_fingerprint.as_slice() != fingerprint
+            || decode_sha256(&stored_hash)? != output_sha256
+            || content.as_bytes() != completion.output.as_bytes()
+            || stored.state != JobAttemptState::Succeeded
+        {
+            return Err(JobQueueError::StaleLease);
+        }
+        return Ok(GenerationWriteResult {
+            owner_id: stored.owner_id,
+            job_id: lease.job_id,
+            assistant_event_id: decode_conversation_event_id(&assistant_event_id)?,
+            assistant_revision: decode_revision(assistant_revision)?,
+            replayed: true,
+        });
+    }
+
+    if stored.state != JobAttemptState::Running {
+        return Err(if stored.state == JobAttemptState::CancelRequested {
+            JobQueueError::InvalidTransition
+        } else {
+            JobQueueError::StaleLease
+        });
+    }
+    let active = validate_active_lease(transaction, lease, now)?;
+    if active.owner_id != stored.owner_id {
+        return Err(JobQueueError::CorruptStoredState);
+    }
+    let source = read_generation_source_for_owner(transaction, &stored.owner_id, lease)?;
+    let source_hash: Vec<u8> = transaction
+        .query_row(
+            "SELECT content_sha256
+             FROM conversation_events
+             WHERE owner_id = ?1 AND event_id = ?2 AND event_kind = 'user_text'",
+            params![
+                stored.owner_id,
+                source.source_event_id.as_uuid().as_bytes().as_slice()
+            ],
+            |row| row.get(0),
+        )
+        .map_err(backend)?;
+    if decode_sha256(&source_hash)? != completion.canonical_input_sha256 {
+        return Err(JobQueueError::CorruptStoredState);
+    }
+    let current_revision: i64 = transaction
+        .query_row(
+            "SELECT current_revision
+             FROM conversations
+             WHERE owner_id = ?1 AND conversation_id = ?2",
+            params![
+                stored.owner_id,
+                source.conversation_id.as_uuid().as_bytes().as_slice()
+            ],
+            |row| row.get(0),
+        )
+        .map_err(backend)?;
+    let current_revision = decode_revision(current_revision)?;
+    let assistant_revision = current_revision
+        .checked_next()
+        .ok_or(JobQueueError::CorruptStoredState)?;
+    let now_i64 = timestamp_i64(now)?;
+    let updated = transaction
+        .execute(
+            "UPDATE conversations
+             SET current_revision = ?3, updated_at_micros = ?4
+             WHERE owner_id = ?1
+               AND conversation_id = ?2
+               AND current_revision = ?5",
+            params![
+                stored.owner_id,
+                source.conversation_id.as_uuid().as_bytes().as_slice(),
+                revision_i64(assistant_revision)?,
+                now_i64,
+                revision_i64(current_revision)?
+            ],
+        )
+        .map_err(backend)?;
+    if updated != 1 {
+        return Err(JobQueueError::RevisionConflict);
+    }
+    let assistant_event_id = ConversationEventId::new();
+    let assistant_correlation_id = CorrelationId::new();
+    transaction
+        .execute(
+            "INSERT INTO conversation_events(
+                owner_id, event_id, conversation_id, conversation_revision,
+                event_kind, content, content_bytes, content_sha256,
+                correlation_id, created_at_micros
+             ) VALUES (?1, ?2, ?3, ?4, 'assistant_text', ?5, ?6, ?7, ?8, ?9)",
+            params![
+                stored.owner_id,
+                assistant_event_id.as_uuid().as_bytes().as_slice(),
+                source.conversation_id.as_uuid().as_bytes().as_slice(),
+                revision_i64(assistant_revision)?,
+                completion.output,
+                i64::try_from(completion.output.len())
+                    .map_err(|_| JobQueueError::CorruptStoredState)?,
+                output_sha256.as_bytes().as_slice(),
+                assistant_correlation_id.as_uuid().as_bytes().as_slice(),
+                now_i64
+            ],
+        )
+        .map_err(backend)?;
+    transaction
+        .execute(
+            "INSERT INTO conversation_generation_results(
+                owner_id, result_idempotency_key, result_fingerprint,
+                job_id, attempt_id, source_outbox_id, source_event_id,
+                conversation_id, assistant_event_id, assistant_revision,
+                provider_backend_id, runtime_build, runtime_sha256,
+                model_revision, model_sha256, canonical_input_sha256,
+                canonical_output_sha256, elapsed_micros, created_at_micros
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
+             )",
+            params![
+                stored.owner_id,
+                lease.result_idempotency_key.as_uuid().as_bytes().as_slice(),
+                fingerprint.as_slice(),
+                lease.job_id.as_uuid().as_bytes().as_slice(),
+                lease.attempt_id.as_uuid().as_bytes().as_slice(),
+                lease.source_outbox_id.as_uuid().as_bytes().as_slice(),
+                source.source_event_id.as_uuid().as_bytes().as_slice(),
+                source.conversation_id.as_uuid().as_bytes().as_slice(),
+                assistant_event_id.as_uuid().as_bytes().as_slice(),
+                revision_i64(assistant_revision)?,
+                completion.provider_backend_id.as_str(),
+                completion.runtime_build.as_str(),
+                completion.runtime_sha256.as_bytes().as_slice(),
+                completion.model_revision.as_str(),
+                completion.model_sha256.as_bytes().as_slice(),
+                completion.canonical_input_sha256.as_bytes().as_slice(),
+                output_sha256.as_bytes().as_slice(),
+                micros_i64(elapsed_micros)?,
+                now_i64
+            ],
+        )
+        .map_err(backend)?;
+    let finished = finish_in_transaction(transaction, lease, JobOutcome::Succeeded, now)?;
+    if finished.replayed || finished.owner_id != stored.owner_id || finished.job_id != lease.job_id
+    {
+        return Err(JobQueueError::CorruptStoredState);
+    }
+    Ok(GenerationWriteResult {
+        owner_id: stored.owner_id,
+        job_id: lease.job_id,
+        assistant_event_id,
+        assistant_revision,
+        replayed: false,
+    })
+}
+
+fn generation_result_fingerprint(
+    lease: &JobLease,
+    completion: &GenerationCompletion,
+    output_sha256: Sha256Digest,
+    elapsed_micros: u64,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"POV_GENERATION_RESULT_V1");
+    update_hash_field(&mut hasher, b"job", lease.job_id.as_uuid().as_bytes());
+    update_hash_field(
+        &mut hasher,
+        b"attempt",
+        lease.attempt_id.as_uuid().as_bytes(),
+    );
+    update_hash_field(
+        &mut hasher,
+        b"result-key",
+        lease.result_idempotency_key.as_uuid().as_bytes(),
+    );
+    update_hash_field(
+        &mut hasher,
+        b"provider-backend",
+        completion.provider_backend_id.as_str().as_bytes(),
+    );
+    update_hash_field(
+        &mut hasher,
+        b"runtime-build",
+        completion.runtime_build.as_str().as_bytes(),
+    );
+    update_hash_field(
+        &mut hasher,
+        b"runtime-sha256",
+        completion.runtime_sha256.as_bytes(),
+    );
+    update_hash_field(
+        &mut hasher,
+        b"model-revision",
+        completion.model_revision.as_str().as_bytes(),
+    );
+    update_hash_field(
+        &mut hasher,
+        b"model-sha256",
+        completion.model_sha256.as_bytes(),
+    );
+    update_hash_field(
+        &mut hasher,
+        b"canonical-input-sha256",
+        completion.canonical_input_sha256.as_bytes(),
+    );
+    update_hash_field(
+        &mut hasher,
+        b"canonical-output-sha256",
+        output_sha256.as_bytes(),
+    );
+    update_hash_field(
+        &mut hasher,
+        b"elapsed-micros",
+        &elapsed_micros.to_be_bytes(),
+    );
+    hasher.finalize().into()
 }
 
 struct FinishResult {
@@ -3101,6 +4060,8 @@ fn decode_event_row_at(row: &Row<'_>, offset: usize) -> rusqlite::Result<EventRo
         execution_micros: row.get(offset + 8)?,
         failure_kind: row.get(offset + 9)?,
         correlation_id: row.get(offset + 10)?,
+        conversation_id: row.get(offset + 11)?,
+        source_event_id: row.get(offset + 12)?,
     })
 }
 
@@ -3131,6 +4092,8 @@ fn event_from_row(row: EventRow) -> Result<JobEvent, JobQueueError> {
             .map(|value| JobFailureKind::from_str(value).ok_or(JobQueueError::CorruptStoredState))
             .transpose()?,
         correlation_id: decode_correlation_id(&row.correlation_id)?,
+        conversation_id: decode_conversation_id(&row.conversation_id)?,
+        source_event_id: decode_conversation_event_id(&row.source_event_id)?,
     })
 }
 
@@ -3351,6 +4314,75 @@ pub(crate) async fn test_final_attempt_waiting_transition_is_guarded(
         .map_err(map_executor_error)
 }
 
+#[cfg(test)]
+pub(crate) async fn test_generation_records_reject_mutation(
+    store: &SqliteStore<ConversationStore>,
+    auth: VerifiedAuthContext,
+    assistant_event_id: ConversationEventId,
+) -> Result<(), JobQueueError> {
+    ensure_store_healthy(store)?;
+    store
+        .connection
+        .call(move |connection| {
+            let owner_id = auth.owner_id().as_uuid();
+            let denied = [
+                connection.execute(
+                    "UPDATE conversation_generation_results
+                     SET elapsed_micros = elapsed_micros
+                     WHERE owner_id = ?1 AND assistant_event_id = ?2",
+                    params![
+                        owner_id.as_bytes().as_slice(),
+                        assistant_event_id.as_uuid().as_bytes().as_slice()
+                    ],
+                ),
+                connection.execute(
+                    "DELETE FROM conversation_generation_results
+                     WHERE owner_id = ?1 AND assistant_event_id = ?2",
+                    params![
+                        owner_id.as_bytes().as_slice(),
+                        assistant_event_id.as_uuid().as_bytes().as_slice()
+                    ],
+                ),
+                connection.execute(
+                    "UPDATE conversation_generation_dispatch_control
+                     SET last_outbox_sequence = last_outbox_sequence
+                     WHERE control_id = 1",
+                    [],
+                ),
+            ];
+            if denied.iter().any(Result::is_ok) || !connection.is_autocommit() {
+                return Err(JobQueueError::CorruptStoredState);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(map_executor_error)
+}
+
+#[cfg(test)]
+pub(crate) async fn test_generation_result_count(
+    store: &SqliteStore<ConversationStore>,
+    auth: VerifiedAuthContext,
+) -> Result<usize, JobQueueError> {
+    ensure_store_healthy(store)?;
+    store
+        .connection
+        .call(move |connection| {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT count(*)
+                     FROM conversation_generation_results
+                     WHERE owner_id = ?1",
+                    [auth.owner_id().as_uuid().as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .map_err(backend)?;
+            usize::try_from(count).map_err(|_| JobQueueError::CorruptStoredState)
+        })
+        .await
+        .map_err(map_executor_error)
+}
+
 fn begin_immediate(connection: &mut RawConnection) -> Result<Transaction<'_>, JobQueueError> {
     connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -3446,6 +4478,21 @@ fn decode_outbox_id(value: &[u8]) -> Result<OutboxId, JobQueueError> {
     OutboxId::from_uuid(decode_uuid(value)?).ok_or(JobQueueError::CorruptStoredState)
 }
 
+fn decode_conversation_id(value: &[u8]) -> Result<ConversationId, JobQueueError> {
+    ConversationId::from_uuid(decode_uuid(value)?).ok_or(JobQueueError::CorruptStoredState)
+}
+
+fn decode_conversation_event_id(value: &[u8]) -> Result<ConversationEventId, JobQueueError> {
+    ConversationEventId::from_uuid(decode_uuid(value)?).ok_or(JobQueueError::CorruptStoredState)
+}
+
+fn decode_sha256(value: &[u8]) -> Result<Sha256Digest, JobQueueError> {
+    let bytes: [u8; 32] = value
+        .try_into()
+        .map_err(|_| JobQueueError::CorruptStoredState)?;
+    Ok(Sha256Digest::from_bytes(bytes))
+}
+
 fn decode_idempotency_key(value: &[u8]) -> Result<IdempotencyKey, JobQueueError> {
     IdempotencyKey::from_uuid(decode_uuid(value)?).ok_or(JobQueueError::CorruptStoredState)
 }
@@ -3463,6 +4510,13 @@ fn decode_fingerprint(value: &[u8]) -> Result<EnqueueFingerprint, JobQueueError>
         .try_into()
         .map_err(|_| JobQueueError::CorruptStoredState)?;
     Ok(EnqueueFingerprint::from_bytes(value))
+}
+
+fn update_hash_field(hasher: &mut Sha256, name: &[u8], value: &[u8]) {
+    hasher.update((name.len() as u64).to_be_bytes());
+    hasher.update(name);
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
 }
 
 fn decode_mutation_fingerprint(value: &[u8]) -> Result<JobMutationFingerprint, JobQueueError> {

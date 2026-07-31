@@ -4817,7 +4817,7 @@ mod tests {
         .expect("fresh writer");
         let report = read_report(&writer, StoreKind::Conversation).expect("writer report");
         validate_store_report(&report).expect("writer policy");
-        assert_eq!(report.applied_migrations.len(), 5);
+        assert_eq!(report.applied_migrations.len(), 6);
         assert_eq!(report.busy_timeout_millis, BUSY_TIMEOUT_MILLIS);
 
         let transaction = writer
