@@ -206,7 +206,7 @@ impl ControllingTerminal {
 }
 
 fn termios_matches(left: &Termios, right: &Termios) -> bool {
-    left.input_modes == right.input_modes
+    let matches = left.input_modes == right.input_modes
         && left.output_modes == right.output_modes
         && left.control_modes == right.control_modes
         && left.local_modes == right.local_modes
@@ -214,8 +214,10 @@ fn termios_matches(left: &Termios, right: &Termios) -> bool {
         // representation covers every element and is stable within this build.
         && format!("{:?}", left.special_codes) == format!("{:?}", right.special_codes)
         && left.input_speed() == right.input_speed()
-        && left.output_speed() == right.output_speed()
-        && left.line_discipline == right.line_discipline
+        && left.output_speed() == right.output_speed();
+    #[cfg(target_os = "linux")]
+    let matches = matches && left.line_discipline == right.line_discipline;
+    matches
 }
 
 struct EchoGuard<'a> {

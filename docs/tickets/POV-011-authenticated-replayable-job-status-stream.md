@@ -75,20 +75,36 @@ PASS:
   제거한 뒤 locked workspace check와 serial full suite PASS: `pov-core` 313 PASS/1 ignored,
   process-supervisor 22 PASS/15 ignored, 나머지 API/contract suite PASS. 이 결과는 POV-011
   변경 compile/test 격리를 위한 진단이며 실제 repository supported-Unix PASS가 아닙니다.
+- actual macOS 26.5.2 arm64, Rust/Cargo 1.95.0의 current tree에서 `rustix 1.1.4`가
+  제공하는 공통 `Termios` 필드와 속도는 그대로 비교하고 Linux에서만 공개되는
+  `line_discipline` 비교를 해당 target으로 제한했습니다.
+  `cargo check --locked -p pov-core --all-targets`, operator 단위 테스트 3건, production CLI
+  테스트 2건, `cargo fmt --all -- --check`, locked workspace check가 PASS했습니다.
+- 같은 current tree의 두 번째 exact `cargo test --locked --workspace --all-targets`가
+  PASS했습니다: `pov-core` 313 PASS/1 ignored, process-supervisor 22 PASS/15 ignored, 나머지
+  API/contract suite PASS. Frontend format/lint/typecheck/production build도 PASS했습니다.
 
-FAIL / UNAVAILABLE:
+OBSERVED NON-REPRODUCED FAILURE:
 
-- 실제 tree의 `cargo check --locked --workspace --all-targets`와
-  `cargo test --locked --workspace --all-targets`는
-  `crates/pov-core/src/auth/operator.rs:218`의 기존
-  `Termios.line_discipline` 필드 부재 `E0609`로 FAIL했습니다.
+- 첫 번째 exact full workspace test는
+  `planned_rotation_preparation_durability_faults_have_exact_fresh_actor_phases`가 macOS APFS
+  identity 재검증 중 `IdentityChanged`로 1회 FAIL했습니다. 동일 test의 즉시 exact 직렬
+  재실행과 이후 exact full workspace 재실행은 PASS해 root cause가 재현되지 않았습니다.
+  이 관측을 `Termios` 수정의 성공으로 숨기거나 해당 auth maintenance 경계를 수정하지
+  않습니다.
+
+REMAINING / UNAVAILABLE:
+
+- 이 수정 뒤 supported Linux/WSL-native tree에서 locked workspace check, KDF-serialized
+  test, production binary build, `scripts/test_operator_pty.py`와
+  `scripts/test_production_auth_smoke.py`를 아직 실행하지 않았습니다.
 - 현재 macOS에서 `scripts/test_operator_pty.py`와
   `scripts/test_production_auth_smoke.py`는 Linux-only로 UNAVAILABLE이고, production
   `auth init`을 완료한 private instance가 없어 `scripts/smoke.sh`도 실행하지 않았습니다.
 
-따라서 구현을 completion evidence로 승격하지 않습니다. 실제 supported-Unix tree에서
-Rust baseline을 복구하고 locked check/test 및 적용 가능한 auth/smoke를 다시 PASS한 뒤
-RTD After를 반복할 때만 `Completed`로 전환합니다.
+따라서 macOS compile/test baseline은 복구됐지만 구현을 completion evidence로 승격하지
+않습니다. 실제 supported Linux tree에서 locked check/test 및 auth/PTY/production smoke를
+PASS하고 RTD After를 반복할 때만 `Completed`로 전환합니다.
 
 ## Rollback
 

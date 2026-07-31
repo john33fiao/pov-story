@@ -184,8 +184,9 @@ canonical auth schema를 계속 적용하지만 auth maintenance capability를 c
   content-free payload를 제공합니다. SSE는 500ms page poll, 10초 heartbeat와 별도
   background task 없는 drop-cancellable state를 사용하며 client는 cursor만
   sessionStorage에 보존하고 token은 memory 밖에 저장하지 않습니다. 이 구현과 Chromium
-  evidence는 존재하지만 actual macOS locked Rust baseline이 기존
-  `auth/operator.rs`의 `Termios.line_discipline` `E0609`로 실패해 POV-011은 아직
+  evidence에 더해 `auth/operator.rs`의 Linux-only `Termios.line_discipline` 비교를 target
+  gate로 제한해 actual macOS locked check와 재실행 full test가 PASS했습니다. post-fix
+  Linux locked suite와 auth/PTY/production smoke는 아직 실행하지 않았으므로 POV-011은
   `In Progress`이고 supported-Unix completion claim이 아닙니다.
 - auth/API/SSE/upload response는 cache하지 않고 password, recovery code, auth header, cookie와 token을 application/proxy/audit/panic log에서 redact합니다.
 

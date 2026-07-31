@@ -26,7 +26,7 @@ production auth는 POV-010의 선행 조건이 아닙니다.
 | --- | --- | --- | --- |
 | [ADR-0006 H1 development and dogfood platform](decisions/0006-h1-development-and-dogfood-platform.md) | Decision gate | Accepted — 2026-07-31 | macOS를 always-on/dogfood backend로, Windows를 development/cross-platform validation으로 고정 |
 | [POV-010 Minimal authenticated local text chat](tickets/POV-010-minimal-authenticated-local-text-chat.md) | Delivery | Completed — 2026-07-31; core/API/Web 및 pinned frontend/Rust baseline PASS | owner-scoped login/refresh/logout, text capture, durable receipt와 stored timeline을 Windows/WSL의 component·contract·repository evidence로 검증 |
-| [POV-011 Authenticated replayable job status stream](tickets/POV-011-authenticated-replayable-job-status-stream.md) | Delivery | In Progress — Core/API/Web/Chromium 구현 PASS; actual macOS locked Rust baseline은 기존 `Termios.line_discipline` E0609로 NOT READY | token refresh와 reconnect 뒤에도 owner-scoped durable status cursor를 이어 보는 흐름; supported-Unix baseline 복구·재검증 뒤 종료 |
+| [POV-011 Authenticated replayable job status stream](tickets/POV-011-authenticated-replayable-job-status-stream.md) | Delivery | In Progress — Core/API/Web/Chromium 및 actual macOS locked check와 재실행 full test PASS; post-fix Linux 검증 대기 | token refresh와 reconnect 뒤에도 owner-scoped durable status cursor를 이어 보는 흐름; Linux locked suite와 auth/PTY/production smoke 뒤 종료 |
 
 ## Auth Follow-ups — Not Initial H1 Gates
 
