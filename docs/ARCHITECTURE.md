@@ -58,7 +58,7 @@ Cloudflare는 외부 ingress만 담당합니다. local path는 Cloudflare와 인
 
 ## Runtime Baseline
 
-### Implemented H0 Surface
+### Implemented Local Surface
 
 - Rust `1.95.0` workspace의 `pov-api` crate가 Axum `0.8.9`와 Tokio `1.53.1`을 사용합니다.
 - React `19.2.8`과 Vite `8.1.5` production output을 `rust-embed`로 binary에 포함합니다.
@@ -66,13 +66,15 @@ Cloudflare는 외부 ingress만 담당합니다. local path는 Cloudflare와 인
 - [ADR-0006](decisions/0006-h1-development-and-dogfood-platform.md)에 따라 H1의 intended
   always-on backend와 dogfood runtime은 MacBook의 macOS입니다. Windows는 frontend와 Rust
   cross-platform development/validation 환경이지만 production auth maintenance/runtime을
-  활성화하지 않습니다.
+  활성화하지 않습니다. MacBook production runtime과 installed-browser activation evidence는
+  장비 확보 뒤 [POV-038](tickets/POV-038-macos-dogfood-runtime-and-installed-browser-evidence.md)이
+  소유하며 POV-010 implementation delivery의 완료 조건과 분리합니다.
 - `/api/health`는 고정 상태만 반환하며 DB, model, filesystem 상태나 personal data를 읽지 않습니다.
 - unknown API path는 SPA로 fallback하지 않고, embedded asset key 밖의 path는 읽지 않습니다.
 - `pov-core` crate가 UUID-typed owner ID, 생성·rehydration 시 UUID v4를 검증하는 source/correlation ID, positive checked revision과 opaque verified-owner scope를 제공합니다. shared-receiver async backend-neutral repository port의 모든 read/create/revise operation은 이 scope를 요구하고 opaque backend failure를 표현할 수 있습니다. typed source-store marker는 associated domain을 노출하고 source/derivative 역할을 분리합니다. production owner scope는 `AuthRuntime::verify_access`가 검증한 JWT, active session과 credential version에서만 생성하며 synthetic constructor는 test build로 제한됩니다.
 - Conversation, Knowledge, Calendar, Embedding은 고정된 네 SQLite file, typed store handle과 독립 migration namespace를 가집니다. 새 app initialization reservation marker가 없는 미인식 DB는 비어 있는 formatted SQLite까지 채택하지 않습니다. 유효한 reservation도 빈 초기 상태만 복구할 수 있으며 잘못된 store contract, migration exact-prefix·SQL drift와 future version은 app이 WAL mode를 바꾸거나 새 migration을 적용하기 전에 거부합니다. 기존 main file을 처음 열 때 SQLite 자체가 수행할 수 있는 hot-journal/WAL recovery는 이 app-level 거부보다 앞설 수 있으며 직접 검증하지 않았습니다.
 - Conversation store의 concrete append repository는 `VerifiedAuthContext`에서만 owner scope를 받고 exact UTF-8 1~64KiB user event를 저장합니다. UUID v4 idempotency key의 fingerprint는 domain/version, owner, target conversation, absent/exact expected revision, event kind와 exact content bytes에서 repository가 계산하며 correlation ID와 content SHA-256도 caller 값이 아니라 actual bytes와 server state에서 생성합니다. 같은 owner/key/fingerprint retry는 revision 검사보다 먼저 기존 receipt를 찾고, 다른 target/revision/content는 generic conflict로 닫습니다.
-- 새 append는 `BEGIN IMMEDIATE`에서 conversation revision CAS, immutable event, owner-scoped idempotency mapping, content-free audit와 content를 복제하지 않는 outbox pointer를 함께 commit합니다. event source revision은 immutable `1`, conversation ordinal은 별도 revision입니다. 성공은 commit 뒤 owner-scoped joined readback이 exact content 재해시, fingerprint, correlation, event/outbox/audit 1:1 관계와 `current_revision >= event ordinal`을 검증한 뒤에만 반환합니다. 따라서 commit과 readback 사이에 다음 revision이 commit되어도 첫 성공을 corruption으로 오인하지 않습니다. commit 뒤 response loss는 같은 key retry로 복구하고 rollback/commit state가 불명확한 connection은 autocommit 복구 전까지 재사용하지 않으며 복구 불확실성에는 queued report/backup을 포함한 store operation을 poison합니다. 이 repository는 아직 `pov-api`에 wiring되지 않았지만 production `VerifiedAuthContext` dependency는 `AuthRuntime::verify_access`로 충족됐고 repository acceptance fixture만 synthetic owner를 사용합니다.
+- 새 append는 `BEGIN IMMEDIATE`에서 conversation revision CAS, immutable event, owner-scoped idempotency mapping, content-free audit와 content를 복제하지 않는 outbox pointer를 함께 commit합니다. event source revision은 immutable `1`, conversation ordinal은 별도 revision입니다. 성공은 commit 뒤 owner-scoped joined readback이 exact content 재해시, fingerprint, correlation, event/outbox/audit 1:1 관계와 `current_revision >= event ordinal`을 검증한 뒤에만 반환합니다. 따라서 commit과 readback 사이에 다음 revision이 commit되어도 첫 성공을 corruption으로 오인하지 않습니다. commit 뒤 response loss는 같은 key retry로 복구하고 rollback/commit state가 불명확한 connection은 autocommit 복구 전까지 재사용하지 않으며 복구 불확실성에는 queued report/backup을 포함한 store operation을 poison합니다. POV-010 delivery는 owner-scoped list/timeline read와 append를 `pov-api`에 wiring하고 production `VerifiedAuthContext`를 `AuthRuntime::verify_access`에서만 전달합니다. Repository acceptance fixture만 synthetic owner를 사용합니다.
 - Conversation migration `0003`과 typed queue repository/internal dispatcher surface는 immutable outbox row를 owner-scoped source pointer로 사용합니다. enqueue fingerprint와 ledger는 동일 retry를 같은 job으로 복구하고 다른 request 또는 같은 `(owner, outbox, kind)`의 중복 생성을 거부하며, exact owner/outbox/kind lookup은 enqueue key를 잃은 response-loss 복구 경로를 제공합니다. cancel/resume도 별도 typed mutation key와 immutable fingerprint ledger로 같은 결과를 replay합니다. 현재 policy는 `conversation_response_v1`, fixed normal priority와 durable enqueue sequence FIFO 하나이며 caller가 priority, timeout 또는 retry policy를 주입하지 않습니다.
 - durable queue singleton은 generation과 opaque lease token으로 system-wide active attempt를 fence하고 `leased`와 `running`을 구분합니다. job, attempt, cancellation, retry schedule, queue wait, execution duration과 content-free status event는 한 Conversation transaction에서 전이합니다. 입력 대기 상태는 다음 attempt budget이 남은 경우에만 attempt를 끝내고 슬롯을 반납하며, 마지막 attempt의 `waiting_confirmation`은 adapter와 SQL trigger가 함께 거부합니다. `finish` response loss는 같은 held capability와 outcome으로 committed result를 readback하고 stale capability는 mutation 없이 거부합니다. 반면 유실된 claim capability는 재구성하지 않으며 시작되지 않은 lease가 정확한 만료 시각까지 슬롯을 점유하고 attempt 하나를 소비한 뒤 retry 또는 terminal policy로 진행합니다. DB의 마지막 관측 wall-clock보다 뒤인 admission/mutation은 `ClockRegression`으로 fail closed하고 reads는 유지하며, 시간이 그 floor를 따라잡을 때만 재개되고 reset 경로는 없습니다.
 - Conversation migration `0004`는 ADR-0004 local auth control plane을 exact `uninitialized` singleton에서 시작합니다. Account/credential/throttle/login-control은 한 owner만 허용하고, fixed one-hour marker와 version-bound outcome, profile별 8 active session, exact local/remote refresh deadline, generation `0..8191`, one-active-token family와 append-only audit를 SQL constraint와 trigger로 방어합니다. Append-only migration `0005`는 throttle row를 0에서 시작하게 하고 실패 횟수별 exact exponential/capped deadline, failure admission boundary, count 100 bound, password terminal state와 recovery 100 saturation을 강제하며 invalid legacy deadline/count에서는 migration 전체를 rollback합니다. Immutable row는 `INSERT OR REPLACE`로 교체할 수 없고 terminal refresh cleanup은 session delete에서 family/token으로 cascade합니다. Schema 자체는 listener나 production owner context를 활성화하지 않으며, 아래 key lifecycle, auth repository, JWT/session verifier와 fail-closed startup이 이를 소비합니다.
@@ -90,8 +92,11 @@ Cloudflare는 외부 ingress만 담당합니다. local path는 Cloudflare와 인
 - macOS synthetic evidence는 literal argv와 exact child environment, success, spawn/non-zero/signal, timeout/cancel, caller abort, dual-pipe pressure/overflow, direct/descendant PID·PGID 소멸, symlink-safe attempt cleanup과 executable hierarchy/hash drift를 재현합니다. non-Unix backend는 fail closed입니다. Windows Python Whisper path는 [POV-033](tickets/POV-033-windows-python-whisper-turbo-provider.md)의 executable trust와 Job Object evidence 전까지 활성화하지 않습니다. same-account verify-to-exec race, process group을 벗어나는 daemon, supervisor/runtime 자체의 abrupt termination, CPU/memory/fd/work-byte quota는 이 contract가 해결했다고 주장하지 않습니다.
 - `pov-api`는 explicit instance root에서 `StoreSet`과 fail-closed `AuthRuntime`을 listener bind
   전에 열고 React/Vite shell, health와 local auth HTTP surface를 same-origin으로 제공합니다.
-  Conversation append/queue endpoint, Knowledge/Calendar domain adapter, Blob, background
-  dispatcher/worker, SSE, 실제 provider/model과 external ingress는 아직 구현하지 않았습니다.
+  POV-010 delivery는 access-verified `GET /api/conversations`,
+  `GET /api/conversations/{conversation_id}`와 idempotent
+  `POST /api/conversations/{conversation_id}/events`를 추가합니다. Queue endpoint,
+  Knowledge/Calendar domain adapter, Blob, background dispatcher/worker, SSE, 실제
+  provider/model과 external ingress는 아직 구현하지 않았습니다.
 
 ### Control Plane
 
@@ -104,9 +109,10 @@ Cloudflare는 외부 ingress만 담당합니다. local path는 Cloudflare와 인
 ### Web Client
 
 - React, TypeScript, Vite 정적 SPA
-- local과 remote가 동일 API를 사용
+- 현재 local same-origin API만 사용하며 remote ingress는 구현하지 않음
 - 외부 CDN runtime dependency 없이 app asset에 포함
-- service worker는 app shell, icon, hashed asset만 cache
+- access token은 React memory에만 두고 refresh cookie는 HttpOnly local auth path에 한정
+- service worker/PWA cache는 아직 구현하지 않음
 - API, auth, SSE, upload, audio, conversation, search result는 cache하지 않음
 
 ### Worker And Process Supervision
@@ -119,7 +125,7 @@ Cloudflare는 외부 ingress만 담당합니다. local path는 Cloudflare와 인
 - long-running provider endpoint contract는 assigned exact IPv4 `127.0.0.1`만 허용합니다. provider port를 Axum, LAN 또는 Tunnel route로 직접 공개하지 않으며 실제 readiness identity와 restart lifecycle은 POV-012에서 구현합니다.
 - one-shot process는 typed registry의 pinned native executable과 fixed argument array만 사용하고 runtime request에는 path, cwd, environment 또는 stdio 선택을 노출하지 않음
 - cleared environment, owner-only attempt, bounded dual-pipe drain, timeout/cancellation, final process-group kill/absence, exit status와 executable hash를 typed report로 기록
-- process-local permit은 live runtime의 child 실행 겹침을 막습니다. POV-009에서 완료된 Conversation DB queue persistence가 crash-recoverable FIFO, fenced lease와 durable system-wide admission state를 보존하지만, 이 state를 `ProcessSupervisor` 또는 provider와 연결해 계속 실행하는 runtime loop는 POV-010~012 통합 전까지 없습니다.
+- process-local permit은 live runtime의 child 실행 겹침을 막습니다. POV-009에서 완료된 Conversation DB queue persistence가 crash-recoverable FIFO, fenced lease와 durable system-wide admission state를 보존하지만, 이 state를 `ProcessSupervisor` 또는 provider와 연결해 계속 실행하는 runtime loop는 POV-011~012 통합 전까지 없습니다.
 - worker는 source DB에 직접 연결하지 않음
 
 Gemma 4 E2B, KURE-v1과 platform별 Whisper multilingual runtime/model은 benchmark 대상인
@@ -150,7 +156,7 @@ MVP는 `rusqlite` 기반 네 개의 SQLite WAL file로 시작합니다.
 
 ## Identity, Authentication, And Streaming
 
-[ADR-0004](decisions/0004-local-authentication-and-session-security-contract.md)가 auth/session 계약을 accepted했습니다. account, password/recovery verifier, durable throttle, login-attempt marker/outcome, session, active refresh family/predecessor와 auth audit source는 Conversation DB의 control-plane auth namespace에 두고 signing private key는 DB 밖 owner-only secret directory에 둡니다. Migration `0004`/`0005` schema, private auth mutation executor, credential primitive, canonical keyring과 initialization/planned/retire transition lifecycle, Unix instance-directory/maintenance-lock/store-binding actor, strict JWT, login/refresh/logout/logout-all과 credential/account mutation repository, fail-closed `AuthRuntime`, local HTTP/cookie profile 및 controlling-TTY `auth init` operator가 구현됐습니다. [POV-007](deps/POV-007-local-login-refresh-and-session-revoke.md)은 2026-07-29 narrowed local-auth runtime boundary의 supported-Unix production smoke와 final validation을 완료했습니다. Planned/retire production operator는 [POV-035](tickets/POV-035-planned-key-rotation-and-retirement-operator.md), compromise/loss recovery는 [POV-036](tickets/POV-036-auth-key-compromise-and-loss-recovery.md), platform/durability evidence는 [POV-037](tickets/POV-037-auth-platform-and-durability-hardening.md), installed-browser auth evidence는 [POV-010](tickets/POV-010-minimal-authenticated-local-text-chat.md)이 소유합니다.
+[ADR-0004](decisions/0004-local-authentication-and-session-security-contract.md)가 auth/session 계약을 accepted했습니다. account, password/recovery verifier, durable throttle, login-attempt marker/outcome, session, active refresh family/predecessor와 auth audit source는 Conversation DB의 control-plane auth namespace에 두고 signing private key는 DB 밖 owner-only secret directory에 둡니다. Migration `0004`/`0005` schema, private auth mutation executor, credential primitive, canonical keyring과 initialization/planned/retire transition lifecycle, Unix instance-directory/maintenance-lock/store-binding actor, strict JWT, login/refresh/logout/logout-all과 credential/account mutation repository, fail-closed `AuthRuntime`, local HTTP/cookie profile 및 controlling-TTY `auth init` operator가 구현됐습니다. [POV-007](deps/POV-007-local-login-refresh-and-session-revoke.md)은 2026-07-29 narrowed local-auth runtime boundary의 supported-Unix production smoke와 final validation을 완료했습니다. Planned/retire production operator는 [POV-035](tickets/POV-035-planned-key-rotation-and-retirement-operator.md), compromise/loss recovery는 [POV-036](tickets/POV-036-auth-key-compromise-and-loss-recovery.md), platform/durability evidence는 [POV-037](tickets/POV-037-auth-platform-and-durability-hardening.md), MacBook installed-browser auth evidence는 [POV-038](tickets/POV-038-macos-dogfood-runtime-and-installed-browser-evidence.md)이 소유합니다.
 
 `storage/auth_records.rs`, 이를 소비하는 storage binding/type과 crate-private transition
 re-export는 Unix에서만 compile됩니다. Windows는 Conversation migration `0004`/`0005`와

@@ -98,6 +98,7 @@ flowchart LR
     P008 --> P009["POV-009 Single-slot queue"]
     P007 --> P010["POV-010 Local text chat"]
     P008 --> P010
+    P010 --> P038["POV-038 macOS dogfood evidence"]
     P009 --> P011["POV-011 Replayable status"]
     P010 --> P011
     P006 --> P012["POV-012 Local LLM round trip"]
@@ -135,7 +136,7 @@ flowchart LR
 | 5 | [POV-007 Local login, refresh and session revoke](deps/POV-007-local-login-refresh-and-session-revoke.md) | Completed delivery — 2026-07-29; supported-Unix production init/listener-ready/second-init no-replace smoke와 final validation 완료 | POV-004, POV-005 | 검증된 auth context가 owner scope를 강제하고 login/refresh/logout/revoke local runtime을 제공 |
 | 6 | [POV-008 Idempotent conversation append and outbox](deps/POV-008-idempotent-conversation-append-and-outbox.md) | Completed delivery — 2026-07-29; persistence acceptance, production auth dependency와 final RTD/repository validation 완료 | POV-004, POV-007 | 입력이 retry와 embedding failure에도 하나의 durable source event로 남음 |
 | 7 | [POV-009 Durable single-slot job queue](deps/POV-009-durable-single-slot-job-queue.md) | Completed delivery — 2026-07-29; persistence acceptance, production auth dependency와 final RTD/repository validation 완료 | POV-008 | outbox 기반 fixed-normal FIFO, fenced single-slot lease, 보수적 recovery halt와 retry/latency history를 복구; API·browser·provider activation은 POV-010~012에 유지 |
-| 8 | [POV-010 Minimal authenticated local text chat](tickets/POV-010-minimal-authenticated-local-text-chat.md) | Ready delivery — ADR-0006 macOS runtime/Windows development gate resolved | POV-007, POV-008 | 사용자가 macOS offline Web Chat에서 text를 저장하고 durable receipt를 확인하며 Windows에서 구현·cross-platform baseline을 유지 |
+| 8 | [POV-010 Minimal authenticated local text chat](tickets/POV-010-minimal-authenticated-local-text-chat.md) | Completed delivery — 2026-07-31; core/API/Web, pinned frontend와 Rust repository baseline PASS | POV-007, POV-008 | owner-scoped local Web Chat의 login, text 저장, durable receipt와 timeline을 component·contract·repository evidence로 검증 |
 | 9 | [POV-011 Authenticated replayable job status stream](tickets/POV-011-authenticated-replayable-job-status-stream.md) | Delivery | POV-009, POV-010 | token refresh와 reconnect 뒤에도 owner-scoped 상태를 이어 봄 |
 | 10 | [POV-012 Loopback LLM text round trip](tickets/POV-012-loopback-llm-text-round-trip.md) | Delivery | POV-006, POV-009, POV-010 | local provider crash를 안전하게 드러내는 text inference 왕복 |
 | 11 | [POV-013 Conversation Core offline evidence gate](tickets/POV-013-conversation-core-offline-evidence-gate.md) | Evidence gate | POV-004~012 | offline, owner isolation, retry, reconnect와 process failure 증거로 H2 진입 여부 결정 |
@@ -161,10 +162,12 @@ evidence를 다시 읽고 Ready 여부를 판단합니다.
 | A1 | [POV-035 Planned key rotation and retirement operator](tickets/POV-035-planned-key-rotation-and-retirement-operator.md) | Delivery | POV-007 | 구현된 planned/retire lifecycle을 listener-closed production operator로 안전하게 실행·재개 |
 | A2 | [POV-036 Auth key compromise and loss recovery](tickets/POV-036-auth-key-compromise-and-loss-recovery.md) | Delivery | POV-007, POV-035 | recovery-code authorization, session invalidation과 replacement key lifecycle을 fail closed로 연결 |
 | A3 | [POV-037 Auth platform and durability hardening](tickets/POV-037-auth-platform-and-durability-hardening.md) | Hardening evidence | POV-007 | claim할 platform의 PTY, reference-device Argon2, abrupt-crash/filesystem durability와 residual을 기록 |
+| A4 | [POV-038 macOS dogfood runtime and installed-browser evidence](tickets/POV-038-macos-dogfood-runtime-and-installed-browser-evidence.md) | Platform activation evidence | POV-007, POV-010; target MacBook available | macOS production auth/listener와 installed-browser login·capture·cookie/storage/offline evidence를 실제 장비에서 기록 |
 
-A1~A3는 initial H1 text-capture activation gate가 아닙니다. A1은 장기 key maintenance/release
+A1~A4는 initial H1 text-capture implementation gate가 아닙니다. A1은 장기 key maintenance/release
 claim, A2는 compromise/loss recovery 지원 claim, A3는 해당 platform/performance/durability
-claim 전에 각각 완료합니다. Installed-browser auth evidence는 POV-010이 소유합니다.
+claim 전에 각각 완료합니다. A4는 target MacBook을 확보한 뒤 활성화하며, macOS
+production/dogfood와 installed-browser 지원 claim 전에 완료합니다.
 
 ## Decision Gates
 
@@ -174,6 +177,8 @@ claim 전에 각각 완료합니다. Installed-browser auth evidence는 POV-010�
 - POV-010 dogfood platform: [ADR-0006](decisions/0006-h1-development-and-dogfood-platform.md)
   Accepted; MacBook macOS가 H1 always-on/dogfood backend이고 Windows는
   development/cross-platform validation 환경
+- POV-038 macOS activation evidence: target MacBook을 확보할 때까지 backlog로 유지하며
+  POV-010 implementation delivery를 막지 않음
 - POV-022 외부 사용자 검증: 개인용 H1~H5 완성 뒤 또는 명시적 재우선순위 결정 뒤 활성화하며 현재 delivery dependency로 사용하지 않음
 - 외부 contribution 허용 전: 제출·검토·라이선스 동의 정책 확정
 - authentication 구현 전: [ADR-0004](decisions/0004-local-authentication-and-session-security-contract.md) Accepted

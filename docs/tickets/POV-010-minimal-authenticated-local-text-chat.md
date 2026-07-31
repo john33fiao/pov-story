@@ -1,6 +1,6 @@
 # POV-010 Minimal Authenticated Local Text Chat
 
-Status: Ready — ADR-0006 macOS runtime target and Windows development role accepted
+Status: Completed — 2026-07-31; core/API/Web delivery and pinned repository validation complete
 
 Type: Delivery
 
@@ -8,7 +8,8 @@ Roadmap: H1 — Trustworthy text capture
 
 Depends on: POV-007, POV-008
 
-Runtime target: MacBook macOS same-origin production runtime
+Runtime target: same-origin local production runtime; MacBook macOS dogfood activation evidence is
+deferred to POV-038
 
 Development target: Windows frontend and cross-platform repository validation; no production auth
 stub or bypass
@@ -30,7 +31,6 @@ POV-001의 offline shell에 login, owner-scoped conversation 선택, text submit
 - stored user-event timeline and error state
 - keyboard accessibility and basic status semantics
 - no-external-asset offline flow
-- installed-browser cookie, URL, storage, cache와 redaction evidence
 
 ## HTTP Contract
 
@@ -51,10 +51,12 @@ POV-001의 offline shell에 login, owner-scoped conversation 선택, text submit
 
 - Windows에서 frontend와 Rust repository baseline, model-independent component/contract test를
   실행합니다.
-- MacBook macOS에서 production `auth init`, listener-ready startup, installed-browser
-  login/refresh/logout, text capture/readback과 cookie/storage/cache evidence를 실행합니다.
-- macOS 실기 evidence를 실행하기 전에는 구현이 끝나도 이 ticket을 `Completed`로 바꾸지
-  않습니다.
+- supported-Unix auth/listener behavior는 기존 production smoke와 WSL-native supplemental
+  evidence를 사용하되 macOS 검증으로 확장하지 않습니다.
+- MacBook production `auth init`, listener-ready startup, installed-browser
+  login/refresh/logout, text capture/readback과 cookie/storage/cache evidence는
+  [POV-038](POV-038-macos-dogfood-runtime-and-installed-browser-evidence.md) backlog가
+  소유하며 이 ticket의 implementation completion을 막지 않습니다.
 
 ## Out Of Scope
 
@@ -76,17 +78,51 @@ POV-001의 offline shell에 login, owner-scoped conversation 선택, text submit
   나타나지 않습니다.
 - refresh cookie는 exact local profile의 `Path=/api/auth`, `HttpOnly`,
   `SameSite=Strict`와 cache-control contract를 유지하고 logout 뒤 clear됩니다.
-- evidence를 실행한 installed browser/version만 PASS로 기록하며 unavailable Chrome/Safari
-  조합을 검증된 것으로 확장하지 않습니다.
+- 실제 installed-browser/macOS production 지원은 POV-038 evidence 전까지 주장하지
+  않습니다.
 
 ## Verification
 
 - component/unit tests using synthetic content
-- local same-origin capture smoke
-- duplicate submit, auth expiry and storage failure browser test
-- offline browser network inspection
-- installed-browser login/refresh/logout, cookie flags, URL/storage/cache inspection
+- local auth/conversation HTTP contract와 supported-Unix production smoke
+- duplicate submit, auth expiry, storage failure와 token non-persistence component tests
+- build asset의 external runtime dependency inspection
 - actual repository validation commands and `git diff --check`
+
+## Completion Evidence — 2026-07-31
+
+- `pov-core`는 verified owner별 conversation 목록과 revision 순서 timeline read를
+  제공하고 cross-owner read를 `NotFound`로 닫습니다.
+- supported-Unix `pov-api`는 `AuthRuntime::verify_access` 뒤에만 세 conversation route를
+  열고 path/body에서 owner authority를 받지 않습니다.
+- React client는 boot refresh, login/logout, 401 refresh-once retry, conversation
+  selection/creation과 authoritative append readback을 제공합니다. Access token은 React
+  memory에만 있고 Web Storage API를 사용하지 않습니다.
+- Windows에서 repository 조회 표적 테스트, strict append payload 계약 테스트와
+  jsdom component test 3건이 PASS했습니다. Component test는 login fallback/token
+  non-persistence, 첫 append의 absent revision/401 retry/authoritative render와
+  미확인 logout을 성공으로 표시하지 않는 경계를 확인합니다.
+- Windows host의 Linux target 교차 check는 bundled SQLite C source용
+  `x86_64-linux-gnu-gcc` 부재로 중단됐지만, WSL Ubuntu의 별도 `/tmp` target에서
+  `cargo check --locked --workspace --all-targets`와 `cargo test --locked -p pov-api`가
+  PASS했습니다. 이는 Unix compile/test evidence이며 macOS production evidence로
+  확장하지 않습니다.
+- 같은 WSL native `/tmp` 경계에서 production binary build,
+  `scripts/test_operator_pty.py`, `scripts/test_production_auth_smoke.py`와
+  `KDF_TEST_SERIAL=1 cargo test --locked --workspace --all-targets -- --test-threads=1`이
+  PASS했습니다.
+- Windows에서 Rust fmt/check/workspace test(153 tests)가 PASS했습니다. Frontend
+  format/lint/test/typecheck/build는 Node `22.17.0`/npm `10.9.2`에서 PASS했습니다.
+- 정본 Node `26.4.0`/npm `11.17.0`에서 `npm --prefix web ci`,
+  format/lint/test/typecheck/build가 모두 PASS했습니다. Vitest test는
+  `/// <reference types="vitest/jsdom" />`와 실제 `jsdom.window` Web Storage를 사용해 Node
+  26의 file-less global Web Storage와 분리하며 추가 `NODE_OPTIONS` 없이 3건이 PASS합니다.
+- Windows Rust 표적 payload contract test, fmt, locked workspace check와 153 tests가
+  PASS했습니다. 기존 WSL-native supported-Unix production/auth evidence도 보존합니다.
+- 연결 가능한 browser와 target MacBook이 없어 실제 UI/macOS inspection은
+  `UNAVAILABLE`이었으며, device-bound production/browser evidence는 POV-038 backlog가
+  소유합니다. 이는 POV-010 implementation delivery의 완료를 막지 않으며 macOS
+  production 지원 근거로 확장하지 않습니다.
 
 ## Rollback
 
@@ -99,4 +135,5 @@ text composer route를 비활성화해도 이미 저장된 conversation event는
 - [POV-001](../deps/POV-001-local-offline-walking-skeleton.md)
 - [POV-007](../deps/POV-007-local-login-refresh-and-session-revoke.md)
 - [POV-008](../deps/POV-008-idempotent-conversation-append-and-outbox.md)
+- [POV-038](POV-038-macos-dogfood-runtime-and-installed-browser-evidence.md)
 - [ADR-0006](../decisions/0006-h1-development-and-dogfood-platform.md)

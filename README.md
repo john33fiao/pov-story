@@ -8,12 +8,17 @@ POV Story는 메모, 음성, 일정, 할 일, 작업일지와 장기 기억을 �
 - owner/source/revision, 네 SQLite lifecycle, safe process supervisor와 POV-008/009 persistence delivery가 완료됐습니다.
 - 인증은 local login/JWT/session/revoke HTTP runtime과 controlling-TTY `auth init` operator까지 연결됐습니다. 신규 initialization은 corpus evaluation을 주장하지 않는 persisted sentinel을 사용하며 password blocklist enforcement는 current tree에서 제거됐습니다.
 - Windows Rust workspace check/test baseline은 [POV-034](docs/deps/POV-034-restore-windows-workspace-validation-baseline.md)에서 복구됐고 Unix auth maintenance capability는 Windows에서 계속 비활성입니다.
-- 실제 lifelog 접수, background dispatcher, provider/model 실행은 활성화되지 않았습니다.
+- POV-010의 owner-scoped conversation 목록/타임라인/append API와 로그인·세션 복구·텍스트
+  composer 웹 흐름은 2026-07-31 구현·검증을 완료했습니다. MacBook production runtime과
+  installed-browser evidence는 장비 확보 뒤
+  [POV-038](docs/tickets/POV-038-macos-dogfood-runtime-and-installed-browser-evidence.md)에서
+  실행하며 완료 전까지 macOS production 지원을 주장하지 않습니다. Background dispatcher와
+  provider/model 실행은 활성화되지 않았습니다.
 - H1 always-on backend와 dogfood runtime target은 MacBook의 macOS이며, Windows는 구현과
   cross-platform validation 환경으로 사용합니다. Native Windows production auth는 계속
   fail closed이고 POV-010의 선행 조건이 아닙니다.
 
-현재 근접 작업은 완료된 [POV-007 auth delivery](docs/deps/POV-007-local-login-refresh-and-session-revoke.md), [POV-008 conversation append](docs/deps/POV-008-idempotent-conversation-append-and-outbox.md), [POV-009 durable queue](docs/deps/POV-009-durable-single-slot-job-queue.md)에 이어 [POV-010](docs/tickets/POV-010-minimal-authenticated-local-text-chat.md)부터 H1 single-owner 제품 흐름을 활성화하는 것입니다. [POV-022 외부 사용자 discovery](docs/tickets/POV-022-first-segment-and-voice-wedge-discovery-gate.md)는 개인용 H1~H5 완성 뒤의 후순위 제품 검증 backlog이며 현재 delivery를 막지 않습니다.
+현재 근접 작업은 완료된 [POV-007 auth delivery](docs/deps/POV-007-local-login-refresh-and-session-revoke.md), [POV-008 conversation append](docs/deps/POV-008-idempotent-conversation-append-and-outbox.md), [POV-009 durable queue](docs/deps/POV-009-durable-single-slot-job-queue.md), [POV-010 local text chat](docs/tickets/POV-010-minimal-authenticated-local-text-chat.md)에 이어 [POV-011 replayable status stream](docs/tickets/POV-011-authenticated-replayable-job-status-stream.md)의 readiness를 검토하는 것입니다. MacBook 실기 검증은 장비 확보 전까지 POV-038 backlog로 유지합니다. [POV-022 외부 사용자 discovery](docs/tickets/POV-022-first-segment-and-voice-wedge-discovery-gate.md)는 개인용 H1~H5 완성 뒤의 후순위 제품 검증 backlog이며 현재 delivery를 막지 않습니다.
 
 ## 빠른 실행
 

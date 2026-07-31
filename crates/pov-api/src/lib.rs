@@ -36,7 +36,7 @@ use pov_core::{
     storage::StoreSet,
 };
 use rust_embed::Embed;
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 use serde::{
     Deserialize, Deserializer,
     de::{self, MapAccess, Visitor},
@@ -132,7 +132,7 @@ struct PasswordChangePayload {
     new_password: String,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 struct AppendEventPayload {
     idempotency_key: String,
     expected_revision: Option<u64>,
@@ -268,7 +268,7 @@ impl<'de> Deserialize<'de> for PasswordChangePayload {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 impl<'de> Deserialize<'de> for AppendEventPayload {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -1056,6 +1056,47 @@ fn embedded_asset_response(path: &str) -> Response {
         .header("x-content-type-options", "nosniff")
         .body(Body::from(data))
         .expect("static response headers are valid")
+}
+
+#[cfg(test)]
+mod conversation_contract_tests {
+    use super::AppendEventPayload;
+
+    #[test]
+    fn append_payload_requires_exact_fields_and_absent_or_numeric_revision() {
+        let first: AppendEventPayload = serde_json::from_str(
+            r#"{
+                "idempotency_key":"a1b06fd4-39a2-4210-940c-ace9d47a610b",
+                "content":"synthetic first note"
+            }"#,
+        )
+        .expect("first append payload");
+        assert_eq!(
+            first.idempotency_key,
+            "a1b06fd4-39a2-4210-940c-ace9d47a610b"
+        );
+        assert_eq!(first.expected_revision, None);
+        assert_eq!(first.content, "synthetic first note");
+
+        let later: AppendEventPayload = serde_json::from_str(
+            r#"{
+                "idempotency_key":"e76aa730-c29a-45e0-84fc-c9b88d819e69",
+                "expected_revision":7,
+                "content":"synthetic later note"
+            }"#,
+        )
+        .expect("later append payload");
+        assert_eq!(later.expected_revision, Some(7));
+
+        for invalid in [
+            r#"{"idempotency_key":"x","expected_revision":null,"content":"x"}"#,
+            r#"{"idempotency_key":"x","content":"x","owner_id":"forged"}"#,
+            r#"{"idempotency_key":"x","idempotency_key":"y","content":"x"}"#,
+            r#"{"idempotency_key":"x"}"#,
+        ] {
+            assert!(serde_json::from_str::<AppendEventPayload>(invalid).is_err());
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

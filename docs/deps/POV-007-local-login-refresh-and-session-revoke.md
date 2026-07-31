@@ -31,7 +31,7 @@ logout-all과 session revoke를 fail closed로 사용할 수 있는 runtime**까
 | --- | --- | --- |
 | planned rotation·verify-only retire production operator | [POV-035](../tickets/POV-035-planned-key-rotation-and-retirement-operator.md) | 초기 H1 text capture gate 아님; 장기 key maintenance/release claim 전 필요 |
 | compromise·loss recovery와 production operator | [POV-036](../tickets/POV-036-auth-key-compromise-and-loss-recovery.md) | 초기 H1 text capture gate 아님; 해당 recovery 지원 claim 전 필요 |
-| installed-browser login/refresh/logout, cookie·storage evidence | [POV-010](../tickets/POV-010-minimal-authenticated-local-text-chat.md) | H1 product/browser evidence에서 검증 |
+| MacBook installed-browser login/refresh/logout, cookie·storage evidence | [POV-038](../tickets/POV-038-macos-dogfood-runtime-and-installed-browser-evidence.md) | Target MacBook 확보 뒤 macOS production/dogfood claim 전에 검증 |
 | platform PTY matrix, reference-device Argon2, abrupt crash/power-loss, same-UID ABA residual | [POV-037](../tickets/POV-037-auth-platform-and-durability-hardening.md) | 초기 H1 text capture gate 아님; 해당 platform/durability claim 전 필요 |
 
 POV-007 completion은 현재 구현된 Unix auth maintenance profile만 주장합니다.
@@ -51,7 +51,7 @@ POV-010의 선행 delivery로 만들지 않습니다.
 - Cargo production-subprocess parser/dispatch evidence에서 비정규·secret-looking argv, redirected stdio/no controlling TTY의 진단 redaction과 mutation 부재 검증
 - refresh replay detection과 related session revoke
 - password change, saved recovery-code rotation/recovery와 user disable/re-enable
-- local HTTP token/cookie profile; installed-browser product flow는 POV-010에서 검증
+- local HTTP token/cookie profile; MacBook installed-browser product flow는 POV-038에서 검증
 - auth/token redaction과 negative audit evidence
 
 ## Delivery Slices
