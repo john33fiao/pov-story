@@ -1,6 +1,6 @@
 # TODO
 
-Last updated: 2026-07-30
+Last updated: 2026-07-31
 
 Current phase: H6 follow-on direction accepted; H0 completed including Windows workspace validation baseline; H1 single-owner product delivery active; external POV-022 research deferred until the personal product is complete or explicitly reprioritized
 
@@ -17,12 +17,15 @@ Repository posture: public fresh-history baseline verified 2026-07-27; POV-031 c
 
 ## Now
 
-POV-010을 시작하기 전에 H1 dogfood platform을 declared supported Unix/WSL 또는 native Windows 중 하나로 명시합니다. Native Windows를 선택하면 성공 stub 없이 별도 auth delivery ticket을 먼저 만듭니다. 이번 repository initialization은 platform을 선택하지 않습니다.
+H1 always-on backend와 dogfood runtime은
+[ADR-0006](decisions/0006-h1-development-and-dogfood-platform.md)에서 MacBook의 macOS로
+결정했습니다. Windows는 구현과 cross-platform validation에 사용하며 native Windows
+production auth는 POV-010의 선행 조건이 아닙니다.
 
 | Item | Type | Status | Outcome |
 | --- | --- | --- | --- |
-| H1 dogfood platform declaration | Decision gate | Open — required before POV-010 activation | declared supported Unix/WSL 또는 native Windows를 명시하고, native Windows 선택 시 별도 auth delivery ticket 생성 |
-| [POV-010 Minimal authenticated local text chat](tickets/POV-010-minimal-authenticated-local-text-chat.md) | Delivery | Planned — awaiting dogfood platform declaration | installed-browser login/refresh/logout과 owner-scoped text capture, durable receipt, stored timeline 검증 |
+| [ADR-0006 H1 development and dogfood platform](decisions/0006-h1-development-and-dogfood-platform.md) | Decision gate | Accepted — 2026-07-31 | macOS를 always-on/dogfood backend로, Windows를 development/cross-platform validation으로 고정 |
+| [POV-010 Minimal authenticated local text chat](tickets/POV-010-minimal-authenticated-local-text-chat.md) | Delivery | Ready — platform gate resolved; implementation next | macOS installed-browser login/refresh/logout과 owner-scoped text capture, durable receipt, stored timeline 검증; Windows에서 구현·baseline 검증 |
 
 ## Auth Follow-ups — Not Initial H1 Gates
 
@@ -78,7 +81,9 @@ H3~H5 상세 delivery ticket은 [POV-021](tickets/POV-021-voice-round-trip-evide
 - [ ] 개인용 H1~H5 완성 또는 명시적 재우선순위 결정 뒤 POV-022 외부 사용자 검증 활성화
 - [x] POV-001에서 Rust toolchain, Node version, package manager를 실제 manifest와 함께 고정
 - [x] [ADR-0004](decisions/0004-local-authentication-and-session-security-contract.md)에서 authentication cryptography, key lifecycle과 refresh lifetime 결정
-- [ ] POV-010 activation 전에 H1 dogfood platform을 declared supported Unix/WSL 또는 native Windows 중 명시하고, native Windows를 선택하면 별도 auth delivery ticket 생성
+- [x] [ADR-0006](decisions/0006-h1-development-and-dogfood-platform.md)에서 MacBook
+  macOS를 H1 always-on/dogfood backend로, Windows를 development/cross-platform validation
+  환경으로 결정
 - [ ] POV-014에서 temporary Blob encryption, retention, quota와 irreversible purge contract 결정
 - [ ] model/runtime artifact pinning과 versioned quality gate 결정
 - [ ] backup, export, restore와 explicit purge policy 결정

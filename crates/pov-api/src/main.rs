@@ -43,11 +43,18 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 #[cfg(unix)]
 async fn serve(instance_root: PathBuf) -> Result<(), Box<dyn Error>> {
-    let stores = StoreSet::open(instance_root.join("stores")).await?;
+    let stores = Arc::new(StoreSet::open(instance_root.join("stores")).await?);
     let now_micros = current_time_micros()?;
-    let runtime = Arc::new(AuthRuntime::open(&instance_root, &stores, now_micros).await?);
+    let runtime = Arc::new(AuthRuntime::open(&instance_root, stores.as_ref(), now_micros).await?);
     let listener = TcpListener::bind(DEFAULT_BIND_ADDRESS).await?;
-    axum::serve(listener, app_with_auth(runtime)).await?;
+    axum::serve(
+        listener,
+        app_with_auth(Arc::clone(&runtime), Arc::clone(&stores)),
+    )
+    .await?;
+    drop(runtime);
+    let stores = Arc::try_unwrap(stores)
+        .map_err(|_| io::Error::other("store references remain after server shutdown"))?;
     stores.close().await?;
     Ok(())
 }

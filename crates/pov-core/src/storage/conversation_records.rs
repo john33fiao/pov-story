@@ -17,8 +17,8 @@ use crate::{
     conversation::{
         AppendReceipt, AuditId, ContentHash, ConversationAudit, ConversationError,
         ConversationEvent, ConversationEventId, ConversationEventKind, ConversationId,
-        ConversationRecord, IdempotencyKey, IdempotencyResult, OutboxEvent, OutboxId,
-        PreparedAppend, RequestFingerprint, conversation_source, event_source,
+        ConversationRecord, ConversationTimeline, IdempotencyKey, IdempotencyResult, OutboxEvent,
+        OutboxId, PreparedAppend, RequestFingerprint, conversation_source, event_source,
     },
     identity::{CorrelationId, Revision, VerifiedAuthContext},
 };
@@ -587,6 +587,142 @@ pub(crate) async fn read_conversation(
         .map_err(map_executor_error)
 }
 
+pub(crate) async fn list_conversations(
+    store: &SqliteStore<ConversationStore>,
+    auth: VerifiedAuthContext,
+) -> Result<Vec<ConversationRecord>, ConversationError> {
+    ensure_store_healthy(store)?;
+    let poison = Arc::clone(&store.operation_poisoned);
+    store
+        .connection
+        .call(move |connection| {
+            ensure_connection_healthy(&poison)?;
+            let mut statement = connection
+                .prepare(
+                    "SELECT conversation_id, current_revision
+                     FROM conversations
+                     WHERE owner_id = ?1
+                     ORDER BY updated_at_micros DESC, conversation_id ASC",
+                )
+                .map_err(backend)?;
+            let rows = statement
+                .query_map(
+                    params![auth.owner_id().as_uuid().as_bytes().as_slice()],
+                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .map_err(backend)?;
+            let mut conversations = Vec::new();
+            for row in rows {
+                let (conversation_id, revision) = row.map_err(backend)?;
+                let conversation_id = decode_conversation_id(&conversation_id)?;
+                conversations.push(ConversationRecord {
+                    id: conversation_id,
+                    source: conversation_source(
+                        &auth,
+                        conversation_id,
+                        decode_revision(revision)?,
+                    )?,
+                });
+            }
+            Ok(conversations)
+        })
+        .await
+        .map_err(map_executor_error)
+}
+
+pub(crate) async fn read_timeline(
+    store: &SqliteStore<ConversationStore>,
+    auth: VerifiedAuthContext,
+    id: ConversationId,
+) -> Result<ConversationTimeline, ConversationError> {
+    ensure_store_healthy(store)?;
+    let poison = Arc::clone(&store.operation_poisoned);
+    store
+        .connection
+        .call(move |connection| {
+            ensure_connection_healthy(&poison)?;
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Deferred)
+                .map_err(backend)?;
+            let revision: Option<i64> = transaction
+                .query_row(
+                    "SELECT current_revision
+                     FROM conversations
+                     WHERE owner_id = ?1 AND conversation_id = ?2",
+                    params![
+                        auth.owner_id().as_uuid().as_bytes().as_slice(),
+                        id.as_uuid().as_bytes().as_slice()
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(backend)?;
+            let revision = revision.ok_or(ConversationError::NotFound)?;
+            let mut statement = transaction
+                .prepare(
+                    "SELECT
+                        event_id,
+                        conversation_id,
+                        conversation_revision,
+                        event_kind,
+                        content,
+                        content_bytes,
+                        content_sha256,
+                        correlation_id
+                     FROM conversation_events
+                     WHERE owner_id = ?1 AND conversation_id = ?2
+                     ORDER BY conversation_revision ASC",
+                )
+                .map_err(backend)?;
+            let rows = statement
+                .query_map(
+                    params![
+                        auth.owner_id().as_uuid().as_bytes().as_slice(),
+                        id.as_uuid().as_bytes().as_slice()
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            EventRow {
+                                conversation_id: row.get(1)?,
+                                conversation_revision: row.get(2)?,
+                                event_kind: row.get(3)?,
+                                content: row.get(4)?,
+                                content_bytes: row.get(5)?,
+                                content_sha256: row.get(6)?,
+                                correlation_id: row.get(7)?,
+                            },
+                        ))
+                    },
+                )
+                .map_err(backend)?;
+            let mut events = Vec::new();
+            for row in rows {
+                let (event_id, row) = row.map_err(backend)?;
+                events.push(decode_event(&auth, decode_event_id(&event_id)?, row)?);
+            }
+            drop(statement);
+            transaction.commit().map_err(backend)?;
+
+            let revision = decode_revision(revision)?;
+            if events.is_empty()
+                || events.last().map(ConversationEvent::conversation_revision) != Some(revision)
+                || events.iter().any(|event| event.conversation_id() != id)
+            {
+                return Err(ConversationError::CorruptStoredState);
+            }
+            Ok(ConversationTimeline {
+                conversation: ConversationRecord {
+                    id,
+                    source: conversation_source(&auth, id, revision)?,
+                },
+                events,
+            })
+        })
+        .await
+        .map_err(map_executor_error)
+}
+
 pub(crate) async fn read_event(
     store: &SqliteStore<ConversationStore>,
     auth: VerifiedAuthContext,
@@ -629,30 +765,36 @@ pub(crate) async fn read_event(
                 .optional()
                 .map_err(backend)?;
             let row = row.ok_or(ConversationError::NotFound)?;
-            let content_hash = decode_content_hash(&row.content_sha256)?;
-            let actual_hash =
-                ContentHash::from_bytes(sha2::Sha256::digest(row.content.as_bytes()).into());
-            if usize::try_from(row.content_bytes)
-                .map_err(|_| ConversationError::CorruptStoredState)?
-                != row.content.len()
-                || actual_hash != content_hash
-            {
-                return Err(ConversationError::CorruptStoredState);
-            }
-            Ok(ConversationEvent {
-                id,
-                conversation_id: decode_conversation_id(&row.conversation_id)?,
-                conversation_revision: decode_revision(row.conversation_revision)?,
-                source: event_source(&auth, id)?,
-                kind: ConversationEventKind::from_str(&row.event_kind)
-                    .ok_or(ConversationError::CorruptStoredState)?,
-                content: row.content,
-                content_hash,
-                correlation_id: decode_correlation_id(&row.correlation_id)?,
-            })
+            decode_event(&auth, id, row)
         })
         .await
         .map_err(map_executor_error)
+}
+
+fn decode_event(
+    auth: &VerifiedAuthContext,
+    id: ConversationEventId,
+    row: EventRow,
+) -> Result<ConversationEvent, ConversationError> {
+    let content_hash = decode_content_hash(&row.content_sha256)?;
+    let actual_hash = ContentHash::from_bytes(sha2::Sha256::digest(row.content.as_bytes()).into());
+    if usize::try_from(row.content_bytes).map_err(|_| ConversationError::CorruptStoredState)?
+        != row.content.len()
+        || actual_hash != content_hash
+    {
+        return Err(ConversationError::CorruptStoredState);
+    }
+    Ok(ConversationEvent {
+        id,
+        conversation_id: decode_conversation_id(&row.conversation_id)?,
+        conversation_revision: decode_revision(row.conversation_revision)?,
+        source: event_source(auth, id)?,
+        kind: ConversationEventKind::from_str(&row.event_kind)
+            .ok_or(ConversationError::CorruptStoredState)?,
+        content: row.content,
+        content_hash,
+        correlation_id: decode_correlation_id(&row.correlation_id)?,
+    })
 }
 
 pub(crate) async fn read_outbox(

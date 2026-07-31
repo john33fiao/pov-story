@@ -48,6 +48,8 @@
 
 ## Operations And Public Project
 
+- MacBook macOS H1 runtime의 exact OS/browser version, service launch 방식과 backup/restore
+  evidence를 어떤 release gate에서 고정할 것인가?
 - Cloudflare zone, Tunnel replica, WAF/rate limit/Turnstile baseline과 incident alert는?
 - backup, export, restore, explicit purge policy와 recovery objective는?
 - 외부 contribution을 받을 경우 제출, 검토와 라이선스 동의 정책을 어떻게 정의할 것인가?

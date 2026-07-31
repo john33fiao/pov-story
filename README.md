@@ -9,6 +9,9 @@ POV Story는 메모, 음성, 일정, 할 일, 작업일지와 장기 기억을 �
 - 인증은 local login/JWT/session/revoke HTTP runtime과 controlling-TTY `auth init` operator까지 연결됐습니다. 신규 initialization은 corpus evaluation을 주장하지 않는 persisted sentinel을 사용하며 password blocklist enforcement는 current tree에서 제거됐습니다.
 - Windows Rust workspace check/test baseline은 [POV-034](docs/deps/POV-034-restore-windows-workspace-validation-baseline.md)에서 복구됐고 Unix auth maintenance capability는 Windows에서 계속 비활성입니다.
 - 실제 lifelog 접수, background dispatcher, provider/model 실행은 활성화되지 않았습니다.
+- H1 always-on backend와 dogfood runtime target은 MacBook의 macOS이며, Windows는 구현과
+  cross-platform validation 환경으로 사용합니다. Native Windows production auth는 계속
+  fail closed이고 POV-010의 선행 조건이 아닙니다.
 
 현재 근접 작업은 완료된 [POV-007 auth delivery](docs/deps/POV-007-local-login-refresh-and-session-revoke.md), [POV-008 conversation append](docs/deps/POV-008-idempotent-conversation-append-and-outbox.md), [POV-009 durable queue](docs/deps/POV-009-durable-single-slot-job-queue.md)에 이어 [POV-010](docs/tickets/POV-010-minimal-authenticated-local-text-chat.md)부터 H1 single-owner 제품 흐름을 활성화하는 것입니다. [POV-022 외부 사용자 discovery](docs/tickets/POV-022-first-segment-and-voice-wedge-discovery-gate.md)는 개인용 H1~H5 완성 뒤의 후순위 제품 검증 backlog이며 현재 delivery를 막지 않습니다.
 
@@ -24,7 +27,10 @@ npm --prefix web run build
 cargo build --locked --release -p pov-api
 ```
 
-최초 owner 인증은 redirect할 수 없는 controlling TTY에서 별도로 초기화합니다. password나 recovery code를 인자나 환경 변수로 전달하는 형식은 제공하지 않습니다.
+최초 owner 인증은 supported Unix의 redirect할 수 없는 controlling TTY에서 별도로
+초기화합니다. H1 target은 MacBook의 macOS이며 native Windows binary는 production auth를
+제공하지 않습니다. Password나 recovery code를 인자나 환경 변수로 전달하는 형식은
+제공하지 않습니다.
 
 ```bash
 cargo run --locked --release -p pov-api -- auth init --instance-root /absolute/private/path --login-id owner_01
@@ -69,6 +75,8 @@ git diff --check
 - [Live TODO](docs/TODO.md): 현재 phase와 ticket 상태
 - [Outcome Roadmap And WBS](docs/WBS.md): 순서, dependency와 evidence gate
 - [Tickets](docs/tickets/), [Decisions](docs/decisions/), [Open Questions](docs/OPEN_QUESTIONS.md): 상세 범위, 결정과 미결 선택
+- [ADR-0006](docs/decisions/0006-h1-development-and-dogfood-platform.md): macOS
+  always-on/dogfood backend와 Windows 개발·검증 역할
 
 ## 핵심 경계
 

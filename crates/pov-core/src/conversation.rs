@@ -167,7 +167,8 @@ pub enum ConversationEventKind {
 }
 
 impl ConversationEventKind {
-    pub(crate) const fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::UserText => "user_text",
             Self::AssistantText => "assistant_text",
@@ -211,6 +212,34 @@ impl fmt::Debug for ConversationRecord {
             .debug_struct("ConversationRecord")
             .field("id", &self.id)
             .field("revision", &self.source.revision())
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct ConversationTimeline {
+    pub(crate) conversation: ConversationRecord,
+    pub(crate) events: Vec<ConversationEvent>,
+}
+
+impl ConversationTimeline {
+    #[must_use]
+    pub const fn conversation(&self) -> &ConversationRecord {
+        &self.conversation
+    }
+
+    #[must_use]
+    pub fn events(&self) -> &[ConversationEvent] {
+        &self.events
+    }
+}
+
+impl fmt::Debug for ConversationTimeline {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConversationTimeline")
+            .field("conversation", &self.conversation)
+            .field("events", &self.events)
             .finish()
     }
 }
@@ -503,6 +532,21 @@ impl<'a> ConversationRepository<'a> {
         id: ConversationId,
     ) -> Result<ConversationRecord, ConversationError> {
         storage::conversation_records::read_conversation(self.store, auth.clone(), id).await
+    }
+
+    pub async fn list_conversations(
+        &self,
+        auth: &VerifiedAuthContext,
+    ) -> Result<Vec<ConversationRecord>, ConversationError> {
+        storage::conversation_records::list_conversations(self.store, auth.clone()).await
+    }
+
+    pub async fn read_timeline(
+        &self,
+        auth: &VerifiedAuthContext,
+        id: ConversationId,
+    ) -> Result<ConversationTimeline, ConversationError> {
+        storage::conversation_records::read_timeline(self.store, auth.clone(), id).await
     }
 
     pub async fn read_event(
@@ -849,6 +893,90 @@ mod tests {
                 .expect("other owner row counts"),
             (1, 1, 1, 1, 1)
         );
+    }
+
+    #[tokio::test]
+    async fn list_and_timeline_are_owner_scoped_and_revision_ordered() {
+        let directory = tempfile::tempdir().expect("temporary store directory");
+        let stores = StoreSet::open(directory.path().join("stores"))
+            .await
+            .expect("stores open");
+        let repository = ConversationRepository::new(&stores.conversation);
+        let owner = VerifiedAuthContext::synthetic(41);
+        let other_owner = VerifiedAuthContext::synthetic(42);
+        let conversation_id = ConversationId::new();
+
+        let first = repository
+            .append_user_event(
+                &owner,
+                command(
+                    conversation_id,
+                    IdempotencyKey::new(),
+                    None,
+                    "first stored event",
+                ),
+            )
+            .await
+            .expect("first append");
+        repository
+            .append_user_event(
+                &owner,
+                command(
+                    conversation_id,
+                    IdempotencyKey::new(),
+                    Some(first.event.conversation_revision()),
+                    "second stored event",
+                ),
+            )
+            .await
+            .expect("second append");
+
+        let conversations = repository
+            .list_conversations(&owner)
+            .await
+            .expect("owner list");
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].id(), conversation_id);
+        assert_eq!(conversations[0].source().revision().get(), 2);
+
+        let timeline = repository
+            .read_timeline(&owner, conversation_id)
+            .await
+            .expect("owner timeline");
+        assert_eq!(timeline.conversation().id(), conversation_id);
+        assert_eq!(timeline.conversation().source().revision().get(), 2);
+        assert_eq!(
+            timeline
+                .events()
+                .iter()
+                .map(|event| event.content())
+                .collect::<Vec<_>>(),
+            ["first stored event", "second stored event"]
+        );
+        assert_eq!(
+            timeline
+                .events()
+                .iter()
+                .map(|event| event.ordinal())
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+
+        assert!(
+            repository
+                .list_conversations(&other_owner)
+                .await
+                .expect("other owner list")
+                .is_empty()
+        );
+        assert_eq!(
+            repository
+                .read_timeline(&other_owner, conversation_id)
+                .await,
+            Err(ConversationError::NotFound)
+        );
+
+        stores.close().await.expect("stores close");
     }
 
     #[tokio::test]

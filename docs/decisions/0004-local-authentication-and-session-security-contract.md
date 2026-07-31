@@ -6,6 +6,9 @@
 - Partial supersession:
   [ADR-0005](0005-password-blocklist-removal-and-legacy-auth-compatibility.md)
   (Accepted 2026-07-27; password blocklist enforcement와 persisted marker semantics만)
+- Delivery sequencing:
+  [ADR-0006](0006-h1-development-and-dogfood-platform.md)
+  (Accepted 2026-07-31; macOS H1 runtime target와 Windows development role)
 
 ADR-0005는 offline/caller-supplied password blocklist enforcement,
 compiled blocklist version의 current-marker 의미와 `AUTH-PASS-02`의
@@ -15,7 +18,11 @@ JWT/session/cookie/CSRF/redaction 계약은 이 ADR대로 유지됩니다.
 
 ## Context And Threat Boundary
 
-POV Story는 한 owner의 민감한 개인 기록을 다루지만, 현재 `pov-api`에는 account, credential, session, token issuer 또는 auth middleware가 없습니다. 구현 전에 password, JWT, refresh, browser cookie, revoke와 recovery 계약을 하나로 고정하지 않으면 각 endpoint가 서로 다른 owner 근거와 failure behavior를 만들 수 있습니다.
+이 ADR을 결정한 2026-07-25 당시 `pov-api`에는 account, credential, session, token issuer
+또는 auth middleware가 없었습니다. 이후 POV-007이 local auth runtime을 구현했으며 현재
+구현 상태와 남은 범위는 Architecture와 active ticket을 따릅니다. 구현 전에 password, JWT,
+refresh, browser cookie, revoke와 recovery 계약을 하나로 고정하지 않으면 각 endpoint가
+서로 다른 owner 근거와 failure behavior를 만들 수 있다는 결정 근거는 유지됩니다.
 
 현재 보호 경계는 single-owner app instance, owner가 통제하는 OS account와 app-owned data root입니다. local profile은 인터넷 없이 `http://127.0.0.1:8080`에서 동작해야 합니다. remote profile은 향후 exact HTTPS origin과 Cloudflare Tunnel evidence가 있을 때만 활성화할 수 있습니다. 같은 OS account로 임의 process와 app data를 읽을 수 있는 공격자, browser/OS 자체 compromise, phishing과 XSS 완전 방어는 현재 경계 밖입니다.
 
@@ -30,7 +37,9 @@ POV Story는 한 owner의 민감한 개인 기록을 다루지만, 현재 `pov-a
 - bootstrap에서 owner가 정하는 login identifier는 exact ASCII `login_id` 하나이며 3~32 bytes, regex `[a-z][a-z0-9_-]{2,31}`를 만족해야 합니다. 이 release에서는 immutable이고 internal UUID `owner_id`와 분리합니다. Login input은 JSON string을 decode한 뒤 byte-for-byte 비교하며 trim, Unicode normalization, case-fold, alternate separator 또는 alias를 허용하지 않습니다. Grammar 밖 input은 account lookup이나 Argon2 없이 같은 mutation-free invalid-request response로 거부하고, well-formed unknown ID만 known ID와 같은 dummy verifier/throttle 경로를 사용합니다.
 - 보호 요청은 access JWT의 signature와 모든 claim을 검증한 뒤 active account, active `sid`, matching owner와 credential version을 server source에서 확인해야 합니다. 이 검증을 모두 통과한 auth verifier만 production `VerifiedAuthContext`를 만들 수 있습니다.
 - request body, URL, model output, cookie의 owner 값이나 검증된 `sub` 하나만으로 owner scope를 만들지 않습니다. session owner와 token `sub`가 다르면 fail closed합니다.
-- `pov-api`는 아직 이 issuer/verifier나 auth schema를 구현하지 않았습니다. 이 ADR의 local-auth subset은 POV-007, SSE/upload subset은 후속 ticket, remote subset은 trusted ingress decision 뒤 delivery의 구현 계약입니다.
+- 이 ADR의 local-auth subset은 POV-007에서 구현됐습니다. Installed-browser product evidence는
+  POV-010, SSE/upload subset은 후속 ticket, remote subset은 trusted ingress decision 뒤
+  delivery의 구현 계약입니다.
 
 ### Password, Throttling And Recovery
 
@@ -205,7 +214,7 @@ Cookie가 port를 구분하지 않는다는 [RFC 6265](https://www.rfc-editor.or
 5. `/probe/local/clear`를 실행하고 browser를 닫습니다.
 6. `curl -D - http://localhost:18080/probe/local/header`와 `/probe/remote/header`의 `X-POV-Set-Cookie-Specimen`을 비교해 두 profile의 exact fresh-session production string을 검토합니다. Production-name cookie를 보낸 negative request가 `409`, `http://127.0.0.1:18080/` Host request가 `421`이며 둘 다 `Set-Cookie`가 없는지도 확인합니다. 두 specimen endpoint 모두 production cookie를 issue하지 않으며 remote specimen은 HTTPS browser compatibility evidence가 아닙니다.
 
-2026-07-25 현재 Codex in-app browser의 `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36` engine에서 primary와 secondary port가 모두 `true`이고 clear 뒤 secondary가 `false`임을 확인했습니다. 이 결과는 해당 Chromium engine의 local HTTP acceptance와 port-isolation 한계만 확정합니다. POV-007의 release support target은 installed Chrome과 Safari이며 두 browser의 AUTH-COOKIE-01이 모두 PASS하기 전 auth delivery를 완료하지 않습니다. Firefox는 설치·지원 결정 전 unsupported이고 AUTH-COOKIE-02는 실제 trusted HTTPS test origin이 생기기 전 conditional입니다.
+2026-07-25 현재 Codex in-app browser의 `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36` engine에서 primary와 secondary port가 모두 `true`이고 clear 뒤 secondary가 `false`임을 확인했습니다. 이 결과는 해당 Chromium engine의 local HTTP acceptance와 port-isolation 한계만 확정합니다. POV-007 completion은 supported-Unix runtime 경계로 좁혀졌고 installed-browser AUTH-COOKIE-01과 storage/cache evidence는 POV-010이 소유합니다. ADR-0006에서 선택한 macOS target의 실제 installed browser/version만 PASS로 기록하며, 실행하지 않은 Safari/Chrome 조합으로 결과를 확장하지 않습니다. Firefox는 설치·지원 결정 전 unsupported이고 AUTH-COOKIE-02는 실제 trusted HTTPS test origin이 생기기 전 conditional입니다.
 
 ## Rejected Alternatives
 

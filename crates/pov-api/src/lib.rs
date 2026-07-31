@@ -17,14 +17,23 @@ use axum::{
 #[cfg(unix)]
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, HeaderName, HeaderValue},
     routing::post,
 };
 #[cfg(unix)]
-use pov_core::auth::{
-    AuthProfile, AuthRuntime, CredentialMutationOutcome, IssuedSession, LoginOutcome, LoginRequest,
-    LogoutAllOutcome, LogoutOutcome, NormalizedPassword, RefreshOutcome, SecretBytes,
+use pov_core::{
+    auth::{
+        AuthProfile, AuthRuntime, CredentialMutationOutcome, IssuedSession, LoginOutcome,
+        LoginRequest, LogoutAllOutcome, LogoutOutcome, NormalizedPassword, RefreshOutcome,
+        SecretBytes,
+    },
+    conversation::{
+        AppendUserEvent, ConversationError, ConversationId, ConversationRepository,
+        ConversationTimeline, IdempotencyKey, MAX_USER_EVENT_CONTENT_BYTES,
+    },
+    identity::{Revision, VerifiedAuthContext},
+    storage::StoreSet,
 };
 use rust_embed::Embed;
 #[cfg(unix)]
@@ -49,6 +58,8 @@ struct WebAssets;
 #[cfg(unix)]
 const MAX_AUTH_REQUEST_BYTES: usize = 4096;
 #[cfg(unix)]
+const MAX_CONVERSATION_REQUEST_BYTES: usize = MAX_USER_EVENT_CONTENT_BYTES + 4096;
+#[cfg(unix)]
 const LOCAL_ORIGIN: &str = "http://127.0.0.1:8080";
 #[cfg(unix)]
 const LOCAL_HOST: &str = "127.0.0.1:8080";
@@ -71,12 +82,14 @@ pub fn app() -> Router {
 
 #[cfg(unix)]
 #[derive(Clone)]
-struct AuthApiState {
+struct ApiState {
     runtime: Arc<AuthRuntime>,
+    stores: Arc<StoreSet>,
 }
 
 #[cfg(unix)]
-pub fn app_with_auth(runtime: Arc<AuthRuntime>) -> Router {
+pub fn app_with_auth(runtime: Arc<AuthRuntime>, stores: Arc<StoreSet>) -> Router {
+    let state = ApiState { runtime, stores };
     let auth = Router::new()
         .route("/login", post(login))
         .route("/refresh", post(refresh))
@@ -84,12 +97,21 @@ pub fn app_with_auth(runtime: Arc<AuthRuntime>) -> Router {
         .route("/logout-all", post(logout_all))
         .route("/password", post(change_password))
         .route("/session", get(session_status))
-        .layer(DefaultBodyLimit::max(MAX_AUTH_REQUEST_BYTES))
-        .with_state(AuthApiState { runtime });
+        .layer(DefaultBodyLimit::max(MAX_AUTH_REQUEST_BYTES));
+    let conversations = Router::new()
+        .route("/conversations", get(list_conversations))
+        .route("/conversations/{conversation_id}", get(read_conversation))
+        .route(
+            "/conversations/{conversation_id}/events",
+            post(append_conversation_event),
+        )
+        .layer(DefaultBodyLimit::max(MAX_CONVERSATION_REQUEST_BYTES));
     let api = Router::new()
         .route("/health", get(health))
         .nest("/auth", auth)
-        .fallback(api_not_found);
+        .merge(conversations)
+        .fallback(api_not_found)
+        .with_state(state);
 
     Router::new().nest("/api", api).fallback(serve_web_asset)
 }
@@ -108,6 +130,13 @@ struct EmptyPayload {}
 struct PasswordChangePayload {
     current_password: String,
     new_password: String,
+}
+
+#[cfg(unix)]
+struct AppendEventPayload {
+    idempotency_key: String,
+    expected_revision: Option<u64>,
+    content: String,
 }
 
 #[cfg(unix)]
@@ -240,7 +269,70 @@ impl<'de> Deserialize<'de> for PasswordChangePayload {
 }
 
 #[cfg(unix)]
-async fn login(State(state): State<AuthApiState>, headers: HeaderMap, body: Bytes) -> Response {
+impl<'de> Deserialize<'de> for AppendEventPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct AppendEventVisitor;
+
+        impl<'de> Visitor<'de> for AppendEventVisitor {
+            type Value = AppendEventPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an exact conversation append object")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut key = None;
+                let mut expected = None;
+                let mut content = None;
+                while let Some(field) = map.next_key::<String>()? {
+                    match field.as_str() {
+                        "idempotency_key" if key.is_none() => {
+                            key = Some(map.next_value()?);
+                        }
+                        "expected_revision" if expected.is_none() => {
+                            expected = Some(map.next_value::<Option<u64>>()?);
+                        }
+                        "content" if content.is_none() => {
+                            content = Some(map.next_value()?);
+                        }
+                        "idempotency_key" | "expected_revision" | "content" => {
+                            return Err(de::Error::duplicate_field("conversation append field"));
+                        }
+                        _ => {
+                            return Err(de::Error::unknown_field("conversation append field", &[]));
+                        }
+                    }
+                }
+                let expected_revision = match expected {
+                    None => None,
+                    Some(Some(value)) => Some(value),
+                    Some(None) => {
+                        return Err(de::Error::custom(
+                            "expected_revision must be absent or a positive integer",
+                        ));
+                    }
+                };
+                Ok(AppendEventPayload {
+                    idempotency_key: key
+                        .ok_or_else(|| de::Error::missing_field("idempotency_key"))?,
+                    expected_revision,
+                    content: content.ok_or_else(|| de::Error::missing_field("content"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(AppendEventVisitor)
+    }
+}
+
+#[cfg(unix)]
+async fn login(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Response {
     if !valid_mutation_headers(&headers) {
         return auth_error(StatusCode::FORBIDDEN, "request_rejected");
     }
@@ -293,7 +385,7 @@ async fn login(State(state): State<AuthApiState>, headers: HeaderMap, body: Byte
 }
 
 #[cfg(unix)]
-async fn refresh(State(state): State<AuthApiState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn refresh(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Response {
     if !valid_mutation_headers(&headers) || serde_json::from_slice::<EmptyPayload>(&body).is_err() {
         return auth_error(StatusCode::FORBIDDEN, "request_rejected");
     }
@@ -327,7 +419,7 @@ async fn refresh(State(state): State<AuthApiState>, headers: HeaderMap, body: By
 }
 
 #[cfg(unix)]
-async fn logout(State(state): State<AuthApiState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn logout(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Response {
     if !valid_mutation_headers(&headers) || serde_json::from_slice::<EmptyPayload>(&body).is_err() {
         return auth_error(StatusCode::FORBIDDEN, "request_rejected");
     }
@@ -360,11 +452,7 @@ async fn logout(State(state): State<AuthApiState>, headers: HeaderMap, body: Byt
 }
 
 #[cfg(unix)]
-async fn logout_all(
-    State(state): State<AuthApiState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+async fn logout_all(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Response {
     if !valid_mutation_headers(&headers) || serde_json::from_slice::<EmptyPayload>(&body).is_err() {
         return auth_error(StatusCode::FORBIDDEN, "request_rejected");
     }
@@ -400,7 +488,7 @@ async fn logout_all(
 
 #[cfg(unix)]
 async fn change_password(
-    State(state): State<AuthApiState>,
+    State(state): State<ApiState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -468,7 +556,7 @@ async fn change_password(
 }
 
 #[cfg(unix)]
-async fn session_status(State(state): State<AuthApiState>, headers: HeaderMap) -> Response {
+async fn session_status(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if !valid_local_host(&headers) {
         return auth_error(StatusCode::FORBIDDEN, "request_rejected");
     }
@@ -499,6 +587,194 @@ async fn session_status(State(state): State<AuthApiState>, headers: HeaderMap) -
             None,
         ),
         Err(_) => auth_error(StatusCode::UNAUTHORIZED, "invalid_token"),
+    }
+}
+
+#[cfg(unix)]
+async fn list_conversations(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let auth = match verified_conversation_auth(&state, &headers, false).await {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+    let repository = ConversationRepository::new(&state.stores.conversation);
+    match repository.list_conversations(&auth).await {
+        Ok(conversations) => {
+            let conversations = conversations
+                .into_iter()
+                .map(|conversation| {
+                    serde_json::json!({
+                        "conversation_id": conversation.id().to_string(),
+                        "revision": conversation.source().revision().get(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            auth_json(
+                StatusCode::OK,
+                serde_json::json!({"conversations": conversations}),
+                None,
+            )
+        }
+        Err(error) => conversation_error(error),
+    }
+}
+
+#[cfg(unix)]
+async fn read_conversation(
+    State(state): State<ApiState>,
+    Path(conversation_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let auth = match verified_conversation_auth(&state, &headers, false).await {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+    let conversation_id = match parse_conversation_id(&conversation_id) {
+        Some(conversation_id) => conversation_id,
+        None => return auth_error(StatusCode::BAD_REQUEST, "invalid_request"),
+    };
+    let repository = ConversationRepository::new(&state.stores.conversation);
+    match repository.read_timeline(&auth, conversation_id).await {
+        Ok(timeline) => conversation_timeline_response(&timeline),
+        Err(error) => conversation_error(error),
+    }
+}
+
+#[cfg(unix)]
+async fn append_conversation_event(
+    State(state): State<ApiState>,
+    Path(conversation_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let auth = match verified_conversation_auth(&state, &headers, true).await {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+    let conversation_id = match parse_conversation_id(&conversation_id) {
+        Some(conversation_id) => conversation_id,
+        None => return auth_error(StatusCode::BAD_REQUEST, "invalid_request"),
+    };
+    let payload: AppendEventPayload = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(_) => return auth_error(StatusCode::BAD_REQUEST, "invalid_request"),
+    };
+    let idempotency_key = match payload
+        .idempotency_key
+        .parse()
+        .ok()
+        .and_then(IdempotencyKey::from_uuid)
+    {
+        Some(key) => key,
+        None => return auth_error(StatusCode::BAD_REQUEST, "invalid_request"),
+    };
+    let expected_revision = match payload.expected_revision {
+        Some(value) => match Revision::new(value) {
+            Some(revision) => Some(revision),
+            None => return auth_error(StatusCode::BAD_REQUEST, "invalid_request"),
+        },
+        None => None,
+    };
+    let repository = ConversationRepository::new(&state.stores.conversation);
+    let command = AppendUserEvent {
+        conversation_id,
+        expected_revision,
+        idempotency_key,
+        content: payload.content,
+    };
+    match repository.append_user_event(&auth, command).await {
+        Ok(_) => match repository.read_timeline(&auth, conversation_id).await {
+            Ok(timeline) => conversation_timeline_response(&timeline),
+            Err(error) => conversation_error(error),
+        },
+        Err(error) => conversation_error(error),
+    }
+}
+
+#[cfg(unix)]
+async fn verified_conversation_auth(
+    state: &ApiState,
+    headers: &HeaderMap,
+    mutation: bool,
+) -> Result<VerifiedAuthContext, Response> {
+    let headers_valid = if mutation {
+        valid_mutation_headers(headers)
+    } else {
+        valid_local_host(headers)
+    };
+    if !headers_valid {
+        return Err(auth_error(StatusCode::FORBIDDEN, "request_rejected"));
+    }
+    let Some(token) = bearer_token(headers) else {
+        return Err(auth_error(StatusCode::UNAUTHORIZED, "invalid_token"));
+    };
+    let Some(now_micros) = current_time_micros() else {
+        return Err(auth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication_unavailable",
+        ));
+    };
+    state
+        .runtime
+        .verify_access(
+            AuthProfile::Local,
+            SecretBytes::new(token.into_bytes()),
+            now_micros,
+        )
+        .await
+        .map_err(|_| auth_error(StatusCode::UNAUTHORIZED, "invalid_token"))
+}
+
+#[cfg(unix)]
+fn parse_conversation_id(value: &str) -> Option<ConversationId> {
+    value.parse().ok().and_then(ConversationId::from_uuid)
+}
+
+#[cfg(unix)]
+fn conversation_timeline_response(timeline: &ConversationTimeline) -> Response {
+    let events = timeline
+        .events()
+        .iter()
+        .map(|event| {
+            serde_json::json!({
+                "event_id": event.id().to_string(),
+                "revision": event.conversation_revision().get(),
+                "kind": event.kind().as_str(),
+                "content": event.content(),
+                "correlation_id": event.correlation_id().to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    auth_json(
+        StatusCode::OK,
+        serde_json::json!({
+            "conversation_id": timeline.conversation().id().to_string(),
+            "revision": timeline.conversation().source().revision().get(),
+            "events": events,
+        }),
+        None,
+    )
+}
+
+#[cfg(unix)]
+fn conversation_error(error: ConversationError) -> Response {
+    match error {
+        ConversationError::EmptyContent => auth_error(StatusCode::BAD_REQUEST, "invalid_content"),
+        ConversationError::ContentTooLarge => {
+            auth_error(StatusCode::PAYLOAD_TOO_LARGE, "content_too_large")
+        }
+        ConversationError::NotFound => auth_error(StatusCode::NOT_FOUND, "not_found"),
+        ConversationError::IdempotencyConflict => {
+            auth_error(StatusCode::CONFLICT, "idempotency_conflict")
+        }
+        ConversationError::RevisionConflict => {
+            auth_error(StatusCode::CONFLICT, "revision_conflict")
+        }
+        ConversationError::RevisionExhausted => {
+            auth_error(StatusCode::CONFLICT, "revision_exhausted")
+        }
+        ConversationError::CorruptStoredState | ConversationError::BackendFailure => {
+            auth_error(StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable")
+        }
     }
 }
 

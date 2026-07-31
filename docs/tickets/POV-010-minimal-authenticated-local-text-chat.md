@@ -1,12 +1,17 @@
 # POV-010 Minimal Authenticated Local Text Chat
 
-Status: Planned
+Status: Ready — ADR-0006 macOS runtime target and Windows development role accepted
 
 Type: Delivery
 
 Roadmap: H1 — Trustworthy text capture
 
 Depends on: POV-007, POV-008
+
+Runtime target: MacBook macOS same-origin production runtime
+
+Development target: Windows frontend and cross-platform repository validation; no production auth
+stub or bypass
 
 ## Why
 
@@ -26,6 +31,30 @@ POV-001의 offline shell에 login, owner-scoped conversation 선택, text submit
 - keyboard accessibility and basic status semantics
 - no-external-asset offline flow
 - installed-browser cookie, URL, storage, cache와 redaction evidence
+
+## HTTP Contract
+
+- `GET /api/conversations`는 verified access session의 owner에게만 conversation ID와 current
+  revision 목록을 반환합니다.
+- `GET /api/conversations/{conversation_id}`는 같은 owner의 stored event timeline을
+  revision 오름차순으로 반환합니다.
+- `POST /api/conversations/{conversation_id}/events`는 UUID v4 idempotency key, absent/exact
+  expected revision과 exact text content를 받아 existing POV-008 repository에 append합니다.
+- request path/body의 owner 값은 받지 않으며 `AuthRuntime::verify_access`가 만든
+  `VerifiedAuthContext`만 repository에 전달합니다.
+- 첫 append의 absent expected revision은 conversation을 생성하고, 후속 append는 server
+  readback의 exact current revision을 사용합니다.
+- success response는 commit 뒤 authoritative event/timeline readback이 끝난 뒤에만
+  반환합니다.
+
+## Platform Evidence Boundary
+
+- Windows에서 frontend와 Rust repository baseline, model-independent component/contract test를
+  실행합니다.
+- MacBook macOS에서 production `auth init`, listener-ready startup, installed-browser
+  login/refresh/logout, text capture/readback과 cookie/storage/cache evidence를 실행합니다.
+- macOS 실기 evidence를 실행하기 전에는 구현이 끝나도 이 ticket을 `Completed`로 바꾸지
+  않습니다.
 
 ## Out Of Scope
 
@@ -70,3 +99,4 @@ text composer route를 비활성화해도 이미 저장된 conversation event는
 - [POV-001](../deps/POV-001-local-offline-walking-skeleton.md)
 - [POV-007](../deps/POV-007-local-login-refresh-and-session-revoke.md)
 - [POV-008](../deps/POV-008-idempotent-conversation-append-and-outbox.md)
+- [ADR-0006](../decisions/0006-h1-development-and-dogfood-platform.md)

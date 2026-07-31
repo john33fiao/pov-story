@@ -2,7 +2,7 @@
 
 Status: Planning baseline
 
-Last reviewed: 2026-07-29
+Last reviewed: 2026-07-31
 
 ## Roadmap Policy
 
@@ -135,7 +135,7 @@ flowchart LR
 | 5 | [POV-007 Local login, refresh and session revoke](deps/POV-007-local-login-refresh-and-session-revoke.md) | Completed delivery — 2026-07-29; supported-Unix production init/listener-ready/second-init no-replace smoke와 final validation 완료 | POV-004, POV-005 | 검증된 auth context가 owner scope를 강제하고 login/refresh/logout/revoke local runtime을 제공 |
 | 6 | [POV-008 Idempotent conversation append and outbox](deps/POV-008-idempotent-conversation-append-and-outbox.md) | Completed delivery — 2026-07-29; persistence acceptance, production auth dependency와 final RTD/repository validation 완료 | POV-004, POV-007 | 입력이 retry와 embedding failure에도 하나의 durable source event로 남음 |
 | 7 | [POV-009 Durable single-slot job queue](deps/POV-009-durable-single-slot-job-queue.md) | Completed delivery — 2026-07-29; persistence acceptance, production auth dependency와 final RTD/repository validation 완료 | POV-008 | outbox 기반 fixed-normal FIFO, fenced single-slot lease, 보수적 recovery halt와 retry/latency history를 복구; API·browser·provider activation은 POV-010~012에 유지 |
-| 8 | [POV-010 Minimal authenticated local text chat](tickets/POV-010-minimal-authenticated-local-text-chat.md) | Delivery | POV-007, POV-008 | 사용자가 offline Web Chat에서 text를 저장하고 durable receipt를 확인 |
+| 8 | [POV-010 Minimal authenticated local text chat](tickets/POV-010-minimal-authenticated-local-text-chat.md) | Ready delivery — ADR-0006 macOS runtime/Windows development gate resolved | POV-007, POV-008 | 사용자가 macOS offline Web Chat에서 text를 저장하고 durable receipt를 확인하며 Windows에서 구현·cross-platform baseline을 유지 |
 | 9 | [POV-011 Authenticated replayable job status stream](tickets/POV-011-authenticated-replayable-job-status-stream.md) | Delivery | POV-009, POV-010 | token refresh와 reconnect 뒤에도 owner-scoped 상태를 이어 봄 |
 | 10 | [POV-012 Loopback LLM text round trip](tickets/POV-012-loopback-llm-text-round-trip.md) | Delivery | POV-006, POV-009, POV-010 | local provider crash를 안전하게 드러내는 text inference 왕복 |
 | 11 | [POV-013 Conversation Core offline evidence gate](tickets/POV-013-conversation-core-offline-evidence-gate.md) | Evidence gate | POV-004~012 | offline, owner isolation, retry, reconnect와 process failure 증거로 H2 진입 여부 결정 |
@@ -171,7 +171,9 @@ claim 전에 각각 완료합니다. Installed-browser auth evidence는 POV-010�
 - POV-031 구현 선행 조건: [POV-034](deps/POV-034-restore-windows-workspace-validation-baseline.md) Windows baseline과 [ADR-0005](decisions/0005-password-blocklist-removal-and-legacy-auth-compatibility.md) Accepted 충족; [POV-031](deps/POV-031-remove-password-blocklist-feature.md) 완료
 - repository safety baseline: 새 public history 검증, MIT 적용과 [POV-032](deps/POV-032-purge-password-blocklist-history-and-caches.md) superseded archive 완료
 - H1 delivery와 POV-007 local auth runtime: ADR-0005/POV-031 gate 및 narrowed POV-007의 supported-Unix production init smoke와 final validation 완료
-- POV-010 activation 전 dogfood platform: declared supported Unix/WSL 또는 native Windows를 명시하고, native Windows를 선택하면 성공 stub 없이 별도 auth delivery ticket 생성
+- POV-010 dogfood platform: [ADR-0006](decisions/0006-h1-development-and-dogfood-platform.md)
+  Accepted; MacBook macOS가 H1 always-on/dogfood backend이고 Windows는
+  development/cross-platform validation 환경
 - POV-022 외부 사용자 검증: 개인용 H1~H5 완성 뒤 또는 명시적 재우선순위 결정 뒤 활성화하며 현재 delivery dependency로 사용하지 않음
 - 외부 contribution 허용 전: 제출·검토·라이선스 동의 정책 확정
 - authentication 구현 전: [ADR-0004](decisions/0004-local-authentication-and-session-security-contract.md) Accepted

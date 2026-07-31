@@ -34,9 +34,11 @@ logout-all과 session revoke를 fail closed로 사용할 수 있는 runtime**까
 | installed-browser login/refresh/logout, cookie·storage evidence | [POV-010](../tickets/POV-010-minimal-authenticated-local-text-chat.md) | H1 product/browser evidence에서 검증 |
 | platform PTY matrix, reference-device Argon2, abrupt crash/power-loss, same-UID ABA residual | [POV-037](../tickets/POV-037-auth-platform-and-durability-hardening.md) | 초기 H1 text capture gate 아님; 해당 platform/durability claim 전 필요 |
 
-POV-007 completion은 현재 구현된 Unix auth maintenance profile만 주장합니다. Native
-Windows auth maintenance/runtime을 성공 stub으로 간주하지 않으며, POV-010 dogfood
-platform을 정할 때 별도 delivery 필요 여부를 결정합니다.
+POV-007 completion은 현재 구현된 Unix auth maintenance profile만 주장합니다.
+[ADR-0006](../decisions/0006-h1-development-and-dogfood-platform.md)은 MacBook의 macOS를
+H1 always-on/dogfood backend로, Windows를 development/cross-platform validation 환경으로
+결정했습니다. Native Windows auth maintenance/runtime을 성공 stub으로 간주하지 않으며
+POV-010의 선행 delivery로 만들지 않습니다.
 
 ## Scope
 
