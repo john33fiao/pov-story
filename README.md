@@ -18,7 +18,7 @@ POV Story는 메모, 음성, 일정, 할 일, 작업일지와 장기 기억을 �
   cross-platform validation 환경으로 사용합니다. Native Windows production auth는 계속
   fail closed이고 POV-010의 선행 조건이 아닙니다.
 
-현재 근접 작업은 완료된 [POV-007 auth delivery](docs/deps/POV-007-local-login-refresh-and-session-revoke.md), [POV-008 conversation append](docs/deps/POV-008-idempotent-conversation-append-and-outbox.md), [POV-009 durable queue](docs/deps/POV-009-durable-single-slot-job-queue.md), [POV-010 local text chat](docs/tickets/POV-010-minimal-authenticated-local-text-chat.md)에 이어 [POV-011 replayable status stream](docs/tickets/POV-011-authenticated-replayable-job-status-stream.md)의 readiness를 검토하는 것입니다. MacBook 실기 검증은 장비 확보 전까지 POV-038 backlog로 유지합니다. [POV-022 외부 사용자 discovery](docs/tickets/POV-022-first-segment-and-voice-wedge-discovery-gate.md)는 개인용 H1~H5 완성 뒤의 후순위 제품 검증 backlog이며 현재 delivery를 막지 않습니다.
+현재 근접 작업은 완료된 [POV-007 auth delivery](docs/deps/POV-007-local-login-refresh-and-session-revoke.md), [POV-008 conversation append](docs/deps/POV-008-idempotent-conversation-append-and-outbox.md), [POV-009 durable queue](docs/deps/POV-009-durable-single-slot-job-queue.md), [POV-010 local text chat](docs/tickets/POV-010-minimal-authenticated-local-text-chat.md)에 이은 [POV-011 replayable status stream](docs/tickets/POV-011-authenticated-replayable-job-status-stream.md)입니다. POV-011의 Core/API/Web와 Playwright Chromium 흐름은 구현·검증됐지만 actual macOS locked Rust baseline이 기존 `Termios.line_discipline` `E0609`로 실패해 ticket은 `In Progress`입니다. supported-Unix baseline 복구와 재검증 전에는 완료로 주장하지 않습니다. MacBook production 실기 검증은 장비 확보 전까지 POV-038 backlog로 유지합니다. [POV-022 외부 사용자 discovery](docs/tickets/POV-022-first-segment-and-voice-wedge-discovery-gate.md)는 개인용 H1~H5 완성 뒤의 후순위 제품 검증 backlog이며 현재 delivery를 막지 않습니다.
 
 ## 빠른 실행
 

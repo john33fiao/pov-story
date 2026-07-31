@@ -705,6 +705,7 @@ name = "pov-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "mime_guess",
  "pov-core",
  "rust-embed",
@@ -714,6 +715,7 @@ dependencies = [
  "tokio",
  "tower",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

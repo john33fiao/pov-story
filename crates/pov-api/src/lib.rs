@@ -3,6 +3,8 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 #[cfg(unix)]
 use std::{
+    collections::VecDeque,
+    convert::Infallible,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -22,6 +24,8 @@ use axum::{
     routing::post,
 };
 #[cfg(unix)]
+use futures_util::stream;
+#[cfg(unix)]
 use pov_core::{
     auth::{
         AuthProfile, AuthRuntime, CredentialMutationOutcome, IssuedSession, LoginOutcome,
@@ -33,6 +37,7 @@ use pov_core::{
         ConversationTimeline, IdempotencyKey, MAX_USER_EVENT_CONTENT_BYTES,
     },
     identity::{Revision, VerifiedAuthContext},
+    job::{JobEventCursor, JobEventPage, JobQueueError, JobQueueRepository, SequencedJobEvent},
     storage::StoreSet,
 };
 use rust_embed::Embed;
@@ -41,6 +46,10 @@ use serde::{
     Deserialize, Deserializer,
     de::{self, MapAccess, Visitor},
 };
+#[cfg(unix)]
+use tokio::time::{Duration, Instant};
+#[cfg(unix)]
+use zeroize::Zeroizing;
 
 pub const DEFAULT_BIND_ADDRESS: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080));
@@ -71,6 +80,14 @@ const LOCAL_REFRESH_COOKIE_PATH: &str = "/api/auth";
 const CSRF_HEADER: HeaderName = HeaderName::from_static("x-pov-csrf");
 #[cfg(unix)]
 const FETCH_SITE_HEADER: HeaderName = HeaderName::from_static("sec-fetch-site");
+#[cfg(unix)]
+const LAST_EVENT_ID_HEADER: HeaderName = HeaderName::from_static("last-event-id");
+#[cfg(unix)]
+const JOB_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+#[cfg(unix)]
+const JOB_EVENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(unix)]
+const JOB_EVENT_AUTH_INTERVAL: Duration = Duration::from_secs(15);
 
 pub fn app() -> Router {
     let api = Router::new()
@@ -106,10 +123,14 @@ pub fn app_with_auth(runtime: Arc<AuthRuntime>, stores: Arc<StoreSet>) -> Router
             post(append_conversation_event),
         )
         .layer(DefaultBodyLimit::max(MAX_CONVERSATION_REQUEST_BYTES));
+    let jobs = Router::new()
+        .route("/jobs/events", get(poll_job_events))
+        .route("/jobs/events/stream", get(stream_job_events));
     let api = Router::new()
         .route("/health", get(health))
         .nest("/auth", auth)
         .merge(conversations)
+        .merge(jobs)
         .fallback(api_not_found)
         .with_state(state);
 
@@ -591,8 +612,251 @@ async fn session_status(State(state): State<ApiState>, headers: HeaderMap) -> Re
 }
 
 #[cfg(unix)]
+async fn poll_job_events(State(state): State<ApiState>, uri: Uri, headers: HeaderMap) -> Response {
+    let after = match parse_poll_cursor(uri.query()) {
+        Some(cursor) => cursor,
+        None => return auth_error(StatusCode::BAD_REQUEST, "invalid_cursor"),
+    };
+    let auth = match verified_api_auth(&state, &headers, false).await {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+    match JobQueueRepository::new(&state.stores.conversation)
+        .read_event_page(&auth, after)
+        .await
+    {
+        Ok(page) => job_event_page_response(&page),
+        Err(error) => job_event_error(error),
+    }
+}
+
+#[cfg(unix)]
+async fn stream_job_events(
+    State(state): State<ApiState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if uri.query().is_some() {
+        return auth_error(StatusCode::BAD_REQUEST, "invalid_cursor");
+    }
+    let after = match parse_stream_cursor(&headers) {
+        Some(cursor) => cursor,
+        None => return auth_error(StatusCode::BAD_REQUEST, "invalid_cursor"),
+    };
+    let (auth, token) = match verified_stream_auth(&state, &headers).await {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+    let page = match JobQueueRepository::new(&state.stores.conversation)
+        .read_event_page(&auth, after)
+        .await
+    {
+        Ok(page) => page,
+        Err(error) => return job_event_error(error),
+    };
+    let stream_state = JobEventStreamState::new(state, auth, token, page);
+    let body_stream = stream::unfold(stream_state, |mut state| async move {
+        state
+            .next_frame()
+            .await
+            .map(|frame| (Ok::<Bytes, Infallible>(frame), state))
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::PRAGMA, "no-cache")
+        .header(header::REFERRER_POLICY, "no-referrer")
+        .body(Body::from_stream(body_stream))
+        .expect("job event stream response headers are valid")
+}
+
+#[cfg(unix)]
+struct JobEventStreamState {
+    state: ApiState,
+    auth: VerifiedAuthContext,
+    token: Zeroizing<Vec<u8>>,
+    cursor: JobEventCursor,
+    frames: VecDeque<Bytes>,
+    has_more: bool,
+    next_poll: Instant,
+    next_heartbeat: Instant,
+    next_auth: Instant,
+}
+
+#[cfg(unix)]
+impl JobEventStreamState {
+    fn new(
+        state: ApiState,
+        auth: VerifiedAuthContext,
+        token: Zeroizing<Vec<u8>>,
+        page: JobEventPage,
+    ) -> Self {
+        let now = Instant::now();
+        let mut stream = Self {
+            state,
+            auth,
+            token,
+            cursor: JobEventCursor::START,
+            frames: VecDeque::new(),
+            has_more: false,
+            next_poll: now + JOB_EVENT_POLL_INTERVAL,
+            next_heartbeat: now + JOB_EVENT_HEARTBEAT_INTERVAL,
+            next_auth: now + JOB_EVENT_AUTH_INTERVAL,
+        };
+        stream.enqueue_page(&page);
+        stream
+    }
+
+    fn enqueue_page(&mut self, page: &JobEventPage) {
+        self.cursor = page.next_cursor();
+        self.has_more = page.has_more();
+        self.frames
+            .extend(page.events().iter().map(job_event_sse_frame));
+    }
+
+    async fn next_frame(&mut self) -> Option<Bytes> {
+        loop {
+            if Instant::now() >= self.next_auth && !self.revalidate().await {
+                return None;
+            }
+            if let Some(frame) = self.frames.pop_front() {
+                return Some(frame);
+            }
+            if self.has_more {
+                let page = self.read_page().await?;
+                self.enqueue_page(&page);
+                continue;
+            }
+
+            let deadline = self.next_poll.min(self.next_heartbeat).min(self.next_auth);
+            tokio::time::sleep_until(deadline).await;
+            let now = Instant::now();
+            if now >= self.next_auth && !self.revalidate().await {
+                return None;
+            }
+            if now >= self.next_poll {
+                self.next_poll = now + JOB_EVENT_POLL_INTERVAL;
+                let page = self.read_page().await?;
+                self.enqueue_page(&page);
+                if !self.frames.is_empty() {
+                    continue;
+                }
+            }
+            if now >= self.next_heartbeat {
+                self.next_heartbeat = now + JOB_EVENT_HEARTBEAT_INTERVAL;
+                return Some(Bytes::from_static(b": heartbeat\n\n"));
+            }
+        }
+    }
+
+    async fn read_page(&self) -> Option<JobEventPage> {
+        JobQueueRepository::new(&self.state.stores.conversation)
+            .read_event_page(&self.auth, self.cursor)
+            .await
+            .ok()
+    }
+
+    async fn revalidate(&mut self) -> bool {
+        let Some(now_micros) = current_time_micros() else {
+            return false;
+        };
+        match self
+            .state
+            .runtime
+            .verify_access(
+                AuthProfile::Local,
+                SecretBytes::new(self.token.as_slice().to_vec()),
+                now_micros,
+            )
+            .await
+        {
+            Ok(auth) => {
+                self.auth = auth;
+                self.next_auth = Instant::now() + JOB_EVENT_AUTH_INTERVAL;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn parse_poll_cursor(query: Option<&str>) -> Option<JobEventCursor> {
+    let query = query?;
+    let value = query.strip_prefix("after=")?;
+    if value.contains('&') {
+        return None;
+    }
+    value.parse().ok()
+}
+
+#[cfg(unix)]
+fn parse_stream_cursor(headers: &HeaderMap) -> Option<JobEventCursor> {
+    match exact_optional_header(headers, LAST_EVENT_ID_HEADER) {
+        Ok(None) => Some(JobEventCursor::START),
+        Ok(Some(value)) => value.parse().ok(),
+        Err(()) => None,
+    }
+}
+
+#[cfg(unix)]
+fn job_event_value(sequenced: &SequencedJobEvent) -> serde_json::Value {
+    let event = sequenced.event();
+    serde_json::json!({
+        "cursor": sequenced.cursor().to_string(),
+        "event_id": event.id().to_string(),
+        "job_id": event.job_id().to_string(),
+        "job_revision": event.job_revision().get(),
+        "kind": event.kind().as_str(),
+        "state": event.state().as_str(),
+        "attempt_id": event.attempt_id().map(|value| value.to_string()),
+        "happened_at_micros": event.happened_at().get().to_string(),
+        "queue_wait_micros": event.queue_wait_micros().map(|value| value.to_string()),
+        "execution_micros": event.execution_micros().map(|value| value.to_string()),
+        "failure_kind": event.failure().map(|value| value.as_str()),
+        "correlation_id": event.correlation_id().to_string(),
+    })
+}
+
+#[cfg(unix)]
+fn job_event_page_value(page: &JobEventPage) -> serde_json::Value {
+    serde_json::json!({
+        "events": page.events().iter().map(job_event_value).collect::<Vec<_>>(),
+        "next_cursor": page.next_cursor().to_string(),
+        "has_more": page.has_more(),
+    })
+}
+
+#[cfg(unix)]
+fn job_event_page_response(page: &JobEventPage) -> Response {
+    auth_json(StatusCode::OK, job_event_page_value(page), None)
+}
+
+#[cfg(unix)]
+fn job_event_sse_frame(event: &SequencedJobEvent) -> Bytes {
+    let data = serde_json::to_string(&job_event_value(event))
+        .expect("job event JSON contains only serializable values");
+    Bytes::from(format!(
+        "event: job_status\nid: {}\ndata: {data}\n\n",
+        event.cursor()
+    ))
+}
+
+#[cfg(unix)]
+fn job_event_error(error: JobQueueError) -> Response {
+    match error {
+        JobQueueError::InvalidCursor => auth_error(StatusCode::BAD_REQUEST, "invalid_cursor"),
+        JobQueueError::CorruptStoredState | JobQueueError::BackendFailure => {
+            auth_error(StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable")
+        }
+        _ => auth_error(StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable"),
+    }
+}
+
+#[cfg(unix)]
 async fn list_conversations(State(state): State<ApiState>, headers: HeaderMap) -> Response {
-    let auth = match verified_conversation_auth(&state, &headers, false).await {
+    let auth = match verified_api_auth(&state, &headers, false).await {
         Ok(auth) => auth,
         Err(response) => return response,
     };
@@ -624,7 +888,7 @@ async fn read_conversation(
     Path(conversation_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let auth = match verified_conversation_auth(&state, &headers, false).await {
+    let auth = match verified_api_auth(&state, &headers, false).await {
         Ok(auth) => auth,
         Err(response) => return response,
     };
@@ -646,7 +910,7 @@ async fn append_conversation_event(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let auth = match verified_conversation_auth(&state, &headers, true).await {
+    let auth = match verified_api_auth(&state, &headers, true).await {
         Ok(auth) => auth,
         Err(response) => return response,
     };
@@ -691,7 +955,7 @@ async fn append_conversation_event(
 }
 
 #[cfg(unix)]
-async fn verified_conversation_auth(
+async fn verified_api_auth(
     state: &ApiState,
     headers: &HeaderMap,
     mutation: bool,
@@ -704,7 +968,7 @@ async fn verified_conversation_auth(
     if !headers_valid {
         return Err(auth_error(StatusCode::FORBIDDEN, "request_rejected"));
     }
-    let Some(token) = bearer_token(headers) else {
+    let Some(token) = bearer_token_bytes(headers) else {
         return Err(auth_error(StatusCode::UNAUTHORIZED, "invalid_token"));
     };
     let Some(now_micros) = current_time_micros() else {
@@ -717,11 +981,40 @@ async fn verified_conversation_auth(
         .runtime
         .verify_access(
             AuthProfile::Local,
-            SecretBytes::new(token.into_bytes()),
+            SecretBytes::new(token.as_slice().to_vec()),
             now_micros,
         )
         .await
         .map_err(|_| auth_error(StatusCode::UNAUTHORIZED, "invalid_token"))
+}
+
+#[cfg(unix)]
+async fn verified_stream_auth(
+    state: &ApiState,
+    headers: &HeaderMap,
+) -> Result<(VerifiedAuthContext, Zeroizing<Vec<u8>>), Response> {
+    if !valid_local_host(headers) {
+        return Err(auth_error(StatusCode::FORBIDDEN, "request_rejected"));
+    }
+    let Some(token) = bearer_token_bytes(headers) else {
+        return Err(auth_error(StatusCode::UNAUTHORIZED, "invalid_token"));
+    };
+    let Some(now_micros) = current_time_micros() else {
+        return Err(auth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication_unavailable",
+        ));
+    };
+    let auth = state
+        .runtime
+        .verify_access(
+            AuthProfile::Local,
+            SecretBytes::new(token.as_slice().to_vec()),
+            now_micros,
+        )
+        .await
+        .map_err(|_| auth_error(StatusCode::UNAUTHORIZED, "invalid_token"))?;
+    Ok((auth, token))
 }
 
 #[cfg(unix)]
@@ -892,6 +1185,20 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
         return None;
     }
     Some(token.to_owned())
+}
+
+#[cfg(unix)]
+fn bearer_token_bytes(headers: &HeaderMap) -> Option<Zeroizing<Vec<u8>>> {
+    let value = exact_single_header(headers, header::AUTHORIZATION)?;
+    let token = value.strip_prefix("Bearer ")?;
+    if token.is_empty()
+        || token
+            .bytes()
+            .any(|byte| !byte.is_ascii() || byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+    Some(Zeroizing::new(token.as_bytes().to_vec()))
 }
 
 #[cfg(unix)]
@@ -1107,10 +1414,12 @@ mod auth_http_tests {
     };
 
     use super::{
-        CSRF_HEADER, FETCH_SITE_HEADER, LOCAL_HOST, LOCAL_ORIGIN, LoginPayload, auth_error,
-        auth_error_with_clear_cookie, bearer_token, local_issue_cookie, local_refresh_cookie,
-        valid_mutation_headers,
+        CSRF_HEADER, FETCH_SITE_HEADER, LAST_EVENT_ID_HEADER, LOCAL_HOST, LOCAL_ORIGIN,
+        LoginPayload, auth_error, auth_error_with_clear_cookie, bearer_token, bearer_token_bytes,
+        job_event_error, local_issue_cookie, local_refresh_cookie, parse_poll_cursor,
+        parse_stream_cursor, valid_mutation_headers,
     };
+    use pov_core::job::{JobEventCursor, JobQueueError};
 
     fn valid_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -1219,6 +1528,54 @@ mod auth_http_tests {
         assert!(bearer_token(&headers).is_none());
     }
 
+    #[test]
+    fn job_event_cursor_inputs_are_exact_single_decimal_values() {
+        assert_eq!(
+            parse_poll_cursor(Some("after=0")),
+            Some(JobEventCursor::START)
+        );
+        assert_eq!(
+            parse_poll_cursor(Some("after=17"))
+                .expect("valid polling cursor")
+                .get(),
+            17
+        );
+        for invalid in [
+            None,
+            Some(""),
+            Some("after="),
+            Some("after=01"),
+            Some("after=17&after=18"),
+            Some("after=17&unknown=1"),
+            Some("unknown=17"),
+        ] {
+            assert_eq!(parse_poll_cursor(invalid), None);
+        }
+
+        let mut headers = HeaderMap::new();
+        assert_eq!(parse_stream_cursor(&headers), Some(JobEventCursor::START));
+        headers.insert(LAST_EVENT_ID_HEADER, HeaderValue::from_static("17"));
+        assert_eq!(
+            parse_stream_cursor(&headers)
+                .expect("valid resume cursor")
+                .get(),
+            17
+        );
+        headers.append(LAST_EVENT_ID_HEADER, HeaderValue::from_static("18"));
+        assert_eq!(parse_stream_cursor(&headers), None);
+    }
+
+    #[test]
+    fn retained_bearer_is_exact_and_zeroizing() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer header.payload.signature"),
+        );
+        let token = bearer_token_bytes(&headers).expect("retained bearer");
+        assert_eq!(token.as_slice(), b"header.payload.signature");
+    }
+
     #[tokio::test]
     async fn auth_responses_are_no_store_and_clear_exact_cookie() {
         let response = auth_error(StatusCode::UNAUTHORIZED, "invalid_token");
@@ -1246,6 +1603,13 @@ mod auth_http_tests {
             Some(&HeaderValue::from_static(
                 "pov_refresh_local=; Path=/api/auth; HttpOnly; SameSite=Strict; Max-Age=0"
             ))
+        );
+
+        let response = job_event_error(JobQueueError::InvalidCursor);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
         );
     }
 }

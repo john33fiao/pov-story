@@ -1,6 +1,7 @@
 use std::{
     error::Error,
     fmt,
+    str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -19,6 +20,7 @@ const CONVERSATION_RESPONSE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10 *
 const CONVERSATION_RESPONSE_LEASE_DURATION: Duration = Duration::from_secs(30);
 const CONVERSATION_RESPONSE_RETRY_BASE: Duration = Duration::from_secs(1);
 const MAX_DURABLE_MICROS: u64 = i64::MAX as u64;
+pub const JOB_EVENT_PAGE_SIZE: usize = 128;
 
 macro_rules! opaque_id {
     ($name:ident) => {
@@ -290,7 +292,8 @@ pub enum JobState {
 }
 
 impl JobState {
-    pub(crate) const fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
             Self::Leased => "leased",
@@ -392,7 +395,8 @@ pub enum JobEventKind {
 }
 
 impl JobEventKind {
-    pub(crate) const fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Enqueued => "enqueued",
             Self::Leased => "leased",
@@ -440,7 +444,8 @@ pub enum JobFailureKind {
 }
 
 impl JobFailureKind {
-    pub(crate) const fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::ProviderUnavailable => "provider_unavailable",
             Self::Timeout => "timeout",
@@ -783,6 +788,93 @@ impl JobEvent {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct JobEventCursor(u64);
+
+impl JobEventCursor {
+    pub const START: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(value: u64) -> Option<Self> {
+        if value <= i64::MAX as u64 {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for JobEventCursor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for JobEventCursor {
+    type Err = JobQueueError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty()
+            || (value.len() > 1 && value.starts_with('0'))
+            || value.bytes().any(|byte| !byte.is_ascii_digit())
+        {
+            return Err(JobQueueError::InvalidCursor);
+        }
+        value
+            .parse::<u64>()
+            .ok()
+            .and_then(Self::new)
+            .ok_or(JobQueueError::InvalidCursor)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SequencedJobEvent {
+    pub(crate) cursor: JobEventCursor,
+    pub(crate) event: JobEvent,
+}
+
+impl SequencedJobEvent {
+    #[must_use]
+    pub const fn cursor(&self) -> JobEventCursor {
+        self.cursor
+    }
+
+    #[must_use]
+    pub const fn event(&self) -> &JobEvent {
+        &self.event
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JobEventPage {
+    pub(crate) events: Vec<SequencedJobEvent>,
+    pub(crate) next_cursor: JobEventCursor,
+    pub(crate) has_more: bool,
+}
+
+impl JobEventPage {
+    #[must_use]
+    pub fn events(&self) -> &[SequencedJobEvent] {
+        &self.events
+    }
+
+    #[must_use]
+    pub const fn next_cursor(&self) -> JobEventCursor {
+        self.next_cursor
+    }
+
+    #[must_use]
+    pub const fn has_more(&self) -> bool {
+        self.has_more
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EnqueueReceipt {
     pub job: JobSnapshot,
@@ -914,6 +1006,7 @@ pub enum ClaimResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JobQueueError {
     NotFound,
+    InvalidCursor,
     IdempotencyConflict,
     RevisionConflict,
     InvalidTransition,
@@ -932,6 +1025,7 @@ impl fmt::Display for JobQueueError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::NotFound => "job queue record was not found",
+            Self::InvalidCursor => "job event cursor is invalid",
             Self::IdempotencyConflict => "job operation idempotency conflict",
             Self::RevisionConflict => "job revision conflict",
             Self::InvalidTransition => "job state transition is not allowed",
@@ -1115,6 +1209,14 @@ impl<'a> JobQueueRepository<'a> {
         job_id: JobId,
     ) -> Result<Vec<JobEvent>, JobQueueError> {
         storage::job_records::read_events(self.store, auth.clone(), job_id).await
+    }
+
+    pub async fn read_event_page(
+        &self,
+        auth: &VerifiedAuthContext,
+        after: JobEventCursor,
+    ) -> Result<JobEventPage, JobQueueError> {
+        storage::job_records::read_event_page(self.store, auth.clone(), after).await
     }
 
     pub async fn request_cancel(
@@ -1355,10 +1457,11 @@ mod tests {
     };
 
     use super::{
-        CancelJob, ClaimResult, EnqueueFingerprint, EnqueueJob, JobAttemptState, JobClock,
-        JobEnqueueKey, JobEventKind, JobFailureKind, JobKind, JobLease, JobLeaseToken,
-        JobMutationKey, JobOutcome, JobQueueError, JobQueueFault, JobQueueRepository, JobState,
-        JobTimestampMicros, RecoveryResolution, RecoveryTicket, ResumeJob,
+        CancelJob, ClaimResult, EnqueueFingerprint, EnqueueJob, JOB_EVENT_PAGE_SIZE,
+        JobAttemptState, JobClock, JobEnqueueKey, JobEventCursor, JobEventKind, JobFailureKind,
+        JobKind, JobLease, JobLeaseToken, JobMutationKey, JobOutcome, JobQueueError, JobQueueFault,
+        JobQueueRepository, JobState, JobTimestampMicros, RecoveryResolution, RecoveryTicket,
+        ResumeJob,
     };
 
     const SECOND: u64 = 1_000_000;
@@ -1449,6 +1552,164 @@ mod tests {
             ClaimResult::Leased(lease) => lease,
             other => panic!("expected leased job, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn job_event_cursor_requires_canonical_bounded_decimal() {
+        assert_eq!(
+            "0".parse::<JobEventCursor>().expect("start cursor"),
+            JobEventCursor::START
+        );
+        assert_eq!(
+            i64::MAX
+                .to_string()
+                .parse::<JobEventCursor>()
+                .expect("largest SQLite cursor")
+                .get(),
+            i64::MAX as u64
+        );
+        for invalid in [
+            "",
+            "00",
+            "01",
+            "+1",
+            "-1",
+            " 1",
+            "1 ",
+            "9223372036854775808",
+        ] {
+            assert_eq!(
+                invalid.parse::<JobEventCursor>(),
+                Err(JobQueueError::InvalidCursor),
+                "{invalid:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_event_cursor_allows_global_gaps_and_rejects_foreign_or_missing_values() {
+        let directory = tempdir().expect("temporary directory");
+        let root = directory.path().join("stores");
+        let stores = StoreSet::open(&root).await.expect("stores open");
+        let clock = Arc::new(ManualClock::new(START));
+        let queue = queue_with_clock(&stores, &clock);
+        let owner = VerifiedAuthContext::synthetic(1);
+        let other_owner = VerifiedAuthContext::synthetic(2);
+
+        for (event_owner, content) in [
+            (&owner, "owner first"),
+            (&other_owner, "other owner"),
+            (&owner, "owner second"),
+        ] {
+            let outbox = append_outbox(&stores, event_owner, content).await;
+            queue
+                .enqueue(event_owner, enqueue_command(outbox, JobEnqueueKey::new()))
+                .await
+                .expect("enqueue event");
+        }
+
+        let owner_page = queue
+            .read_event_page(&owner, JobEventCursor::START)
+            .await
+            .expect("owner page");
+        let other_page = queue
+            .read_event_page(&other_owner, JobEventCursor::START)
+            .await
+            .expect("other page");
+        assert_eq!(owner_page.events().len(), 2);
+        assert_eq!(other_page.events().len(), 1);
+        assert!(owner_page.events()[1].cursor().get() > owner_page.events()[0].cursor().get() + 1);
+        assert_eq!(
+            queue
+                .read_event_page(&owner, other_page.events()[0].cursor())
+                .await,
+            Err(JobQueueError::InvalidCursor)
+        );
+        assert_eq!(
+            queue
+                .read_event_page(
+                    &owner,
+                    JobEventCursor::new(i64::MAX as u64).expect("bounded missing cursor"),
+                )
+                .await,
+            Err(JobQueueError::InvalidCursor)
+        );
+
+        let resume_cursor = owner_page.events()[0].cursor();
+        drop(queue);
+        drop(stores);
+        let reopened = StoreSet::open(&root).await.expect("stores reopen");
+        let resumed = JobQueueRepository::new(&reopened.conversation)
+            .read_event_page(&owner, resume_cursor)
+            .await
+            .expect("resume after reopen");
+        assert_eq!(resumed.events().len(), 1);
+        assert_eq!(resumed.next_cursor(), owner_page.next_cursor());
+        assert!(!resumed.has_more());
+    }
+
+    #[tokio::test]
+    async fn owner_event_pages_are_bounded_repeatable_and_include_terminal_state() {
+        let directory = tempdir().expect("temporary directory");
+        let stores = StoreSet::open(directory.path().join("stores"))
+            .await
+            .expect("stores open");
+        let clock = Arc::new(ManualClock::new(START));
+        let queue = queue_with_clock(&stores, &clock);
+        let owner = VerifiedAuthContext::synthetic(1);
+
+        for index in 0..JOB_EVENT_PAGE_SIZE {
+            let outbox = append_outbox(&stores, &owner, &format!("source {index}")).await;
+            queue
+                .enqueue(&owner, enqueue_command(outbox, JobEnqueueKey::new()))
+                .await
+                .expect("enqueue page event");
+        }
+        let lease = claim_lease(&queue).await;
+        let running = queue
+            .dispatcher()
+            .mark_running(&lease)
+            .await
+            .expect("mark running");
+        queue
+            .dispatcher()
+            .finish(&running, JobOutcome::Succeeded)
+            .await
+            .expect("terminal success");
+
+        let first = queue
+            .read_event_page(&owner, JobEventCursor::START)
+            .await
+            .expect("first page");
+        let replay = queue
+            .read_event_page(&owner, JobEventCursor::START)
+            .await
+            .expect("replayed first page");
+        assert_eq!(first, replay);
+        assert_eq!(first.events().len(), JOB_EVENT_PAGE_SIZE);
+        assert!(first.has_more());
+
+        let second = queue
+            .read_event_page(&owner, first.next_cursor())
+            .await
+            .expect("second page");
+        assert!(!second.has_more());
+        assert_eq!(second.events().len(), 3);
+        assert_eq!(
+            second
+                .events()
+                .last()
+                .expect("terminal event")
+                .event()
+                .state(),
+            JobState::Succeeded
+        );
+        let empty = queue
+            .read_event_page(&owner, second.next_cursor())
+            .await
+            .expect("empty tail page");
+        assert!(empty.events().is_empty());
+        assert_eq!(empty.next_cursor(), second.next_cursor());
     }
 
     #[tokio::test]

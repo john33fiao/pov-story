@@ -18,6 +18,7 @@ ed25519-dalek = { version = "3.0.0", default-features = false, features = [
   "fast",
   "zeroize",
 ] }
+futures-util = "0.3.33"
 getrandom = "0.4.3"
 nix = { version = "0.31.3", features = ["poll", "pthread", "signal"] }
 mime_guess = "2.0.5"

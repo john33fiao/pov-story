@@ -162,6 +162,17 @@ p {
   backdrop-filter: blur(1rem);
 }
 
+.session-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.connection-status {
+  color: #81958a;
+  font-size: 0.75rem;
+}
+
 .brand {
   display: flex;
   align-items: center;
@@ -435,6 +446,10 @@ p {
 }
 
 @media (max-width: 760px) {
+  .connection-status {
+    display: none;
+  }
+
   .app-shell {
     grid-template:
       'topbar' auto

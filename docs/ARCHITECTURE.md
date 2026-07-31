@@ -179,6 +179,14 @@ canonical auth schema를 계속 적용하지만 auth maintenance capability를 c
 - browser auth mutation은 POST JSON, exact Origin/Host, `X-POV-CSRF: 1`, same-origin Fetch Metadata를 요구하고 CORS와 access-cookie fallback을 열지 않습니다.
 - access token은 browser memory에만 두고 Web Storage, IndexedDB, cookie와 URL에 저장하지 않습니다. REST, SSE와 upload는 Authorization Bearer JWT를 사용합니다.
 - 상태 stream은 native EventSource 대신 bearer header를 넣는 fetch streaming SSE를 사용합니다. expiry 전에 닫고 refresh 뒤 durable cursor로 재연결하며 active session을 최대 15초마다 다시 확인합니다.
+- POV-011 current tree는 migration `0003`의 immutable global event sequence를 owner-scoped
+  canonical decimal cursor로 읽고, 128-event JSON polling과 fetch-streaming SSE에서 동일한
+  content-free payload를 제공합니다. SSE는 500ms page poll, 10초 heartbeat와 별도
+  background task 없는 drop-cancellable state를 사용하며 client는 cursor만
+  sessionStorage에 보존하고 token은 memory 밖에 저장하지 않습니다. 이 구현과 Chromium
+  evidence는 존재하지만 actual macOS locked Rust baseline이 기존
+  `auth/operator.rs`의 `Termios.line_discipline` `E0609`로 실패해 POV-011은 아직
+  `In Progress`이고 supported-Unix completion claim이 아닙니다.
 - auth/API/SSE/upload response는 cache하지 않고 password, recovery code, auth header, cookie와 token을 application/proxy/audit/panic log에서 redact합니다.
 
 ## Job And Mutation Model

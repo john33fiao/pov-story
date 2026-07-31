@@ -12,6 +12,11 @@ import {
   type ConversationTimeline,
   type Session,
 } from './api.ts'
+import {
+  clearJobEventCursor,
+  runJobEventFeed,
+  type JobEventConnectionState,
+} from './job-events.ts'
 
 type Phase = 'booting' | 'anonymous' | 'authenticated'
 
@@ -66,18 +71,23 @@ export default function App() {
   const [draft, setDraft] = useState('')
   const [error, setError] = useState('')
   const [status, setStatus] = useState('로컬 세션을 확인하고 있습니다.')
+  const [connectionStatus, setConnectionStatus] = useState('상태 연결 준비 중')
   const [busy, setBusy] = useState(false)
   const accessToken = useRef('')
+  const sessionRef = useRef<Session | undefined>(undefined)
   const refreshInFlight = useRef<Promise<Session> | undefined>(undefined)
 
-  const acceptSession = useCallback((session: Session) => {
+  const acceptSession = useCallback((session: Session, announce = true) => {
     accessToken.current = session.access_token
+    sessionRef.current = session
     setPhase('authenticated')
-    setStatus('이 장치의 기록에 연결되었습니다.')
+    if (announce) setStatus('이 장치의 기록에 연결되었습니다.')
   }, [])
 
   const endSession = useCallback(() => {
     accessToken.current = ''
+    sessionRef.current = undefined
+    clearJobEventCursor()
     setConversations([])
     setTimeline(undefined)
     setPhase('anonymous')
@@ -100,6 +110,25 @@ export default function App() {
     }
   }, [acceptSession, endSession])
 
+  const refreshAccess = useCallback(async () => {
+    const refresh =
+      refreshInFlight.current ??
+      refreshSession().finally(() => {
+        refreshInFlight.current = undefined
+      })
+    refreshInFlight.current = refresh
+    try {
+      const refreshed = await refresh
+      acceptSession(refreshed, false)
+      return refreshed
+    } catch (refreshError) {
+      if (refreshError instanceof ApiError && refreshError.status === 401) {
+        endSession()
+      }
+      throw refreshError
+    }
+  }, [acceptSession, endSession])
+
   const withAccess = useCallback(
     async <T,>(operation: (token: string) => Promise<T>): Promise<T> => {
       try {
@@ -111,22 +140,11 @@ export default function App() {
         ) {
           throw operationError
         }
-        refreshInFlight.current ??= refreshSession().finally(() => {
-          refreshInFlight.current = undefined
-        })
-        try {
-          const session = await refreshInFlight.current
-          acceptSession(session)
-          return await operation(session.access_token)
-        } catch (refreshError) {
-          if (refreshError instanceof ApiError && refreshError.status === 401) {
-            endSession()
-          }
-          throw refreshError
-        }
+        const refreshed = await refreshAccess()
+        return operation(refreshed.access_token)
       }
     },
-    [acceptSession, endSession],
+    [refreshAccess],
   )
 
   const loadConversations = useCallback(async () => {
@@ -156,11 +174,43 @@ export default function App() {
     }
   }, [loadConversations, phase])
 
+  useEffect(() => {
+    if (phase !== 'authenticated') return
+    const controller = new AbortController()
+    const stateText: Record<JobEventConnectionState, string> = {
+      connecting: '상태 연결 중',
+      connected: '실시간 상태 연결됨',
+      reconnecting: '상태 다시 연결 중',
+      polling: '상태 polling 중',
+    }
+    void runJobEventFeed({
+      signal: controller.signal,
+      getSession: () => {
+        if (!sessionRef.current)
+          throw new Error('authenticated session missing')
+        return sessionRef.current
+      },
+      refreshSession: refreshAccess,
+      onAuthenticationLost: endSession,
+      onEvent: () => {},
+      onState: (nextState) => setConnectionStatus(stateText[nextState]),
+      onError: (message) => setConnectionStatus(message),
+    }).catch(() => {
+      if (!controller.signal.aborted) {
+        setConnectionStatus('상태 연결을 계속할 수 없습니다.')
+      }
+    })
+    return () => {
+      controller.abort()
+    }
+  }, [endSession, phase, refreshAccess])
+
   async function handleLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     setBusy(true)
     setError('')
     try {
+      clearJobEventCursor()
       acceptSession(await login(loginId, password))
     } catch (loginError) {
       setError(messageFor(loginError))
@@ -324,14 +374,17 @@ export default function App() {
             <small>Local text journal</small>
           </span>
         </div>
-        <button
-          className="quiet-button"
-          type="button"
-          disabled={busy}
-          onClick={() => void handleLogout()}
-        >
-          로그아웃
-        </button>
+        <div className="session-actions">
+          <span className="connection-status">{connectionStatus}</span>
+          <button
+            className="quiet-button"
+            type="button"
+            disabled={busy}
+            onClick={() => void handleLogout()}
+          >
+            로그아웃
+          </button>
+        </div>
       </header>
 
       <aside className="conversation-sidebar" aria-label="기록 목록">

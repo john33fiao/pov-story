@@ -18,6 +18,8 @@ node_modules/
 dist/
 coverage/
 .vite/
+playwright-report/
+test-results/
 
 # Local application state and personal data
 data/

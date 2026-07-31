@@ -12,6 +12,14 @@ import {
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+vi.mock('./job-events.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./job-events.ts')>()
+  return {
+    ...actual,
+    runJobEventFeed: vi.fn().mockResolvedValue(undefined),
+  }
+})
+
 function jsonResponse(status: number, body: unknown) {
   return new Response(JSON.stringify(body), {
     status,

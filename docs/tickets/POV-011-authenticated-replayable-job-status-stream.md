@@ -1,6 +1,6 @@
 # POV-011 Authenticated Replayable Job Status Stream
 
-Status: Planned
+Status: In Progress
 
 Type: Delivery
 
@@ -49,6 +49,46 @@ Bearer access token을 사용하는 fetch-streaming SSE와 durable status cursor
 - duplicate, gap and terminal event replay tests
 - cache header and token leakage inspection
 - actual repository validation commands and `git diff --check`
+
+## Implementation Evidence — 2026-07-31
+
+구현된 current-tree 범위:
+
+- immutable migration `0003`의 global `event_sequence`를 재사용하는 canonical decimal
+  `JobEventCursor`, owner-scoped 128-event page와 cross-owner/missing cursor fail-closed read
+- bearer-only `GET /api/jobs/events?after=<cursor>` JSON polling과 no-query
+  `GET /api/jobs/events/stream` fetch-streaming SSE
+- 동일 content-free payload serializer, 500ms poll, 10초 heartbeat, 최대 15초 active-session
+  재검증과 별도 task 없는 drop-cancellable stream
+- zeroizing retained bearer, sessionStorage cursor-only resume, 5초 전 single-flight refresh,
+  duplicate suppression, bounded reconnect와 strict polling fallback
+- `@playwright/test` `1.62.1` Chromium synthetic-stream evidence와 passive connection status
+
+PASS:
+
+- Node `26.4.0`, npm `11.17.0`에서 frontend format/lint, Vitest 10건, typecheck와 production
+  build
+- Playwright `1.62.1` Chromium 1건: expiry refresh handoff, reload resume, exact
+  URL/Authorization/credentials/cache, Web Storage와 Cache API token canary 부재
+- `cargo fmt --all -- --check`, `git diff --check`
+- `/private/tmp` diagnostic copy에서 기존 macOS `Termios.line_discipline` 비교 한 줄만
+  제거한 뒤 locked workspace check와 serial full suite PASS: `pov-core` 313 PASS/1 ignored,
+  process-supervisor 22 PASS/15 ignored, 나머지 API/contract suite PASS. 이 결과는 POV-011
+  변경 compile/test 격리를 위한 진단이며 실제 repository supported-Unix PASS가 아닙니다.
+
+FAIL / UNAVAILABLE:
+
+- 실제 tree의 `cargo check --locked --workspace --all-targets`와
+  `cargo test --locked --workspace --all-targets`는
+  `crates/pov-core/src/auth/operator.rs:218`의 기존
+  `Termios.line_discipline` 필드 부재 `E0609`로 FAIL했습니다.
+- 현재 macOS에서 `scripts/test_operator_pty.py`와
+  `scripts/test_production_auth_smoke.py`는 Linux-only로 UNAVAILABLE이고, production
+  `auth init`을 완료한 private instance가 없어 `scripts/smoke.sh`도 실행하지 않았습니다.
+
+따라서 구현을 completion evidence로 승격하지 않습니다. 실제 supported-Unix tree에서
+Rust baseline을 복구하고 locked check/test 및 적용 가능한 auth/smoke를 다시 PASS한 뒤
+RTD After를 반복할 때만 `Completed`로 전환합니다.
 
 ## Rollback
 

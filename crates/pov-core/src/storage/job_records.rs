@@ -19,12 +19,13 @@ use crate::{
     conversation::{IdempotencyKey, OutboxId},
     identity::{CorrelationId, Revision, VerifiedAuthContext},
     job::{
-        ClaimResult, EnqueueFingerprint, EnqueueReceipt, JobAttemptId, JobAttemptSnapshot,
-        JobAttemptState, JobEvent, JobEventId, JobEventKind, JobFailureKind, JobId, JobKind,
-        JobLease, JobLeaseToken, JobMutationFingerprint, JobOutcome, JobOwnerMutationOperation,
-        JobPriority, JobQueueError, JobQueueFault, JobSnapshot, JobState, JobTimestampMicros,
-        JobTransitionReceipt, PreparedEnqueue, PreparedJobOwnerMutation, RecoveryResolution,
-        RecoveryTicket, duration_micros,
+        ClaimResult, EnqueueFingerprint, EnqueueReceipt, JOB_EVENT_PAGE_SIZE, JobAttemptId,
+        JobAttemptSnapshot, JobAttemptState, JobEvent, JobEventCursor, JobEventId, JobEventKind,
+        JobEventPage, JobFailureKind, JobId, JobKind, JobLease, JobLeaseToken,
+        JobMutationFingerprint, JobOutcome, JobOwnerMutationOperation, JobPriority, JobQueueError,
+        JobQueueFault, JobSnapshot, JobState, JobTimestampMicros, JobTransitionReceipt,
+        PreparedEnqueue, PreparedJobOwnerMutation, RecoveryResolution, RecoveryTicket,
+        SequencedJobEvent, duration_micros,
     },
 };
 
@@ -636,6 +637,95 @@ pub(crate) async fn read_events(
                 .map_err(backend)?;
             rows.map(|row| row.map_err(backend).and_then(event_from_row))
                 .collect()
+        })
+        .await
+        .map_err(map_executor_error)
+}
+
+pub(crate) async fn read_event_page(
+    store: &SqliteStore<ConversationStore>,
+    auth: VerifiedAuthContext,
+    after: JobEventCursor,
+) -> Result<JobEventPage, JobQueueError> {
+    ensure_store_healthy(store)?;
+    let poison = Arc::clone(&store.operation_poisoned);
+    store
+        .connection
+        .call(move |connection| {
+            ensure_not_poisoned(&poison)?;
+            let owner_id = auth.owner_id().as_uuid();
+            let after_i64 = i64::try_from(after.get()).map_err(|_| JobQueueError::InvalidCursor)?;
+            if after != JobEventCursor::START {
+                let owned: i64 = connection
+                    .query_row(
+                        "SELECT EXISTS(
+                            SELECT 1
+                            FROM conversation_job_events
+                            WHERE owner_id = ?1 AND event_sequence = ?2
+                        )",
+                        params![owner_id.as_bytes().as_slice(), after_i64],
+                        |row| row.get(0),
+                    )
+                    .map_err(backend)?;
+                if owned != 1 {
+                    return Err(JobQueueError::InvalidCursor);
+                }
+            }
+            let mut statement = connection
+                .prepare(
+                    "SELECT
+                        event_sequence,
+                        event_id,
+                        job_id,
+                        job_revision,
+                        event_kind,
+                        state,
+                        attempt_id,
+                        happened_at_micros,
+                        queue_wait_micros,
+                        execution_micros,
+                        failure_kind,
+                        correlation_id
+                     FROM conversation_job_events
+                     WHERE owner_id = ?1 AND event_sequence > ?2
+                     ORDER BY event_sequence
+                     LIMIT ?3",
+                )
+                .map_err(backend)?;
+            let rows = statement
+                .query_map(
+                    params![
+                        owner_id.as_bytes().as_slice(),
+                        after_i64,
+                        i64::try_from(JOB_EVENT_PAGE_SIZE + 1)
+                            .map_err(|_| JobQueueError::CorruptStoredState)?
+                    ],
+                    |row| Ok((row.get::<_, i64>(0)?, decode_event_row_at(row, 1)?)),
+                )
+                .map_err(backend)?;
+            let mut events = rows
+                .map(|row| {
+                    let (sequence, event) = row.map_err(backend)?;
+                    let cursor = u64::try_from(sequence)
+                        .ok()
+                        .and_then(JobEventCursor::new)
+                        .ok_or(JobQueueError::CorruptStoredState)?;
+                    Ok(SequencedJobEvent {
+                        cursor,
+                        event: event_from_row(event)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, JobQueueError>>()?;
+            let has_more = events.len() > JOB_EVENT_PAGE_SIZE;
+            if has_more {
+                events.pop();
+            }
+            let next_cursor = events.last().map_or(after, SequencedJobEvent::cursor);
+            Ok(JobEventPage {
+                events,
+                next_cursor,
+                has_more,
+            })
         })
         .await
         .map_err(map_executor_error)
@@ -2995,18 +3085,22 @@ fn attempt_from_row(row: AttemptRow) -> Result<JobAttemptSnapshot, JobQueueError
 }
 
 fn decode_event_row(row: &Row<'_>) -> rusqlite::Result<EventRow> {
+    decode_event_row_at(row, 0)
+}
+
+fn decode_event_row_at(row: &Row<'_>, offset: usize) -> rusqlite::Result<EventRow> {
     Ok(EventRow {
-        event_id: row.get(0)?,
-        job_id: row.get(1)?,
-        job_revision: row.get(2)?,
-        event_kind: row.get(3)?,
-        state: row.get(4)?,
-        attempt_id: row.get(5)?,
-        happened_at_micros: row.get(6)?,
-        queue_wait_micros: row.get(7)?,
-        execution_micros: row.get(8)?,
-        failure_kind: row.get(9)?,
-        correlation_id: row.get(10)?,
+        event_id: row.get(offset)?,
+        job_id: row.get(offset + 1)?,
+        job_revision: row.get(offset + 2)?,
+        event_kind: row.get(offset + 3)?,
+        state: row.get(offset + 4)?,
+        attempt_id: row.get(offset + 5)?,
+        happened_at_micros: row.get(offset + 6)?,
+        queue_wait_micros: row.get(offset + 7)?,
+        execution_micros: row.get(offset + 8)?,
+        failure_kind: row.get(offset + 9)?,
+        correlation_id: row.get(offset + 10)?,
     })
 }
 
