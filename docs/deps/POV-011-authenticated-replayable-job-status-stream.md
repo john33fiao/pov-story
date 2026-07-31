@@ -1,12 +1,14 @@
 # POV-011 Authenticated Replayable Job Status Stream
 
-Status: In Progress
+Status: Completed — 2026-07-31; Core/API/Web/Chromium and macOS locked baseline verified
 
 Type: Delivery
 
 Roadmap: H1 — Trustworthy text capture
 
 Depends on: POV-009, POV-010
+
+Runtime target: macOS local runtime; Linux에서의 제품 사용과 지원은 제공하지 않음
 
 ## Why
 
@@ -32,6 +34,7 @@ Bearer access token을 사용하는 fetch-streaming SSE와 durable status cursor
 - push notification
 - Cloudflare deployment tuning
 - multi-device fanout
+- Linux runtime delivery와 지원 근거
 
 ## Acceptance Criteria
 
@@ -74,7 +77,7 @@ PASS:
 - `/private/tmp` diagnostic copy에서 기존 macOS `Termios.line_discipline` 비교 한 줄만
   제거한 뒤 locked workspace check와 serial full suite PASS: `pov-core` 313 PASS/1 ignored,
   process-supervisor 22 PASS/15 ignored, 나머지 API/contract suite PASS. 이 결과는 POV-011
-  변경 compile/test 격리를 위한 진단이며 실제 repository supported-Unix PASS가 아닙니다.
+  변경 compile/test 격리를 위한 진단이며 actual repository baseline PASS가 아닙니다.
 - actual macOS 26.5.2 arm64, Rust/Cargo 1.95.0의 current tree에서 `rustix 1.1.4`가
   제공하는 공통 `Termios` 필드와 속도는 그대로 비교하고 Linux에서만 공개되는
   `line_discipline` 비교를 해당 target으로 제한했습니다.
@@ -92,19 +95,25 @@ OBSERVED NON-REPRODUCED FAILURE:
   재실행과 이후 exact full workspace 재실행은 PASS해 root cause가 재현되지 않았습니다.
   이 관측을 `Termios` 수정의 성공으로 숨기거나 해당 auth maintenance 경계를 수정하지
   않습니다.
+- completion 문서 검증의 첫 locked full workspace test에서도 같은 재검증 지점에서
+  `planned_rotation_rollback_faults_resume_in_reverse_creation_order`가 `IdentityChanged`로
+  1회 FAIL했습니다. 동일 test의 즉시 exact 직렬 재실행과 두 번째 locked full workspace
+  재실행은 PASS했습니다. 문서 변경과의 회귀 연관성은 관측되지 않았으며 이 비재현
+  macOS auth-maintenance anomaly를 완료 근거에서 숨기지 않습니다. 이 test-harness 계열의
+  추가 원인 분석은 POV-037의 macOS filesystem durability evidence가 소유합니다.
 
-REMAINING / UNAVAILABLE:
+PLATFORM BOUNDARY:
 
-- 이 수정 뒤 supported Linux/WSL-native tree에서 locked workspace check, KDF-serialized
-  test, production binary build, `scripts/test_operator_pty.py`와
-  `scripts/test_production_auth_smoke.py`를 아직 실행하지 않았습니다.
-- 현재 macOS에서 `scripts/test_operator_pty.py`와
-  `scripts/test_production_auth_smoke.py`는 Linux-only로 UNAVAILABLE이고, production
-  `auth init`을 완료한 private instance가 없어 `scripts/smoke.sh`도 실행하지 않았습니다.
+- Linux에서의 제품 사용과 runtime 지원은 제공하지 않습니다. Linux/WSL 검증은 수행하더라도
+  선택적인 개발 호환성 증거이며 POV-011의 delivery 또는 완료 조건이 아닙니다.
+- `line_discipline` target gate는 `rustix 1.1.4`의 플랫폼별 공개 필드 차이를 보존하는 compile
+  compatibility 경계일 뿐 Linux 지원 근거가 아닙니다.
+- target MacBook의 production `auth init`, listener와 installed-browser activation evidence는
+  POV-038이 소유하며 POV-011 implementation delivery의 완료 조건이 아닙니다.
 
-따라서 macOS compile/test baseline은 복구됐지만 구현을 completion evidence로 승격하지
-않습니다. 실제 supported Linux tree에서 locked check/test 및 auth/PTY/production smoke를
-PASS하고 RTD After를 반복할 때만 `Completed`로 전환합니다.
+따라서 Core/API/Web/Chromium acceptance와 actual macOS locked baseline을 근거로 POV-011을
+`Completed`로 종료합니다. 이 완료는 Linux runtime 지원 또는 target MacBook production
+activation 완료를 주장하지 않습니다.
 
 ## Rollback
 
@@ -114,5 +123,6 @@ stream endpoint를 끄고 durable status를 polling으로 읽는 임시 fallback
 
 - [Architecture](../ARCHITECTURE.md)
 - [Roadmap](../WBS.md)
-- [POV-009](../deps/POV-009-durable-single-slot-job-queue.md)
-- [POV-010](POV-010-minimal-authenticated-local-text-chat.md)
+- [POV-009](POV-009-durable-single-slot-job-queue.md)
+- [POV-010](../tickets/POV-010-minimal-authenticated-local-text-chat.md)
+- [POV-037](../tickets/POV-037-auth-platform-and-durability-hardening.md)
