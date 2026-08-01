@@ -65,8 +65,8 @@ Completed on 2026-08-01 with a test-only fixture repair.
   `test-results/.last-run.json` 때문에 첫 format check가 실패했지만 generated file을 제거한
   뒤 같은 명령이 PASS했고 tracked artifact로 남지 않았습니다.
 - 이 결과는 POV-039만 완료합니다. POV-013의 exact `70ad661` E04/E08 FAIL은 역사적 실행
-  결과로 유지하며, POV-040, POV-013 전체 재실행과 E10/E11 target-Chrome evidence는
-  남아 있습니다.
+  결과로 유지합니다. 후속 POV-040은 완료됐지만 POV-013 전체 재실행과 E10/E11
+  target-Chrome evidence는 남아 있습니다.
 
 ## Rollback
 

@@ -1,6 +1,6 @@
 # POV-038 macOS Dogfood Runtime And Installed-Browser Evidence
 
-Status: In Progress — target available; blocked by POV-040 and manual evidence pending
+Status: In Progress — target available; manual evidence pending
 
 Type: Platform activation evidence
 
@@ -24,8 +24,8 @@ target 장비에서 별도 evidence slice로 실행합니다.
   제한합니다. Password, recovery code, token, cookie value, KID, instance/model path와
   artifact hash는 evidence에 기록하지 않습니다.
 - POV-013 fail-fast로 credential-bearing manual flow는 아직 실행하지 않았습니다.
-  [POV-040](POV-040-reconcile-macos-raw-filename-validation.md)의 target-macOS full baseline을
-  먼저 복구한 뒤 이 ticket의 production/browser evidence를 실행합니다.
+  [POV-040](POV-040-reconcile-macos-raw-filename-validation.md)의 target-macOS full baseline은
+  2026-08-01 완료됐으며, 이 ticket의 production/browser evidence가 다음 미실행 경계입니다.
 
 ## Scope
 

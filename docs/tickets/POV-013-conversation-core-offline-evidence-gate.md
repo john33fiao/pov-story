@@ -1,6 +1,6 @@
 # POV-013 Conversation Core Offline Evidence Gate
 
-Status: In Progress — `fix`; POV-040, full rerun and target-Chrome evidence required
+Status: In Progress — `fix`; full rerun and target-Chrome evidence required
 
 Type: Evidence gate
 
@@ -125,12 +125,13 @@ Final decision: **fix**
 - [POV-039](POV-039-repair-job-status-browser-evidence-fixture.md)는 stale Playwright fixture만
   current owner-scoped event schema와 맞춥니다. Production parser를 완화하지 않습니다.
 - [POV-040](POV-040-reconcile-macos-raw-filename-validation.md)은 target MacBook의 raw filename
-  `EILSEQ`와 process execution boundary를 한 full baseline으로 재조정합니다. Unknown/raw
-  artifact fail-closed contract를 완화하지 않습니다.
+  `EILSEQ`를 native filesystem capability boundary로 보정하고 process suite와 locked workspace
+  test를 한 native Terminal evidence set에서 통과해 완료했습니다. Unknown/raw artifact
+  fail-closed contract는 완화하지 않았습니다.
 - E10/E11을 실행하지 않았으므로 macOS production auth, installed Chrome, offline asset,
   refresh-cookie/storage/cache claim은 모두 미검증 상태입니다. POV-038은 완료가 아니라
   `Ready`로 유지합니다.
-- POV-014와 H2는 POV-039/040 수정과 POV-013 전체 재실행에서 `proceed`가 나오기 전까지
+- POV-014와 H2는 POV-039/040 완료 뒤 POV-013 전체 재실행에서 `proceed`가 나오기 전까지
   열지 않습니다.
 
 ### POV-039 Remediation Update — 2026-08-01
@@ -143,8 +144,22 @@ Final decision: **fix**
   reconnect cursor, reload, malformed-linkage rejection과 bearer-token non-persistence assertion은
   그대로 유지했습니다.
 - 이 remediation은 exact `70ad66146a7f47dde3157ed0089ef8316e81e8ee` matrix의 E04/E08
-  FAIL을 PASS로 덮어쓰지 않으며 POV-013 전체 재실행도 아닙니다. POV-040, full matrix rerun과
-  E10/E11 target-Chrome evidence가 남아 있으므로 final decision은 계속 **fix**입니다.
+  FAIL을 PASS로 덮어쓰지 않으며 POV-013 전체 재실행도 아닙니다. Full matrix rerun과 E10/E11
+  target-Chrome evidence가 남아 있으므로 final decision은 계속 **fix**입니다.
+
+### POV-040 Remediation Update — 2026-08-01
+
+- Native Terminal/APFS는 raw non-UTF-8 `fs::write`를 locale와 무관하게 `EILSEQ(92)`로
+  거부했고, Codex managed temp 경계는 같은 작업을 `EPERM(1)`로 먼저 거부했습니다.
+- Test-only capability 판정에 EILSEQ를 추가하고 unrelated IO error를 숨기지 않는 회귀를
+  추가했습니다. Raw/unknown artifact parser, 보존, `Occupied`와 auth fail-closed production
+  계약은 변경하지 않았습니다.
+- Current worktree의 동일 native Terminal evidence set에서 두 raw test, process suite
+  `22` PASS/`15` helper ignored와 KDF-serialized locked workspace test `388` PASS/`17` ignored가
+  모두 exit `0`이었습니다.
+- 이 remediation은 exact `70ad66146a7f47dde3157ed0089ef8316e81e8ee` E05 FAIL을 PASS로
+  덮어쓰는 POV-013 rerun이 아닙니다. Full matrix rerun과 E10/E11은 계속 남아 있어 final
+  decision은 **fix**입니다.
 
 ## Verification
 

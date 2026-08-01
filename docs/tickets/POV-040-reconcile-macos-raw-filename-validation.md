@@ -1,6 +1,6 @@
 # POV-040 Reconcile macOS Raw Filename Validation
 
-Status: Planned — opened by POV-013 `fix`
+Status: Completed — 2026-08-01; target-macOS native Terminal locked workspace PASS
 
 Type: Corrective platform validation
 
@@ -54,6 +54,40 @@ PASS했지만, required full command가 한 execution boundary에서 exit `0`을
 - `cargo fmt --all -- --check`
 - `cargo check --locked --workspace --all-targets`
 - `git diff --check` and relative Markdown-link check
+
+## Completion Evidence
+
+Target MacBook의 native Terminal에서 macOS `26.5.2` (`25F84`, arm64), APFS,
+Rust/Cargo `1.95.0` 조합을 검증했습니다. Base HEAD는
+`89bd3cbf865835388e44b70f5db7554f2e54f0a3`이었고 locale은 `ko_KR.UTF-8`이었습니다.
+
+- 수정 전 native Terminal의 두 raw filename test는 각각 exit `101`과
+  `Illegal byte sequence (os error 92)`를 재현했고, 같은 경계의 process-supervisor suite는
+  `22` PASS, `15` helper ignored, `0` FAIL로 exit `0`이었습니다.
+- 별도 raw `fs::write` probe는 `ko_KR.UTF-8`, `C.UTF-8`, `C` 모두
+  `ErrorKind::Uncategorized`와 `EILSEQ(92)`를 반환했습니다. 따라서 locale가 아니라 native
+  Darwin/APFS filename 경계가 원인입니다. Codex managed temp 경계는 동일 작업을 먼저
+  `EPERM(1)`/`PermissionDenied`로 거부해 기존 test가 platform-unavailable 분기로
+  통과했습니다.
+- Test-only filename capability 판정에 `Errno::ILSEQ`를 추가하고, EILSEQ는 허용하되
+  unrelated `ENOENT`는 숨기지 않는 회귀 test를 추가했습니다. Production parser, artifact
+  inventory, auth runtime과 schema는 변경하지 않았습니다.
+- Raw name을 표현할 수 있는 filesystem에서는 기존 test가 raw bytes를
+  `UnrecognizedPresent`/`Occupied`로 관찰하고 원본 artifact를 보존하는 assertions를 계속
+  실행합니다. Native APFS의 EILSEQ 분기는 artifact가 생성되기 전의 capability 한계만
+  기록하며 normalization, alias, adoption 또는 deletion을 허용하지 않습니다.
+
+동일 native Terminal evidence set에서 다음 명령이 모두 exit `0`이었습니다.
+
+- 새 EILSEQ 회귀 test와 두 named raw filename test
+- `cargo test --locked -p pov-core --test process_supervisor -- --test-threads=1`
+- `KDF_TEST_SERIAL=1 cargo test --locked --workspace --all-targets -- --test-threads=1`:
+  전체 test binary 합계 `388` PASS, `17` ignored, `0` FAIL
+- `cargo fmt --all -- --check`
+- `cargo check --locked --workspace --all-targets`
+
+이 완료는 POV-013의 historical exact-SHA matrix 결과를 덮어쓰지 않습니다. POV-013 full
+matrix rerun과 POV-038 production/installed-browser evidence는 각 ticket에서 별도로 남습니다.
 
 ## Rollback
 

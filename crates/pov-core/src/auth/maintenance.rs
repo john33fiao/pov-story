@@ -3177,7 +3177,7 @@ mod tests {
         AuthRetireFinalLifecycleOutcome, AuthRetireForwardPhase, AuthRetirePreSourcePhase,
         AuthRetirePrepareOutcome, AuthRetirePrepareTestFault, AuthRetireReconciliation,
         AuthRetireRecovery, AuthRetireRollbackOutcome, AuthRetireRollbackTestFault,
-        AuthRetireSourceOutcome, SecretFsError,
+        AuthRetireSourceOutcome, SecretFsError, raw_filename_creation_is_unavailable,
     };
     use crate::auth::transition::AUTH_MAINTENANCE_LOCK_NAME as AUTH_LOCK_FILE_NAME;
 
@@ -8066,11 +8066,7 @@ mod tests {
                 );
                 fs::remove_file(invalid_artifact).expect("remove non-UTF-8 artifact");
             }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidInput
-                ) => {}
+            Err(error) if raw_filename_creation_is_unavailable(&error) => {}
             Err(error) => panic!("unexpected non-UTF-8 artifact error: {error}"),
         }
 

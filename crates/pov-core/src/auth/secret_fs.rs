@@ -10670,6 +10670,16 @@ impl fmt::Display for SecretFsError {
 impl Error for SecretFsError {}
 
 #[cfg(test)]
+pub(super) fn raw_filename_creation_is_unavailable(error: &io::Error) -> bool {
+    // Native macOS/APFS rejects raw non-UTF-8 path bytes with EILSEQ before an
+    // artifact exists. Managed runners may reject the same operation earlier.
+    matches!(
+        error.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput
+    ) || error.raw_os_error() == Some(Errno::ILSEQ.raw_os_error())
+}
+
+#[cfg(test)]
 mod tests {
     use std::{
         env,
@@ -10690,7 +10700,7 @@ mod tests {
 
     use base64ct::{Base64Unpadded, Encoding};
     use rustix::{
-        io::{FdFlags, fcntl_getfd},
+        io::{Errno, FdFlags, fcntl_getfd},
         process::{Pid, Signal, kill_process},
     };
     use tempfile::tempdir;
@@ -10713,7 +10723,8 @@ mod tests {
         CodecObservation, FileKind, KnownFilePurpose, OWNER_DIRECTORY_MODE, OWNER_FILE_MODE,
         PinnedReservationEntry, PinnedTopLevelArtifact, RedactedBytes, SECRET_DIRECTORY_NAME,
         STORE_DIRECTORY_NAME, SecretFsError, SemanticLinkageObservation, TopLevelArtifactName,
-        capture_known_file, read_artifact_manifest, remove_exact_known_file,
+        capture_known_file, raw_filename_creation_is_unavailable, read_artifact_manifest,
+        remove_exact_known_file,
     };
 
     const HELPER_ROOT_ENV: &str = "POV_AUTH_SECRET_FS_TEST_ROOT";
@@ -10914,6 +10925,15 @@ mod tests {
     }
 
     #[test]
+    fn raw_filename_creation_unavailable_recognizes_ilseq_without_hiding_unrelated_errors() {
+        let ilseq = io::Error::from_raw_os_error(Errno::ILSEQ.raw_os_error());
+        assert!(raw_filename_creation_is_unavailable(&ilseq));
+
+        let unrelated = io::Error::from_raw_os_error(Errno::NOENT.raw_os_error());
+        assert!(!raw_filename_creation_is_unavailable(&unrelated));
+    }
+
+    #[test]
     fn raw_non_utf8_artifact_name_is_occupied_without_normalization() {
         let raw_name = b"artifact-\xff";
         let retained_name = RedactedBytes::new(raw_name.to_vec());
@@ -10932,12 +10952,7 @@ mod tests {
             .join(OsString::from_vec(raw_name.to_vec()));
         match fs::write(&artifact, b"synthetic") {
             Ok(()) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput
-                ) =>
-            {
+            Err(error) if raw_filename_creation_is_unavailable(&error) => {
                 return;
             }
             Err(error) => panic!("unexpected raw artifact error: {error}"),
